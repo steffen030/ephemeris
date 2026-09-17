@@ -4,4 +4,7 @@
 //! platform (display hardware, input devices, etc.).  Concrete backends live
 //! in sibling crates or in this crate behind feature flags.
 
+pub mod display;
 pub mod input;
+
+pub use display::{Display, PixelBuf, Rect, RefreshMode};
