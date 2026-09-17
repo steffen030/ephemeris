@@ -4,3 +4,7 @@
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# Git worktrees (local development branches)
+.worktree/
+

@@ -72,10 +72,10 @@ This project uses **git worktrees** to develop features and fixes in isolation b
 
 2. **Create a worktree for development**
    ```bash
-   git worktree add feature/<bead-id> main
-   cd feature/<bead-id>
+   git worktree add .worktree/<bead-id> main
+   cd .worktree/<bead-id>
    ```
-   Branch naming: Use `feature/<bead-id>` for consistency with beads tracking.
+   All worktrees go in `.worktree/` directory (ignored by git, kept local).
 
 3. **Develop and test**
    - Implement changes in the worktree
@@ -96,7 +96,7 @@ This project uses **git worktrees** to develop features and fixes in isolation b
 
 5. **Clean up and close**
    ```bash
-   git worktree remove feature/<bead-id>
+   git worktree remove .worktree/<bead-id>
    bd close <id>  # Close the beads issue
    ```
 
@@ -105,8 +105,8 @@ This project uses **git worktrees** to develop features and fixes in isolation b
 ```bash
 # Worktree management
 git worktree list                              # Show all active worktrees
-git worktree add feature/<name> main           # Create new worktree from main
-git worktree remove feature/<name>             # Remove worktree after merge
+git worktree add .worktree/<name> main           # Create new worktree from main
+git worktree remove .worktree/<name>             # Remove worktree after merge
 
 # Development in a worktree
 cd feature/<id>                                # Work in isolated directory
