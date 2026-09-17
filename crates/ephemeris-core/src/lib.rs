@@ -11,4 +11,7 @@ pub mod model;
 pub mod store;
 
 pub use ink::{InkConfig, InkEngine, InkUpdate};
-pub use model::{Color, Point, Stroke, StrokeId, Tool};
+pub use model::{
+    Account, AccountId, AccountKind, CalendarEvent, Color, EventId, Note, NoteId, Page, PageId,
+    PageTemplate, Point, Profile, ProfileId, Stroke, StrokeId, Task, TaskId, TaskPriority, Tool,
+};
