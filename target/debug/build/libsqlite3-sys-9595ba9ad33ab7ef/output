@@ -88,5 +88,5 @@ ARFLAGS_x86_64_apple_darwin = None
 cargo:rerun-if-env-changed=ARFLAGS_x86_64-apple-darwin
 ARFLAGS_x86_64-apple-darwin = None
 cargo:rustc-link-lib=static=sqlite3
-cargo:rustc-link-search=native=/Users/sgalan/GIT/ephemeris/target/debug/build/libsqlite3-sys-9595ba9ad33ab7ef/out
-cargo:lib_dir=/Users/sgalan/GIT/ephemeris/target/debug/build/libsqlite3-sys-9595ba9ad33ab7ef/out
+cargo:rustc-link-search=native=/Users/sgalan/GIT/ephemeris/.worktree/ephemeris-fna.5/target/debug/build/libsqlite3-sys-9595ba9ad33ab7ef/out
+cargo:lib_dir=/Users/sgalan/GIT/ephemeris/.worktree/ephemeris-fna.5/target/debug/build/libsqlite3-sys-9595ba9ad33ab7ef/out
