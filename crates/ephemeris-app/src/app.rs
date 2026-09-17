@@ -1,6 +1,7 @@
 use ephemeris_core::Result;
-use std::sync::mpsc::{channel, Receiver, Sender, SendError};
+use std::sync::mpsc::{channel, Receiver};
 use tokio::runtime::Runtime;
+use tokio::sync::mpsc::UnboundedSender;
 
 /// Commands from UI to async core.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,8 +20,9 @@ pub enum Event {
 /// Main application controller.
 pub struct App {
     version: String,
+    #[allow(dead_code)]
     rt: Runtime,
-    cmd_tx: Sender<Command>,
+    cmd_tx: UnboundedSender<Command>,
     evt_rx: Receiver<Event>,
 }
 
@@ -35,14 +37,14 @@ impl App {
             .enable_all()
             .build()?;
 
-        let (cmd_tx, cmd_rx) = channel::<Command>();
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<Command>();
         let (evt_tx, evt_rx) = channel::<Event>();
         let evt_tx_clone = evt_tx.clone();
 
         // Spawn async core task
         rt.spawn(async move {
             tracing::info!("Async core task started");
-            while let Ok(cmd) = cmd_rx.recv() {
+            while let Some(cmd) = cmd_rx.recv().await {
                 match cmd {
                     Command::Ping => {
                         tracing::debug!("Received ping, sending pong");
@@ -75,8 +77,8 @@ impl App {
     }
 
     /// Send a command to the async core.
-    pub fn send_command(&self, cmd: Command) -> std::result::Result<(), SendError<Command>> {
-        self.cmd_tx.send(cmd)
+    pub fn send_command(&self, cmd: Command) -> std::result::Result<(), String> {
+        self.cmd_tx.send(cmd).map_err(|_| "Failed to send command".to_string())
     }
 
     /// Receive an event from the async core (non-blocking).
