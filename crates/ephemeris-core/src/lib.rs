@@ -10,6 +10,7 @@ pub mod error;
 pub mod geom;
 pub mod ink;
 pub mod model;
+pub mod sqlite;
 pub mod store;
 
 pub use config::Config;
