@@ -1,11 +1,11 @@
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, bounded};
 use std::sync::{Arc, Mutex};
-use super::InputEvent;
+use super::{InputEvent, Input, InputError};
 
 /// Wayland input backend for tablet_v2 and wl_touch support.
 pub struct WaylandInput {
-    #[allow(dead_code)]
     state: Arc<Mutex<WaylandState>>,
+    rx: Receiver<InputEvent>,
 }
 
 #[allow(dead_code)]
@@ -22,12 +22,11 @@ struct WaylandState {
 impl WaylandInput {
     /// Create a new Wayland input backend.
     pub fn new() -> std::result::Result<Self, Box<dyn std::error::Error>> {
-        Ok(WaylandInput { state: Arc::new(Mutex::new(WaylandState::default())) })
-    }
-
-    /// Subscribe to input events (stub for future thread-based event loop).
-    pub fn subscribe(&self, _tx: Sender<InputEvent>) {
-        // Future: spawn thread to run Wayland event loop and emit events
+        let (_tx, rx) = bounded::<InputEvent>(64);
+        Ok(WaylandInput {
+            state: Arc::new(Mutex::new(WaylandState::default())),
+            rx,
+        })
     }
 
     /// Handle pen proximity change.
@@ -83,7 +82,24 @@ impl WaylandInput {
 
 impl Default for WaylandInput {
     fn default() -> Self {
-        WaylandInput { state: Arc::new(Mutex::new(WaylandState::default())) }
+        WaylandInput::new().expect("Failed to create default WaylandInput")
+    }
+}
+
+impl Input for WaylandInput {
+    fn receiver(&self) -> Receiver<InputEvent> {
+        self.rx.clone()
+    }
+
+    fn run(self) -> Result<(), InputError> {
+        // In a real implementation, this would:
+        // 1. Connect to Wayland display
+        // 2. Set up tablet_v2 and wl_touch listeners
+        // 3. Process events from Wayland into InputEvent
+        // 4. Send events through the channel until the backend is dropped
+        //
+        // For now, this is a stub that allows the trait to be satisfied.
+        Ok(())
     }
 }
 
