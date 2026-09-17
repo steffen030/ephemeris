@@ -13,6 +13,7 @@ fs = []
 
 [dependencies]
 ephemeris-pal = { workspace = true }
+rusqlite = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
 serde = { workspace = true }

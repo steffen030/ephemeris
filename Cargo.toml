@@ -22,6 +22,7 @@ ephemeris-ui    = { path = "crates/ephemeris-ui" }
 
 # Shared external dependencies (pin versions here; crates inherit via workspace = true)
 crossbeam-channel = "0.5"
+rusqlite = { version = "0.30", features = ["bundled"] }
 thiserror = "2"
 log = "0.4"
 serde = { version = "1", features = ["derive"] }

@@ -12,6 +12,7 @@ pub mod geom;
 pub mod ics;
 pub mod ink;
 pub mod model;
+pub mod sqlite;
 pub mod store;
 
 pub use config::Config;
