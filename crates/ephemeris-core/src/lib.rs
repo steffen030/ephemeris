@@ -39,4 +39,8 @@ pub fn init_tracing() {
 pub mod webdav;
 pub mod task_provider;
 pub mod stroke_persistence;
+<<<<<<< HEAD
 pub mod profile_manager;
+=======
+pub mod obsidian;
+>>>>>>> feature/ephemeris-be4.5
