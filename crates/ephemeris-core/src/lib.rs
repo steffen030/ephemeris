@@ -9,6 +9,7 @@ pub mod action;
 pub mod config;
 pub mod error;
 pub mod geom;
+pub mod ics;
 pub mod ink;
 pub mod model;
 pub mod store;
