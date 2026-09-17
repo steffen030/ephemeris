@@ -5,12 +5,14 @@
 //! and persist-and-reload tests until the SQLite backend (ephemeris-fna.3)
 //! lands.
 
+pub mod config;
 pub mod error;
 pub mod geom;
 pub mod ink;
 pub mod model;
 pub mod store;
 
+pub use config::Config;
 pub use error::{AppError, Result};
 pub use ink::{InkConfig, InkEngine, InkUpdate};
 pub use model::{
