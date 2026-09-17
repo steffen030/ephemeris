@@ -39,3 +39,4 @@ pub fn init_tracing() {
 pub mod webdav;
 pub mod task_provider;
 pub mod stroke_persistence;
+pub mod obsidian;
