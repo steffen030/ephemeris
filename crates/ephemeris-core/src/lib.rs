@@ -37,3 +37,4 @@ pub fn init_tracing() {
         .init();
 }
 pub mod webdav;
+pub mod task_provider;
