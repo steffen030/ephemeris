@@ -5,6 +5,7 @@
 //! and persist-and-reload tests until the SQLite backend (ephemeris-fna.3)
 //! lands.
 
+pub mod action;
 pub mod config;
 pub mod error;
 pub mod geom;
