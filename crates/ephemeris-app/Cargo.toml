@@ -1,0 +1,17 @@
+[package]
+name = "ephemeris-app"
+description = "Ephemeris application binary"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ephemeris"
+path = "src/main.rs"
+
+[dependencies]
+ephemeris-core = { workspace = true }
+ephemeris-pal  = { workspace = true }
+ephemeris-ui   = { workspace = true }
+log = { workspace = true }

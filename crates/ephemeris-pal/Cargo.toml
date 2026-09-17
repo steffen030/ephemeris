@@ -1,0 +1,15 @@
+[package]
+name = "ephemeris-pal"
+description = "Platform abstraction layer for Ephemeris (display, input)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+crossbeam-channel = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+# nothing extra needed; mock backend is in src/input/mock.rs behind #[cfg(feature="mock")]

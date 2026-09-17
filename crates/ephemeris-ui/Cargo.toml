@@ -1,0 +1,12 @@
+[package]
+name = "ephemeris-ui"
+description = "UI components and rendering for Ephemeris"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+ephemeris-core = { workspace = true }
+ephemeris-pal  = { workspace = true }
+log = { workspace = true }
