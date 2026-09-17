@@ -7,5 +7,5 @@ crates/ephemeris-app/src/app.rs:
 Cargo.toml:
 
 # env-dep:CARGO_PKG_VERSION=0.1.0
-# env-dep:CLIPPY_ARGS=-W__CLIPPY_HACKERY__clippy::all__CLIPPY_HACKERY__
+# env-dep:CLIPPY_ARGS=
 # env-dep:CLIPPY_CONF_DIR

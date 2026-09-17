@@ -23,6 +23,9 @@
 //!   supporting background threads.
 
 pub mod mock;
+pub mod wayland;
+
+pub use wayland::WaylandInput;
 
 use crossbeam_channel::Receiver;
 use thiserror::Error;
