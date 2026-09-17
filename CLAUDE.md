@@ -57,6 +57,75 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 - If a required sync or push is blocked, stop and report the exact command and error.
 <!-- END BEADS INTEGRATION -->
 
+## Development Workflow (Beads + Git Worktrees)
+
+This project uses **git worktrees** to develop features and fixes in isolation before merging to main.
+
+### Standard Workflow
+
+1. **Find and claim work**
+   ```bash
+   bd ready                    # Show available issues
+   bd show <id>                # Review issue details
+   bd update <id> --claim      # Claim the issue
+   ```
+
+2. **Create a worktree for development**
+   ```bash
+   git worktree add feature/<bead-id> main
+   cd feature/<bead-id>
+   ```
+   Branch naming: Use `feature/<bead-id>` for consistency with beads tracking.
+
+3. **Develop and test**
+   - Implement changes in the worktree
+   - Commit changes locally (commits stay in the worktree branch)
+   - Run tests and validation
+   - Iterate until satisfied
+
+4. **Merge back to main**
+   ```bash
+   # Switch to main branch
+   cd ..
+   git checkout main
+   git pull --rebase origin main  # Ensure main is up-to-date (if using a remote)
+   
+   # Merge the feature branch
+   git merge feature/<bead-id>
+   ```
+
+5. **Clean up and close**
+   ```bash
+   git worktree remove feature/<bead-id>
+   bd close <id>  # Close the beads issue
+   ```
+
+### Key Commands
+
+```bash
+# Worktree management
+git worktree list                              # Show all active worktrees
+git worktree add feature/<name> main           # Create new worktree from main
+git worktree remove feature/<name>             # Remove worktree after merge
+
+# Development in a worktree
+cd feature/<id>                                # Work in isolated directory
+git status                                     # See changes
+git commit -m "message"                        # Commit changes
+git push origin feature/<id>                   # Push if using remote
+cd ..                                          # Return to main worktree
+
+# Merge when ready
+git checkout main
+git merge feature/<id>                         # Merge after testing
+```
+
+### Tips
+
+- **Each beads issue → one worktree**: This keeps work isolated and makes it easy to switch between tasks.
+- **Main branch stays clean**: Main is always deployable since all work is done in worktrees before merging.
+- **Commit discipline**: Use meaningful commit messages that reference the bead ID.
+- **Before merging**: Always verify tests pass and code quality checks pass in the worktree.
 
 ## Build & Test
 
