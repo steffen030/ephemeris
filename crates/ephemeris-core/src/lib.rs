@@ -5,13 +5,29 @@
 //! and persist-and-reload tests until the SQLite backend (ephemeris-fna.3)
 //! lands.
 
+pub mod error;
 pub mod geom;
 pub mod ink;
 pub mod model;
 pub mod store;
 
+pub use error::{AppError, Result};
 pub use ink::{InkConfig, InkEngine, InkUpdate};
 pub use model::{
     Account, AccountId, AccountKind, CalendarEvent, Color, EventId, Note, NoteId, Page, PageId,
     PageTemplate, Point, Profile, ProfileId, Stroke, StrokeId, Task, TaskId, TaskPriority, Tool,
 };
+
+/// Initialize tracing with environment filter.
+pub fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_target(true)
+        .with_thread_ids(true)
+        .init();
+}
