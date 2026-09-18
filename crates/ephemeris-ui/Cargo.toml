@@ -10,3 +10,9 @@ license.workspace = true
 ephemeris-core = { workspace = true }
 ephemeris-pal  = { workspace = true }
 log = { workspace = true }
+
+# Slint retained-mode UI framework (software renderer — headless, no GPU/winit)
+slint = { workspace = true }
+
+[build-dependencies]
+slint-build = { workspace = true }
