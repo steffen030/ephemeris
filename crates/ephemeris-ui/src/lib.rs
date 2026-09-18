@@ -51,9 +51,7 @@ struct HeadlessPlatform {
 }
 
 impl Platform for HeadlessPlatform {
-    fn create_window_adapter(
-        &self,
-    ) -> Result<Rc<dyn WindowAdapter>, slint::PlatformError> {
+    fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, slint::PlatformError> {
         Ok(self.window.clone())
     }
 
@@ -95,7 +93,12 @@ impl EphemerisUi {
         let component = EphemerisPage::new()?;
         component.window().show()?;
 
-        Ok(EphemerisUi { window, component, width, height })
+        Ok(EphemerisUi {
+            window,
+            component,
+            width,
+            height,
+        })
     }
 
     // ── Property setters ──────────────────────────────────────────────────
@@ -171,7 +174,8 @@ impl EphemerisUi {
         // alignment, then convert.
         let buf: RefCell<Vec<slint::platform::software_renderer::Rgb565Pixel>> =
             RefCell::new(vec![
-                slint::platform::software_renderer::Rgb565Pixel::default();
+                slint::platform::software_renderer::Rgb565Pixel::default(
+                );
                 pixel_count
             ]);
 
@@ -193,8 +197,7 @@ impl EphemerisUi {
         let mut pal_buf = PixelBuf::new(self.width, self.height);
         for (i, px) in pixels.iter().enumerate() {
             let (r, g, b) = rgb565_to_rgb888(*px);
-            let luma = (0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32)
-                .round() as u8;
+            let luma = (0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32).round() as u8;
             pal_buf.data[i] = luma;
         }
 
@@ -250,7 +253,10 @@ mod tests {
             .expect("render_frame failed");
 
         // The first render must repaint the whole window.
-        assert!(!damage.is_empty(), "first render should produce damage rects");
+        assert!(
+            !damage.is_empty(),
+            "first render should produce damage rects"
+        );
         assert_eq!(damage[0].width, 800);
         assert_eq!(damage[0].height, 600);
     }

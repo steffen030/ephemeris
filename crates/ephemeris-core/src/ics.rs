@@ -1,4 +1,4 @@
-use crate::{CalendarEvent, ProfileId, AppError};
+use crate::{AppError, CalendarEvent, ProfileId};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// ICS (iCalendar) feed reader for HTTPS calendar feeds.
@@ -6,7 +6,10 @@ pub struct IcsReader;
 
 impl IcsReader {
     /// Parse ICS text and extract VEVENT components as CalendarEvents.
-    pub fn parse_events(ics_text: &str, profile_id: ProfileId) -> crate::Result<Vec<CalendarEvent>> {
+    pub fn parse_events(
+        ics_text: &str,
+        profile_id: ProfileId,
+    ) -> crate::Result<Vec<CalendarEvent>> {
         let mut events = Vec::new();
 
         for line in ics_text.lines() {
@@ -27,10 +30,7 @@ impl IcsReader {
     }
 
     /// Fetch and parse an ICS feed from an HTTPS URL (stub).
-    pub fn fetch_feed(
-        _url: &str,
-        profile_id: ProfileId,
-    ) -> crate::Result<Vec<CalendarEvent>> {
+    pub fn fetch_feed(_url: &str, profile_id: ProfileId) -> crate::Result<Vec<CalendarEvent>> {
         // Future: use reqwest to fetch from URL
         // For now, return empty with proper type signature
         Ok(Vec::new())

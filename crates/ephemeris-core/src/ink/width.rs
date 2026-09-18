@@ -27,7 +27,12 @@ pub struct WidthConfig {
 
 impl Default for WidthConfig {
     fn default() -> Self {
-        Self { min_ratio: 0.35, max_ratio: 1.6, gamma: 1.4, min_px: 0.5 }
+        Self {
+            min_ratio: 0.35,
+            max_ratio: 1.6,
+            gamma: 1.4,
+            min_px: 0.5,
+        }
     }
 }
 
@@ -56,7 +61,10 @@ mod tests {
         let cfg = WidthConfig::default();
         let w = cfg.width_for(4.0, 0.0);
         assert!(w >= cfg.min_px);
-        assert!(w < cfg.width_for(4.0, 1.0), "min pressure should be thinner than max");
+        assert!(
+            w < cfg.width_for(4.0, 1.0),
+            "min pressure should be thinner than max"
+        );
     }
 
     #[test]
@@ -76,7 +84,10 @@ mod tests {
         for i in 0..=100 {
             let p = i as f32 / 100.0;
             let w = cfg.width_for(3.0, p);
-            assert!(w >= prev - 1e-6, "width must not decrease as pressure rises");
+            assert!(
+                w >= prev - 1e-6,
+                "width must not decrease as pressure rises"
+            );
             prev = w;
         }
     }
@@ -90,7 +101,10 @@ mod tests {
 
     #[test]
     fn respects_absolute_floor() {
-        let cfg = WidthConfig { min_px: 2.0, ..Default::default() };
+        let cfg = WidthConfig {
+            min_px: 2.0,
+            ..Default::default()
+        };
         // Tiny base width, zero pressure would go below the floor.
         assert_eq!(cfg.width_for(0.1, 0.0), 2.0);
     }

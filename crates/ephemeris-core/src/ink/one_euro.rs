@@ -19,7 +19,10 @@ struct LowPass {
 
 impl LowPass {
     fn new() -> Self {
-        Self { initialised: false, prev: 0.0 }
+        Self {
+            initialised: false,
+            prev: 0.0,
+        }
     }
 
     fn filter(&mut self, x: f32, alpha: f32) -> f32 {
@@ -52,7 +55,11 @@ pub struct OneEuroConfig {
 impl Default for OneEuroConfig {
     fn default() -> Self {
         // Tuned for pen input sampled at ~100–200 Hz in logical pixels.
-        Self { min_cutoff: 1.0, beta: 0.007, d_cutoff: 1.0 }
+        Self {
+            min_cutoff: 1.0,
+            beta: 0.007,
+            d_cutoff: 1.0,
+        }
     }
 }
 
@@ -99,7 +106,11 @@ impl OneEuroFilter {
         self.last_time_s = Some(t_s);
 
         // Estimate derivative (speed) and low-pass it.
-        let dx = if self.has_prev_x { (x - self.prev_x) / dt } else { 0.0 };
+        let dx = if self.has_prev_x {
+            (x - self.prev_x) / dt
+        } else {
+            0.0
+        };
         self.prev_x = x;
         self.has_prev_x = true;
 
