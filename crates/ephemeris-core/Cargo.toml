@@ -10,6 +10,8 @@ license.workspace = true
 default = ["fs"]
 # `fs` enables the JSON-on-disk StrokeStore (desktop dev + persist/reload tests).
 fs = []
+# `sqlite` enables the SQLite-backed storage layer (rusqlite, bundled libsqlite3).
+sqlite = []
 
 [dependencies]
 ephemeris-pal = { workspace = true }

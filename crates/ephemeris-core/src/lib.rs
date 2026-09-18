@@ -12,6 +12,7 @@ pub mod geom;
 pub mod ics;
 pub mod ink;
 pub mod model;
+#[cfg(feature = "sqlite")]
 pub mod sqlite;
 pub mod store;
 
@@ -27,8 +28,7 @@ pub use model::{
 pub fn init_tracing() {
     use tracing_subscriber::EnvFilter;
 
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
@@ -36,8 +36,8 @@ pub fn init_tracing() {
         .with_thread_ids(true)
         .init();
 }
-pub mod webdav;
-pub mod task_provider;
-pub mod stroke_persistence;
-pub mod profile_manager;
 pub mod obsidian;
+pub mod profile_manager;
+pub mod stroke_persistence;
+pub mod task_provider;
+pub mod webdav;
