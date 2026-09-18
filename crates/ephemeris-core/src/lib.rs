@@ -12,6 +12,7 @@ pub mod geom;
 pub mod ics;
 pub mod ink;
 pub mod model;
+#[cfg(feature = "sqlite")]
 pub mod sqlite;
 pub mod store;
 
