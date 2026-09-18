@@ -6,12 +6,27 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+# Enables the live Wayland compositor dispatch loop in `input::wayland`.
+# The loop itself is additionally `#[cfg(target_os = "linux")]`-gated, so
+# enabling this feature on a non-Linux host (e.g. the macOS dev/CI box) still
+# compiles the crate — it simply omits the live loop. The dependencies below
+# are only pulled in on Linux via a target-scoped dependency table.
+wayland = ["dep:wayland-client", "dep:wayland-protocols"]
+
 [dependencies]
 crossbeam-channel = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
 winit = { workspace = true }
 softbuffer = { workspace = true }
+
+# Wayland client + protocol bindings for the live dispatch loop. Target-gated to
+# Linux so `--features wayland` still resolves (as a no-op) on macOS/Windows;
+# `optional = true` keeps them out of the default build entirely.
+[target.'cfg(target_os = "linux")'.dependencies]
+wayland-client = { version = "0.31", optional = true }
+wayland-protocols = { version = "0.32", features = ["client", "unstable"], optional = true }
 
 [dev-dependencies]
 # nothing extra needed; mock backend is in src/input/mock.rs behind #[cfg(feature="mock")]

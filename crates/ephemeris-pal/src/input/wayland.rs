@@ -15,15 +15,33 @@
 //!   (pressure `[0, 1]`, tilt in degrees, touch slot bookkeeping) without a
 //!   live compositor.
 //! * [`WaylandInput::run`] connects to the compositor and pumps the event
-//!   queue.  The compositor plumbing is not yet wired up (see the note in
-//!   `run`); everything downstream of the `on_*` seam is implemented and
-//!   tested.
+//!   queue.  The live loop that binds the globals and drives the `on_*` seam
+//!   lives in the [`live`] submodule and is compiled only on Linux with the
+//!   `wayland` feature enabled (see [Compile-time gating](#compile-time-gating)).
+//!
+//! # Compile-time gating
+//!
+//! The normalisation seam ([`WaylandState`] and the `on_*` handlers) is
+//! platform-agnostic pure Rust: it compiles and is unit-tested on every host,
+//! including the macOS dev/CI box.  The *live* dispatch loop needs a real
+//! `libwayland` and only exists on Linux with the `wayland` Cargo feature:
+//!
+//! * `#[cfg(all(feature = "wayland", target_os = "linux"))]` — the [`live`]
+//!   module (the [`wayland_client`]/[`wayland_protocols`] plumbing).  This is
+//!   **compile-only** in CI: it cannot be unit-tested without a running
+//!   compositor, so it is validated by the type checker, not by tests.
+//! * Otherwise — [`WaylandInput::run`] returns [`InputError::Init`] so a caller
+//!   on an unsupported build can fall back to another backend.
+//!
+//! The `on_*` handlers, [`WaylandState`] and the channel wiring are exercised
+//! by the module's unit tests on every platform.
 
-// The `on_*` normalisation handlers, the shared state and the sender are
-// driven by the Wayland compositor dispatch loop, which is not yet wired up in
-// `run` (see the note there). Until it is, they are exercised only by the unit
-// tests, so suppress dead-code warnings at the module level rather than
-// annotating each item.
+// The `on_*` normalisation handlers, the shared state and the sender are driven
+// by the live Wayland dispatch loop, which is only compiled on Linux with the
+// `wayland` feature. On every other build (the default macOS/CI build, or any
+// non-Linux target) the loop is absent, so these items are reachable only from
+// the unit tests. Suppress dead-code warnings at the module level rather than
+// annotating each item; the `live` submodule references them for real.
 #![allow(dead_code)]
 
 use std::collections::HashMap;
@@ -241,22 +259,308 @@ impl Input for WaylandInput {
     }
 
     fn run(self) -> Result<(), InputError> {
-        // Full backend wiring (tracked as follow-up):
-        // 1. Connect to the Wayland display and get the registry.
-        // 2. Bind wl_seat, zwp_tablet_manager_v2 (→ tablet_seat → tablet_tool)
-        //    and wl_touch.
-        // 3. Register listeners that forward protocol callbacks to the `on_*`
-        //    methods above (the normalisation seam, already implemented/tested).
-        // 4. Block dispatching the event queue until the connection closes,
-        //    then return.
-        //
-        // The compositor connection is not yet established. Rather than
-        // silently succeeding (which would make consumers believe a live
-        // stream had ended), report that initialisation is incomplete so the
-        // caller can fall back to another backend.
-        Err(InputError::Init(
-            "Wayland compositor connection not yet implemented".to_string(),
-        ))
+        #[cfg(all(feature = "wayland", target_os = "linux"))]
+        {
+            // Delegate to the live loop: connect to the display, bind the
+            // globals, register the delegates that forward compositor events
+            // to the `on_*` seam, and block pumping the queue until the
+            // connection closes.
+            live::run(self)
+        }
+        #[cfg(not(all(feature = "wayland", target_os = "linux")))]
+        {
+            // No live loop on this build (non-Linux target, or the `wayland`
+            // feature is off). Rather than silently succeeding — which would
+            // make consumers believe a live stream had opened and then ended —
+            // report that initialisation is unavailable so the caller can fall
+            // back to another backend.
+            Err(InputError::Init(
+                "Wayland live dispatch loop unavailable: requires the `wayland` \
+                 feature on a Linux target"
+                    .to_string(),
+            ))
+        }
+    }
+}
+
+// ── Live compositor dispatch loop (Linux + `wayland` feature only) ─────────────
+
+/// Live Wayland dispatch loop.
+///
+/// This module is compiled only on Linux with the `wayland` Cargo feature: it
+/// depends on `libwayland` via [`wayland_client`]/[`wayland_protocols`], which
+/// do not exist on the macOS dev/CI host. It is therefore **compile-only** in
+/// CI — validated by the type checker, but not by unit tests, since exercising
+/// it needs a running compositor. All event normalisation is delegated straight
+/// back to the platform-agnostic `on_*` handlers on [`WaylandInput`], which
+/// *are* unit-tested on every platform.
+#[cfg(all(feature = "wayland", target_os = "linux"))]
+mod live {
+    use wayland_client::protocol::{wl_registry, wl_seat, wl_touch};
+    use wayland_client::{Connection, Dispatch, QueueHandle};
+    use wayland_protocols::wp::tablet::zv2::client::{
+        zwp_tablet_manager_v2, zwp_tablet_seat_v2, zwp_tablet_tool_v2, zwp_tablet_v2,
+    };
+
+    use super::super::InputError;
+    use super::WaylandInput;
+
+    /// wl_touch reports positions as 24.8 `wl_fixed` values; this converts one
+    /// back to a logical-pixel `f32`.
+    fn fixed_to_f32(v: f64) -> f32 {
+        v as f32
+    }
+
+    /// State driven by the Wayland dispatch queue.
+    ///
+    /// Holds the [`WaylandInput`] whose `on_*` handlers do the normalisation,
+    /// plus the globals bound off the registry. The manager/seat/tool/touch
+    /// proxies are kept alive here so their events keep being delivered.
+    struct AppData {
+        input: WaylandInput,
+        seat: Option<wl_seat::WlSeat>,
+        tablet_manager: Option<zwp_tablet_manager_v2::ZwpTabletManagerV2>,
+        tablet_seat: Option<zwp_tablet_seat_v2::ZwpTabletSeatV2>,
+        touch: Option<wl_touch::WlTouch>,
+    }
+
+    /// Connect to the compositor, bind the needed globals, register the
+    /// delegates that forward events to the `on_*` seam, and pump the event
+    /// queue until the connection is lost.
+    ///
+    /// Blocks for the lifetime of the connection (run on a dedicated thread,
+    /// per the [`Input::run`](super::super::Input::run) contract).
+    pub(super) fn run(input: WaylandInput) -> Result<(), InputError> {
+        let conn = Connection::connect_to_env()
+            .map_err(|e| InputError::Init(format!("Wayland connect failed: {e}")))?;
+
+        let display = conn.display();
+        let mut queue = conn.new_event_queue::<AppData>();
+        let qh = queue.handle();
+
+        // Getting the registry triggers the initial burst of `global` events
+        // that bind wl_seat and zwp_tablet_manager_v2 below.
+        display.get_registry(&qh, ());
+
+        let mut app = AppData {
+            input,
+            seat: None,
+            tablet_manager: None,
+            tablet_seat: None,
+            touch: None,
+        };
+
+        // A first blocking round-trip drains the registry advertisement so the
+        // globals are bound before we settle into the steady-state loop.
+        queue
+            .roundtrip(&mut app)
+            .map_err(|e| InputError::Init(format!("Wayland roundtrip failed: {e}")))?;
+
+        // Steady state: block on the socket and dispatch until the compositor
+        // hangs up (the display errors out), then return so the caller can tear
+        // the backend down.
+        loop {
+            queue
+                .blocking_dispatch(&mut app)
+                .map_err(|e| InputError::Init(format!("Wayland dispatch failed: {e}")))?;
+        }
+    }
+
+    // ── Registry: bind seat + tablet manager ──────────────────────────────────
+
+    impl Dispatch<wl_registry::WlRegistry, ()> for AppData {
+        fn event(
+            state: &mut Self,
+            registry: &wl_registry::WlRegistry,
+            event: wl_registry::Event,
+            _: &(),
+            _: &Connection,
+            qh: &QueueHandle<Self>,
+        ) {
+            if let wl_registry::Event::Global {
+                name,
+                interface,
+                version,
+            } = event
+            {
+                match interface.as_str() {
+                    "wl_seat" => {
+                        // Bind the seat; its `capabilities` event tells us
+                        // whether a touch device is present.
+                        let seat =
+                            registry.bind::<wl_seat::WlSeat, _, _>(name, version.min(7), qh, ());
+                        state.seat = Some(seat);
+                        state.try_init_tablet_seat(qh);
+                    }
+                    "zwp_tablet_manager_v2" => {
+                        let manager = registry
+                            .bind::<zwp_tablet_manager_v2::ZwpTabletManagerV2, _, _>(
+                                name,
+                                version.min(1),
+                                qh,
+                                (),
+                            );
+                        state.tablet_manager = Some(manager);
+                        state.try_init_tablet_seat(qh);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    impl AppData {
+        /// Once both the seat and the tablet manager are bound, obtain the
+        /// per-seat tablet seat so tool add/removal events start flowing.
+        fn try_init_tablet_seat(&mut self, qh: &QueueHandle<Self>) {
+            if self.tablet_seat.is_some() {
+                return;
+            }
+            if let (Some(manager), Some(seat)) = (&self.tablet_manager, &self.seat) {
+                self.tablet_seat = Some(manager.get_tablet_seat(seat, qh, ()));
+            }
+        }
+    }
+
+    // ── Seat: discover the touch device ───────────────────────────────────────
+
+    impl Dispatch<wl_seat::WlSeat, ()> for AppData {
+        fn event(
+            state: &mut Self,
+            seat: &wl_seat::WlSeat,
+            event: wl_seat::Event,
+            _: &(),
+            _: &Connection,
+            qh: &QueueHandle<Self>,
+        ) {
+            if let wl_seat::Event::Capabilities {
+                capabilities: wayland_client::WEnum::Value(caps),
+            } = event
+            {
+                let has_touch = caps.contains(wl_seat::Capability::Touch);
+                if has_touch && state.touch.is_none() {
+                    state.touch = Some(seat.get_touch(qh, ()));
+                } else if !has_touch {
+                    // Capability withdrawn: drop the proxy so we stop listening.
+                    state.touch = None;
+                }
+            }
+        }
+    }
+
+    // ── Tablet manager: no events, but must implement Dispatch ────────────────
+
+    impl Dispatch<zwp_tablet_manager_v2::ZwpTabletManagerV2, ()> for AppData {
+        fn event(
+            _: &mut Self,
+            _: &zwp_tablet_manager_v2::ZwpTabletManagerV2,
+            _: zwp_tablet_manager_v2::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
+    }
+
+    // ── Tablet seat: a new tool appears ───────────────────────────────────────
+
+    impl Dispatch<zwp_tablet_seat_v2::ZwpTabletSeatV2, ()> for AppData {
+        fn event(
+            _: &mut Self,
+            _: &zwp_tablet_seat_v2::ZwpTabletSeatV2,
+            event: zwp_tablet_seat_v2::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            // `tool_added` (and `tablet_added`/`pad_added`) arrive as this
+            // event's variants carrying already-constructed proxies, which the
+            // generated code routes to their own Dispatch impls below. Nothing
+            // extra to do here.
+            let _ = event;
+        }
+    }
+
+    // ── Tablet device: proximity/pressure not carried here ────────────────────
+
+    impl Dispatch<zwp_tablet_v2::ZwpTabletV2, ()> for AppData {
+        fn event(
+            _: &mut Self,
+            _: &zwp_tablet_v2::ZwpTabletV2,
+            _: zwp_tablet_v2::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
+    }
+
+    // ── Tablet tool: the stylus event stream → on_pen_* ───────────────────────
+
+    impl Dispatch<zwp_tablet_tool_v2::ZwpTabletToolV2, ()> for AppData {
+        fn event(
+            state: &mut Self,
+            _: &zwp_tablet_tool_v2::ZwpTabletToolV2,
+            event: zwp_tablet_tool_v2::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            use zwp_tablet_tool_v2::Event;
+            match event {
+                Event::ProximityIn { .. } => state.input.on_pen_proximity(true),
+                Event::ProximityOut => state.input.on_pen_proximity(false),
+                Event::Motion { x, y } => {
+                    state.input.on_pen_motion(fixed_to_f32(x), fixed_to_f32(y))
+                }
+                Event::Pressure { pressure } => state.input.on_pen_pressure(pressure),
+                Event::Tilt { tilt_x, tilt_y } => state
+                    .input
+                    .on_pen_tilt(fixed_to_f32(tilt_x), fixed_to_f32(tilt_y)),
+                Event::Button { state: btn, .. } => {
+                    let pressed = matches!(
+                        btn,
+                        wayland_client::WEnum::Value(zwp_tablet_tool_v2::ButtonState::Pressed)
+                    );
+                    state.input.on_pen_button(pressed);
+                }
+                // `down`/`up` (tip contact) is derived from pressure crossing
+                // zero in `on_pen_pressure`, and `frame`/`removed`/etc. carry no
+                // sample we forward, so they are intentionally ignored.
+                _ => {}
+            }
+        }
+    }
+
+    // ── Touch: the finger event stream → on_touch_* ───────────────────────────
+
+    impl Dispatch<wl_touch::WlTouch, ()> for AppData {
+        fn event(
+            state: &mut Self,
+            _: &wl_touch::WlTouch,
+            event: wl_touch::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            use wl_touch::Event;
+            match event {
+                Event::Down { id, x, y, .. } => {
+                    state
+                        .input
+                        .on_touch_down(id as u32, fixed_to_f32(x), fixed_to_f32(y))
+                }
+                Event::Motion { id, x, y, .. } => {
+                    state
+                        .input
+                        .on_touch_motion(id as u32, fixed_to_f32(x), fixed_to_f32(y))
+                }
+                Event::Up { id, .. } => state.input.on_touch_up(id as u32),
+                // `frame`, `cancel`, `shape`, `orientation` carry no coordinate
+                // sample we forward here.
+                _ => {}
+            }
+        }
     }
 }
 
