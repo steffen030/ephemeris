@@ -19,8 +19,7 @@ mod tests {
 
     #[test]
     fn persist_and_load_strokes() {
-        let strokes = StrokePersistence::load_strokes_for_page("page-1")
-            .expect("should load");
+        let strokes = StrokePersistence::load_strokes_for_page("page-1").expect("should load");
         assert_eq!(strokes.len(), 0);
     }
 }

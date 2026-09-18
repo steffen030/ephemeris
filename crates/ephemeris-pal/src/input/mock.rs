@@ -70,7 +70,10 @@ impl ScriptEntry {
 
     /// Create an entry with a delay.
     pub fn after(delay: Duration, event: InputEvent) -> Self {
-        Self { delay: Some(delay), event }
+        Self {
+            delay: Some(delay),
+            event,
+        }
     }
 }
 
@@ -111,7 +114,13 @@ impl MockInput {
         let coords: Vec<(f32, f32)> = points.into_iter().collect();
         assert!(!coords.is_empty(), "pen_stroke: points must not be empty");
 
-        let make_sample = |x, y| PenSample { x, y, pressure, tilt, in_range: true };
+        let make_sample = |x, y| PenSample {
+            x,
+            y,
+            pressure,
+            tilt,
+            in_range: true,
+        };
 
         let last = coords.len() - 1;
         let script: Vec<ScriptEntry> = coords
@@ -138,7 +147,10 @@ impl MockInput {
     /// `id`.
     pub fn touch_gesture(id: u32, points: impl IntoIterator<Item = (f32, f32)>) -> Self {
         let coords: Vec<(f32, f32)> = points.into_iter().collect();
-        assert!(!coords.is_empty(), "touch_gesture: points must not be empty");
+        assert!(
+            !coords.is_empty(),
+            "touch_gesture: points must not be empty"
+        );
 
         let last = coords.len() - 1;
         let script: Vec<ScriptEntry> = coords
@@ -212,8 +224,15 @@ mod tests {
         // A stroke with one point should still emit both PenDown and PenUp
         // (they share the same coordinate).
         let events = drain(MockInput::pen_stroke([(5.0_f32, 10.0_f32)], 0.5, 0.0));
-        assert_eq!(events.len(), 1, "single-point stroke: only PenDown (== PenUp)");
-        assert!(matches!(events[0], InputEvent::PenDown(_) | InputEvent::PenUp(_)));
+        assert_eq!(
+            events.len(),
+            1,
+            "single-point stroke: only PenDown (== PenUp)"
+        );
+        assert!(matches!(
+            events[0],
+            InputEvent::PenDown(_) | InputEvent::PenUp(_)
+        ));
     }
 
     #[test]
@@ -222,10 +241,22 @@ mod tests {
         let events = drain(MockInput::pen_stroke(points, 0.8, 5.0));
 
         assert_eq!(events.len(), 4);
-        assert!(matches!(events[0], InputEvent::PenDown(_)), "first must be PenDown");
-        assert!(matches!(events[1], InputEvent::PenMove(_)), "middle must be PenMove");
-        assert!(matches!(events[2], InputEvent::PenMove(_)), "middle must be PenMove");
-        assert!(matches!(events[3], InputEvent::PenUp(_)), "last must be PenUp");
+        assert!(
+            matches!(events[0], InputEvent::PenDown(_)),
+            "first must be PenDown"
+        );
+        assert!(
+            matches!(events[1], InputEvent::PenMove(_)),
+            "middle must be PenMove"
+        );
+        assert!(
+            matches!(events[2], InputEvent::PenMove(_)),
+            "middle must be PenMove"
+        );
+        assert!(
+            matches!(events[3], InputEvent::PenUp(_)),
+            "last must be PenUp"
+        );
     }
 
     #[test]
@@ -254,7 +285,11 @@ mod tests {
 
     #[test]
     fn pen_stroke_in_range_is_true() {
-        let events = drain(MockInput::pen_stroke([(0.0_f32, 0.0), (1.0, 1.0)], 0.5, 0.0));
+        let events = drain(MockInput::pen_stroke(
+            [(0.0_f32, 0.0), (1.0, 1.0)],
+            0.5,
+            0.0,
+        ));
         for e in &events {
             if let InputEvent::PenDown(s) | InputEvent::PenMove(s) | InputEvent::PenUp(s) = e {
                 assert!(s.in_range, "in_range must be true during a stroke");
@@ -274,14 +309,20 @@ mod tests {
 
         assert_eq!(events.len(), 2);
         assert!(matches!(events[0], InputEvent::PenButton { pressed: true }));
-        assert!(matches!(events[1], InputEvent::PenButton { pressed: false }));
+        assert!(matches!(
+            events[1],
+            InputEvent::PenButton { pressed: false }
+        ));
     }
 
     // ── Hover ─────────────────────────────────────────────────────────────────
 
     #[test]
     fn hover_event() {
-        let script = vec![ScriptEntry::immediate(InputEvent::Hover { x: 42.0, y: 99.0 })];
+        let script = vec![ScriptEntry::immediate(InputEvent::Hover {
+            x: 42.0,
+            y: 99.0,
+        })];
         let events = drain(MockInput::from_script(script));
 
         assert_eq!(events.len(), 1);
@@ -309,12 +350,15 @@ mod tests {
 
         for e in &events {
             let id = match e {
-                InputEvent::TouchBegin(s)
-                | InputEvent::TouchMove(s)
-                | InputEvent::TouchEnd(s) => s.id,
+                InputEvent::TouchBegin(s) | InputEvent::TouchMove(s) | InputEvent::TouchEnd(s) => {
+                    s.id
+                }
                 _ => panic!("unexpected event"),
             };
-            assert_eq!(id, 7, "touch id must match the one supplied to touch_gesture");
+            assert_eq!(
+                id, 7,
+                "touch id must match the one supplied to touch_gesture"
+            );
         }
     }
 
@@ -322,11 +366,7 @@ mod tests {
 
     #[test]
     fn receiver_can_be_cloned_for_fanout() {
-        let backend = MockInput::pen_stroke(
-            [(0.0_f32, 0.0), (1.0, 0.0), (2.0, 0.0)],
-            0.5,
-            0.0,
-        );
+        let backend = MockInput::pen_stroke([(0.0_f32, 0.0), (1.0, 0.0), (2.0, 0.0)], 0.5, 0.0);
         // Two independent consumers share the *same* underlying channel.
         // crossbeam-channel is MPMC: each message is delivered to exactly one
         // receiver.  This test just checks that cloning the receiver compiles
@@ -348,26 +388,26 @@ mod tests {
 
     #[test]
     fn channel_closes_after_run() {
-        let backend = MockInput::from_script(vec![
-            ScriptEntry::immediate(InputEvent::Hover { x: 0.0, y: 0.0 }),
-        ]);
+        let backend = MockInput::from_script(vec![ScriptEntry::immediate(InputEvent::Hover {
+            x: 0.0,
+            y: 0.0,
+        })]);
         let rx = backend.receiver();
         backend.run().unwrap();
         // Drain the one event.
         let _ = rx.try_recv().unwrap();
         // Now channel is empty AND closed; try_recv should return an error.
-        assert!(rx.try_recv().is_err(), "channel should be closed after run() returns");
+        assert!(
+            rx.try_recv().is_err(),
+            "channel should be closed after run() returns"
+        );
     }
 
     // ── Threaded replay ───────────────────────────────────────────────────────
 
     #[test]
     fn threaded_replay_receives_events_in_order() {
-        let stroke = MockInput::pen_stroke(
-            (0..10).map(|i| (i as f32, i as f32 * 2.0)),
-            0.7,
-            0.0,
-        );
+        let stroke = MockInput::pen_stroke((0..10).map(|i| (i as f32, i as f32 * 2.0)), 0.7, 0.0);
         let rx = stroke.receiver();
 
         let handle = std::thread::spawn(move || stroke.run().unwrap());

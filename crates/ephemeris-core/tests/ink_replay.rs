@@ -43,7 +43,10 @@ fn replay(points: Vec<(f32, f32)>, pressure: f32) -> (Vec<InkUpdate>, Stroke) {
     for ev in &events {
         match engine.update_now(ev) {
             InkUpdate::Finished { stroke, damage } => {
-                updates.push(InkUpdate::Finished { stroke: stroke.clone(), damage });
+                updates.push(InkUpdate::Finished {
+                    stroke: stroke.clone(),
+                    damage,
+                });
                 finished = Some(*stroke);
             }
             other => updates.push(other),
@@ -90,8 +93,14 @@ fn replaying_recorded_stream_produces_smooth_stroke() {
     );
 
     // And it should still roughly follow the original: endpoints close to raw.
-    let (fx, fy) = (stroke.points.first().unwrap().x, stroke.points.first().unwrap().y);
-    let (lx, ly) = (stroke.points.last().unwrap().x, stroke.points.last().unwrap().y);
+    let (fx, fy) = (
+        stroke.points.first().unwrap().x,
+        stroke.points.first().unwrap().y,
+    );
+    let (lx, ly) = (
+        stroke.points.last().unwrap().x,
+        stroke.points.last().unwrap().y,
+    );
     assert!((fx - raw[0].0).abs() < 5.0 && (fy - raw[0].1).abs() < 5.0);
     let last_raw = *raw.last().unwrap();
     assert!((lx - last_raw.0).abs() < 5.0 && (ly - last_raw.1).abs() < 5.0);
@@ -141,7 +150,10 @@ fn only_stroke_bbox_is_reported_as_damage() {
         }
     }
 
-    assert!(saw_damage, "engine must report incremental damage while drawing");
+    assert!(
+        saw_damage,
+        "engine must report incremental damage while drawing"
+    );
 
     // The union of all damage must NOT cover the whole canvas.
     assert!(
@@ -160,7 +172,10 @@ fn first_event_starts_and_last_finishes() {
     let (updates, _stroke) = replay(raw, 0.6);
 
     assert!(matches!(updates.first().unwrap(), InkUpdate::Started));
-    assert!(matches!(updates.last().unwrap(), InkUpdate::Finished { .. }));
+    assert!(matches!(
+        updates.last().unwrap(),
+        InkUpdate::Finished { .. }
+    ));
     // Exactly one stroke finished.
     let finishes = updates
         .iter()

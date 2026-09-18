@@ -7,7 +7,9 @@ pub struct ObsidianVault {
 
 impl ObsidianVault {
     pub fn new(path: impl Into<String>) -> Self {
-        ObsidianVault { vault_path: path.into() }
+        ObsidianVault {
+            vault_path: path.into(),
+        }
     }
 
     pub fn read_notes(&self) -> crate::Result<Vec<Note>> {

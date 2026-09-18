@@ -1,5 +1,5 @@
 use crate::{AppError, Stroke};
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 
 /// SQLite-backed storage layer for Ephemeris.
 pub struct SqliteStore {
@@ -19,8 +19,9 @@ impl SqliteStore {
 
     /// Initialize database schema if not already present.
     fn init_schema(&self) -> crate::Result<()> {
-        self.conn.execute_batch(
-            r#"
+        self.conn
+            .execute_batch(
+                r#"
             CREATE TABLE IF NOT EXISTS strokes (
                 id TEXT PRIMARY KEY,
                 page_id TEXT NOT NULL,
@@ -39,7 +40,8 @@ impl SqliteStore {
                 updated INTEGER
             );
             "#,
-        ).map_err(|e| AppError::Storage(format!("Failed to initialize schema: {}", e)))?;
+            )
+            .map_err(|e| AppError::Storage(format!("Failed to initialize schema: {}", e)))?;
         Ok(())
     }
 
@@ -58,12 +60,12 @@ impl SqliteStore {
 
     /// Load a stroke by ID.
     pub fn load_stroke(&self, stroke_id: &str) -> crate::Result<Option<Stroke>> {
-        let mut stmt = self.conn.prepare("SELECT data FROM strokes WHERE id = ?1")
+        let mut stmt = self
+            .conn
+            .prepare("SELECT data FROM strokes WHERE id = ?1")
             .map_err(|e| AppError::Storage(format!("Query error: {}", e)))?;
 
-        match stmt.query_row(params![stroke_id], |row| {
-            row.get::<_, String>(0)
-        }) {
+        match stmt.query_row(params![stroke_id], |row| row.get::<_, String>(0)) {
             Ok(json) => {
                 let stroke = serde_json::from_str(&json)
                     .map_err(|e| AppError::Storage(format!("Deserialization error: {}", e)))?;
@@ -76,14 +78,16 @@ impl SqliteStore {
 
     /// Delete a stroke by ID.
     pub fn delete_stroke(&self, stroke_id: &str) -> crate::Result<()> {
-        self.conn.execute("DELETE FROM strokes WHERE id = ?1", params![stroke_id])
+        self.conn
+            .execute("DELETE FROM strokes WHERE id = ?1", params![stroke_id])
             .map_err(|e| AppError::Storage(format!("Failed to delete stroke: {}", e)))?;
         Ok(())
     }
 
     /// Clear all strokes on a page.
     pub fn clear_page(&self, page_id: &str) -> crate::Result<()> {
-        self.conn.execute("DELETE FROM strokes WHERE page_id = ?1", params![page_id])
+        self.conn
+            .execute("DELETE FROM strokes WHERE page_id = ?1", params![page_id])
             .map_err(|e| AppError::Storage(format!("Failed to clear page: {}", e)))?;
         Ok(())
     }
@@ -116,7 +120,9 @@ mod tests {
         stroke.points.push(Point::new(10.0, 20.0, 0.5, 0.0, 0));
 
         store.save_stroke(&stroke).expect("should save");
-        let loaded = store.load_stroke(&stroke.id.0.to_string()).expect("should load");
+        let loaded = store
+            .load_stroke(&stroke.id.0.to_string())
+            .expect("should load");
 
         assert!(loaded.is_some());
         assert_eq!(loaded.unwrap().id, stroke.id);
@@ -131,9 +137,13 @@ mod tests {
 
         let stroke = Stroke::new(Tool::Pen, Color::BLACK, 2.0);
         store.save_stroke(&stroke).expect("should save");
-        store.delete_stroke(&stroke.id.0.to_string()).expect("should delete");
+        store
+            .delete_stroke(&stroke.id.0.to_string())
+            .expect("should delete");
 
-        let loaded = store.load_stroke(&stroke.id.0.to_string()).expect("should load");
+        let loaded = store
+            .load_stroke(&stroke.id.0.to_string())
+            .expect("should load");
         assert!(loaded.is_none());
 
         fs::remove_file(&path).ok();
