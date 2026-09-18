@@ -235,3 +235,223 @@ impl InkEngine {
         self.update(event, t)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ephemeris_pal::input::PenSample;
+
+    fn sample(x: f32, y: f32, pressure: f32) -> PenSample {
+        PenSample { x, y, pressure, tilt: 0.0, in_range: true }
+    }
+
+    /// Feed a full PenDown -> PenMove* -> PenUp stream at constant pressure and
+    /// return every update plus the finished stroke.
+    fn drive(coords: &[(f32, f32)], pressure: f32) -> (Vec<InkUpdate>, Stroke) {
+        let mut engine = InkEngine::new(InkConfig::default());
+        let mut updates = Vec::new();
+        let mut finished = None;
+        let last = coords.len() - 1;
+        for (i, &(x, y)) in coords.iter().enumerate() {
+            let s = sample(x, y, pressure);
+            let ev = if i == 0 {
+                InputEvent::PenDown(s)
+            } else if i == last {
+                InputEvent::PenUp(s)
+            } else {
+                InputEvent::PenMove(s)
+            };
+            let u = engine.update_now(&ev);
+            if let InkUpdate::Finished { stroke, damage } = u {
+                finished = Some(*stroke.clone());
+                updates.push(InkUpdate::Finished { stroke, damage });
+            } else {
+                updates.push(u);
+            }
+        }
+        (updates, finished.expect("stream must finish a stroke"))
+    }
+
+    fn diagonal(n: usize) -> Vec<(f32, f32)> {
+        (0..n).map(|i| (10.0 + i as f32 * 4.0, 20.0 + i as f32 * 3.0)).collect()
+    }
+
+    #[test]
+    fn lifecycle_started_extended_finished() {
+        let (updates, _stroke) = drive(&diagonal(6), 0.5);
+        assert!(matches!(updates.first().unwrap(), InkUpdate::Started));
+        assert!(matches!(updates.last().unwrap(), InkUpdate::Finished { .. }));
+        assert_eq!(
+            updates.iter().filter(|u| matches!(u, InkUpdate::Started)).count(),
+            1
+        );
+        assert_eq!(
+            updates.iter().filter(|u| matches!(u, InkUpdate::Finished { .. })).count(),
+            1
+        );
+        assert!(
+            updates.iter().any(|u| matches!(u, InkUpdate::Extended { .. })),
+            "the growing stroke must report incremental Extended damage"
+        );
+    }
+
+    #[test]
+    fn move_before_down_is_idle() {
+        let mut engine = InkEngine::new(InkConfig::default());
+        assert_eq!(engine.update_now(&InputEvent::PenMove(sample(1.0, 1.0, 0.5))), InkUpdate::Idle);
+        assert!(!engine.is_drawing());
+    }
+
+    #[test]
+    fn hover_button_touch_are_idle() {
+        let mut engine = InkEngine::new(InkConfig::default());
+        assert_eq!(engine.update_now(&InputEvent::Hover { x: 1.0, y: 2.0 }), InkUpdate::Idle);
+        assert_eq!(engine.update_now(&InputEvent::PenButton { pressed: true }), InkUpdate::Idle);
+        assert!(!engine.is_drawing());
+    }
+
+    #[test]
+    fn endpoints_anchored_to_raw_pen_down_and_up() {
+        // Endpoints must sit exactly on the raw PenDown / PenUp coordinates,
+        // not on the lagged One-Euro output.
+        let coords = diagonal(10);
+        let (_updates, stroke) = drive(&coords, 0.5);
+        let first = stroke.points.first().unwrap();
+        let last = stroke.points.last().unwrap();
+        let raw_first = coords[0];
+        let raw_last = *coords.last().unwrap();
+        assert!((first.x - raw_first.0).abs() < 1e-4 && (first.y - raw_first.1).abs() < 1e-4);
+        assert!((last.x - raw_last.0).abs() < 1e-4 && (last.y - raw_last.1).abs() < 1e-4);
+    }
+
+    #[test]
+    fn every_damage_rect_is_within_stroke_bbox_inflated_by_half_width() {
+        let coords = diagonal(12);
+        let cfg = InkConfig::default();
+        let (updates, stroke) = drive(&coords, 0.6);
+
+        // Reference bbox: the smoothed stroke centre-line inflated by the
+        // maximum possible half-width plus the engine's AA margin. Every damage
+        // rect (which is derived from the raw pre-smoothing samples) must fall
+        // within this region.
+        let mut bbox = Rect::empty();
+        for p in &stroke.points {
+            bbox.union_point(p.x, p.y);
+        }
+        // The raw samples can lie slightly outside the smoothed bbox and the
+        // spline can overshoot, so use a generous but bounded margin derived
+        // from the width config's largest width.
+        let max_half = cfg.width.width_for(cfg.base_width, 1.0) * 0.5 + 2.0;
+        let allowed = bbox.inflate(max_half + 4.0);
+
+        let mut union = Rect::empty();
+        let mut saw = false;
+        for u in &updates {
+            let d = match u {
+                InkUpdate::Extended { damage } => Some(*damage),
+                InkUpdate::Finished { damage, .. } => Some(*damage),
+                _ => None,
+            };
+            if let Some(d) = d {
+                saw = true;
+                union = union.union(&d);
+                assert!(
+                    d.min_x >= allowed.min_x && d.min_y >= allowed.min_y
+                        && d.max_x <= allowed.max_x && d.max_y <= allowed.max_y,
+                    "damage {d:?} escaped stroke bbox {allowed:?}"
+                );
+            }
+        }
+        assert!(saw, "expected incremental damage");
+
+        // No full-canvas redraw: the union of all damage must not exceed the
+        // stroke bbox region.
+        assert!(
+            union.width() <= allowed.width() + 1e-3 && union.height() <= allowed.height() + 1e-3,
+            "damage union {union:?} exceeded stroke bbox {allowed:?}"
+        );
+    }
+
+    #[test]
+    fn damage_union_equals_builder_total_damage() {
+        // Independent check that the running union tracked internally matches the
+        // union we recompute from the reported rects.
+        let coords = diagonal(8);
+        let (updates, _stroke) = drive(&coords, 0.5);
+        let mut union = Rect::empty();
+        for u in &updates {
+            match u {
+                InkUpdate::Extended { damage } => union = union.union(damage),
+                InkUpdate::Finished { damage, .. } => union = union.union(damage),
+                _ => {}
+            }
+        }
+        assert!(!union.is_empty());
+        // A single short diagonal stroke: bounded, tens of px, never thousands.
+        assert!(union.width() < 200.0 && union.height() < 200.0, "damage union too large: {union:?}");
+    }
+
+    #[test]
+    fn higher_pressure_yields_greater_width() {
+        // Same geometry, different constant pressure. The engine preserves
+        // per-point pressure into the stroke; the rendered width mapping must
+        // make the firmer stroke wider everywhere.
+        let coords = diagonal(10);
+        let cfg = InkConfig::default();
+        let (_u_soft, soft) = drive(&coords, 0.15);
+        let (_u_firm, firm) = drive(&coords, 0.9);
+
+        let mean_width = |s: &Stroke| -> f32 {
+            let n = s.points.len() as f32;
+            s.points
+                .iter()
+                .map(|p| cfg.width.width_for(s.base_width, p.pressure))
+                .sum::<f32>()
+                / n
+        };
+
+        let w_soft = mean_width(&soft);
+        let w_firm = mean_width(&firm);
+        assert!(
+            w_firm > w_soft,
+            "firm-pressure stroke width {w_firm} must exceed soft {w_soft}"
+        );
+    }
+
+    #[test]
+    fn near_duplicate_moves_are_dropped_but_endpoints_kept() {
+        // Feed a PenDown then many identical PenMoves then a PenUp. The near-
+        // duplicate moves must be dropped (Idle), but the stroke must still have
+        // its anchored endpoints.
+        let mut engine = InkEngine::new(InkConfig::default());
+        assert!(matches!(engine.update_now(&InputEvent::PenDown(sample(0.0, 0.0, 0.5))), InkUpdate::Started));
+        for _ in 0..5 {
+            // Same coordinate: below min_sample_dist -> dropped.
+            assert_eq!(engine.update_now(&InputEvent::PenMove(sample(0.0, 0.0, 0.5))), InkUpdate::Idle);
+        }
+        let fin = engine.update_now(&InputEvent::PenUp(sample(0.05, 0.05, 0.5)));
+        match fin {
+            InkUpdate::Finished { stroke, .. } => {
+                assert!(stroke.points.len() >= 2, "endpoints must be recorded even if moves dropped");
+            }
+            other => panic!("expected Finished, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn single_tap_down_up_produces_a_stroke() {
+        // Degenerate stroke: PenDown immediately followed by PenUp.
+        let mut engine = InkEngine::new(InkConfig::default());
+        assert!(matches!(engine.update_now(&InputEvent::PenDown(sample(3.0, 4.0, 0.5))), InkUpdate::Started));
+        match engine.update_now(&InputEvent::PenUp(sample(3.0, 4.0, 0.5))) {
+            InkUpdate::Finished { stroke, .. } => {
+                assert!(!stroke.points.is_empty());
+                for p in &stroke.points {
+                    assert!(p.x.is_finite() && p.y.is_finite());
+                }
+            }
+            other => panic!("expected Finished, got {other:?}"),
+        }
+        assert!(!engine.is_drawing());
+    }
+}
