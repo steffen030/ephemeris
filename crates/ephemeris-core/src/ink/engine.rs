@@ -198,6 +198,11 @@ impl InkEngine {
         self.active.is_some()
     }
 
+    /// Read-only access to the engine's current configuration.
+    pub fn config(&self) -> &InkConfig {
+        &self.cfg
+    }
+
     /// Feed one input event. `t_ms` is the sample's absolute timestamp; pass a
     /// monotonically increasing clock (see [`InkEngine::update_now`] if you
     /// don't have real timestamps).
