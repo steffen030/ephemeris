@@ -1,0 +1,205 @@
+// Ephemeris main UI — eink-optimised layout (800 × 600 default)
+//
+// Layers (top → bottom in z-order):
+//   1. StatusBar  — 24 px at top: page title + page index
+//   2. Toolbar    — 48 px at bottom: tool buttons (Pen / Highlighter / Eraser / Clear)
+//   3. Canvas     — fills remaining space: the ink stroke layer (seam for bead 6iy.2)
+//
+// All callbacks are wired to properties exposed to Rust so the bridge can
+// react to button presses and canvas touch events without winit.
+
+export component EphemerisPage inherits Window {
+    // ── Layout geometry ──────────────────────────────────────────────────
+    preferred-width:  800px;
+    preferred-height: 600px;
+    background: white;
+
+    // ── Exposed state ────────────────────────────────────────────────────
+
+    /// Page title shown in the status bar.
+    in property <string> page-title: "Untitled";
+
+    /// Current page index (1-based, shown as "n / total").
+    in property <int> page-index: 1;
+
+    /// Total page count.
+    in property <int> page-count: 1;
+
+    /// Active tool label (drives toolbar button highlight).
+    in-out property <string> active-tool: "pen";
+
+    // ── Callbacks (wired to Rust via bridge) ────────────────────────────
+
+    /// Emitted when the user taps the canvas (touch / mouse down).
+    callback canvas-touch(/* x */ float, /* y */ float);
+
+    /// Emitted when the user selects a toolbar tool.
+    callback tool-selected(/* tool name */ string);
+
+    /// Emitted when the user presses the "clear page" button.
+    callback clear-page();
+
+    // ── Status bar ───────────────────────────────────────────────────────
+    status-bar := Rectangle {
+        x: 0; y: 0;
+        width: parent.width;
+        height: 24px;
+        background: #e0e0e0;
+
+        HorizontalLayout {
+            padding-left: 8px;
+            padding-right: 8px;
+            alignment: space-between;
+
+            Text {
+                text: root.page-title;
+                font-size: 13px;
+                color: black;
+                vertical-alignment: center;
+            }
+
+            Text {
+                text: root.page-index + " / " + root.page-count;
+                font-size: 13px;
+                color: #444444;
+                vertical-alignment: center;
+            }
+        }
+    }
+
+    // ── Toolbar ──────────────────────────────────────────────────────────
+    toolbar := Rectangle {
+        x: 0;
+        y: parent.height - self.height;
+        width: parent.width;
+        height: 48px;
+        background: #e8e8e8;
+
+        HorizontalLayout {
+            padding: 4px;
+            spacing: 4px;
+            alignment: start;
+
+            // Pen button
+            pen-btn := Rectangle {
+                width: 80px; height: 40px;
+                background: root.active-tool == "pen" ? #b0b0b0 : #f0f0f0;
+                border-radius: 4px;
+                border-width: 1px;
+                border-color: #999999;
+
+                Text {
+                    text: "Pen";
+                    font-size: 14px;
+                    color: black;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+
+                TouchArea {
+                    clicked => {
+                        root.active-tool = "pen";
+                        root.tool-selected("pen");
+                    }
+                }
+            }
+
+            // Highlighter button
+            hl-btn := Rectangle {
+                width: 100px; height: 40px;
+                background: root.active-tool == "highlighter" ? #b0b0b0 : #f0f0f0;
+                border-radius: 4px;
+                border-width: 1px;
+                border-color: #999999;
+
+                Text {
+                    text: "Highlighter";
+                    font-size: 14px;
+                    color: black;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+
+                TouchArea {
+                    clicked => {
+                        root.active-tool = "highlighter";
+                        root.tool-selected("highlighter");
+                    }
+                }
+            }
+
+            // Eraser button
+            eraser-btn := Rectangle {
+                width: 80px; height: 40px;
+                background: root.active-tool == "eraser" ? #b0b0b0 : #f0f0f0;
+                border-radius: 4px;
+                border-width: 1px;
+                border-color: #999999;
+
+                Text {
+                    text: "Eraser";
+                    font-size: 14px;
+                    color: black;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+
+                TouchArea {
+                    clicked => {
+                        root.active-tool = "eraser";
+                        root.tool-selected("eraser");
+                    }
+                }
+            }
+
+            // Clear button (rightmost, with stronger visual separation)
+            clear-btn := Rectangle {
+                width: 80px; height: 40px;
+                background: #f0f0f0;
+                border-radius: 4px;
+                border-width: 1px;
+                border-color: #999999;
+
+                Text {
+                    text: "Clear";
+                    font-size: 14px;
+                    color: #cc0000;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+
+                TouchArea {
+                    clicked => { root.clear-page(); }
+                }
+            }
+        }
+    }
+
+    // ── Canvas (stroke layer — seam for bead 6iy.2) ──────────────────────
+    //
+    // This Rectangle occupies the space between the status bar and toolbar.
+    // Bead 6iy.2 will render completed and in-progress strokes by:
+    //   a) Providing a custom Image element fed from a pixel buffer, OR
+    //   b) Using the canvas-touch callback to drive InkEngine, then
+    //      re-rendering the PixelBuf via EphemerisUi::render_frame().
+    //
+    // The seam is: expose `canvas-touch` callback (already wired above) and
+    // the public `set_canvas_image()` API in bridge.rs (to push rendered frames).
+    canvas := Rectangle {
+        x: 0;
+        y: status-bar.height;
+        width: parent.width;
+        height: parent.height - status-bar.height - toolbar.height;
+        background: white;
+        clip: true;
+
+        // Touch / mouse input forwarding to Rust
+        TouchArea {
+            pointer-event(event) => {
+                if (event.kind == PointerEventKind.down) {
+                    root.canvas-touch(self.mouse-x / 1px, self.mouse-y / 1px);
+                }
+            }
+        }
+    }
+}
