@@ -5,7 +5,9 @@ pub struct WebDavClient {
 
 impl WebDavClient {
     pub fn new(url: impl Into<String>) -> Self {
-        WebDavClient { base_url: url.into() }
+        WebDavClient {
+            base_url: url.into(),
+        }
     }
 
     pub fn push(&self, _local_path: &str) -> crate::Result<String> {

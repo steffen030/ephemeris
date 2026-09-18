@@ -45,15 +45,25 @@ fn knot_delta(a: &Ctrl, b: &Ctrl) -> f32 {
     let d = dist(a, b).sqrt();
     // Guard against coincident points producing a zero interval (which would
     // make the basis blow up).
-    if d < 1e-6 { 1e-4 } else { d }
+    if d < 1e-6 {
+        1e-4
+    } else {
+        d
+    }
 }
 
 /// Interpolate a scalar with the non-uniform Catmull-Rom basis on knots
 /// `t0..t3` at parameter `t`.
 #[allow(clippy::too_many_arguments)]
 fn catmull_rom_scalar(
-    p0: f32, p1: f32, p2: f32, p3: f32,
-    t0: f32, t1: f32, t2: f32, t3: f32,
+    p0: f32,
+    p1: f32,
+    p2: f32,
+    p3: f32,
+    t0: f32,
+    t1: f32,
+    t2: f32,
+    t3: f32,
     t: f32,
 ) -> f32 {
     // Barry-Goldman pyramidal formulation of non-uniform Catmull-Rom.
@@ -114,15 +124,19 @@ pub fn catmull_rom(points: &[Point], segments_per_span: usize) -> Vec<Point> {
             let x = catmull_rom_scalar(p0.x, p1.x, p2.x, p3.x, t0, t1, t2, t3, t);
             let y = catmull_rom_scalar(p0.y, p1.y, p2.y, p3.y, t0, t1, t2, t3, t);
             let pr = catmull_rom_scalar(
-                p0.pressure, p1.pressure, p2.pressure, p3.pressure, t0, t1, t2, t3, t,
+                p0.pressure,
+                p1.pressure,
+                p2.pressure,
+                p3.pressure,
+                t0,
+                t1,
+                t2,
+                t3,
+                t,
             )
             .clamp(0.0, 1.0);
-            let tilt = catmull_rom_scalar(
-                p0.tilt, p1.tilt, p2.tilt, p3.tilt, t0, t1, t2, t3, t,
-            );
-            let tm = catmull_rom_scalar(
-                p0.t_ms, p1.t_ms, p2.t_ms, p3.t_ms, t0, t1, t2, t3, t,
-            );
+            let tilt = catmull_rom_scalar(p0.tilt, p1.tilt, p2.tilt, p3.tilt, t0, t1, t2, t3, t);
+            let tm = catmull_rom_scalar(p0.t_ms, p1.t_ms, p2.t_ms, p3.t_ms, t0, t1, t2, t3, t);
 
             out.push(Point {
                 x,
@@ -177,7 +191,10 @@ mod tests {
         let out = catmull_rom(&input, 10);
         for p in &out {
             // On y=x line, x and y should stay equal.
-            assert!((p.x - p.y).abs() < 1e-3, "point drifted off the line: {p:?}");
+            assert!(
+                (p.x - p.y).abs() < 1e-3,
+                "point drifted off the line: {p:?}"
+            );
         }
     }
 
@@ -193,7 +210,10 @@ mod tests {
         let input = vec![pt(1.0, 1.0), pt(1.0, 1.0), pt(2.0, 2.0)];
         let out = catmull_rom(&input, 6);
         for p in &out {
-            assert!(p.x.is_finite() && p.y.is_finite(), "spline produced NaN/inf");
+            assert!(
+                p.x.is_finite() && p.y.is_finite(),
+                "spline produced NaN/inf"
+            );
         }
     }
 
@@ -206,7 +226,11 @@ mod tests {
         ];
         let out = catmull_rom(&input, 8);
         for p in &out {
-            assert!((0.0..=1.0).contains(&p.pressure), "pressure out of range: {}", p.pressure);
+            assert!(
+                (0.0..=1.0).contains(&p.pressure),
+                "pressure out of range: {}",
+                p.pressure
+            );
         }
         // Some interior point should have higher pressure than the endpoints.
         let max_p = out.iter().map(|p| p.pressure).fold(0.0_f32, f32::max);

@@ -29,7 +29,12 @@ impl Rect {
 
     /// Construct a rect from explicit corners (does not normalise).
     pub fn new(min_x: f32, min_y: f32, max_x: f32, max_y: f32) -> Self {
-        Self { min_x, min_y, max_x, max_y }
+        Self {
+            min_x,
+            min_y,
+            max_x,
+            max_y,
+        }
     }
 
     /// `true` if this rect covers no area (e.g. the result of [`Rect::empty`]).
@@ -39,12 +44,20 @@ impl Rect {
 
     /// Width of the rect (`0` if empty).
     pub fn width(&self) -> f32 {
-        if self.is_empty() { 0.0 } else { self.max_x - self.min_x }
+        if self.is_empty() {
+            0.0
+        } else {
+            self.max_x - self.min_x
+        }
     }
 
     /// Height of the rect (`0` if empty).
     pub fn height(&self) -> f32 {
-        if self.is_empty() { 0.0 } else { self.max_y - self.min_y }
+        if self.is_empty() {
+            0.0
+        } else {
+            self.max_y - self.min_y
+        }
     }
 
     /// Expand this rect to include point `(x, y)`.
@@ -127,7 +140,10 @@ mod tests {
     #[test]
     fn inflate_pads_all_sides() {
         let r = Rect::new(0.0, 0.0, 10.0, 10.0).inflate(2.0);
-        assert_eq!((r.min_x, r.min_y, r.max_x, r.max_y), (-2.0, -2.0, 12.0, 12.0));
+        assert_eq!(
+            (r.min_x, r.min_y, r.max_x, r.max_y),
+            (-2.0, -2.0, 12.0, 12.0)
+        );
     }
 
     #[test]

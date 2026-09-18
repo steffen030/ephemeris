@@ -12,7 +12,12 @@ impl PixelBuf {
     pub fn new(width: u32, height: u32) -> Self {
         let stride = width;
         let data = vec![255u8; (width * height) as usize];
-        PixelBuf { width, height, stride, data }
+        PixelBuf {
+            width,
+            height,
+            stride,
+            data,
+        }
     }
 
     /// Fill entire buffer with a value (0=black, 255=white).
@@ -57,7 +62,12 @@ pub struct Rect {
 
 impl Rect {
     pub fn new(x: u32, y: u32, width: u32, height: u32) -> Self {
-        Rect { x, y, width, height }
+        Rect {
+            x,
+            y,
+            width,
+            height,
+        }
     }
 }
 
@@ -155,7 +165,9 @@ mod tests {
     fn mock_desktop_present() {
         let mut display = MockDesktop::new(800, 600).expect("should create");
         let buf = PixelBuf::new(800, 600);
-        display.present(&buf, &[], RefreshMode::Full).expect("should present");
+        display
+            .present(&buf, &[], RefreshMode::Full)
+            .expect("should present");
     }
 
     #[test]

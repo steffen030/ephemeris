@@ -78,7 +78,9 @@ impl App {
 
     /// Send a command to the async core.
     pub fn send_command(&self, cmd: Command) -> std::result::Result<(), String> {
-        self.cmd_tx.send(cmd).map_err(|_| "Failed to send command".to_string())
+        self.cmd_tx
+            .send(cmd)
+            .map_err(|_| "Failed to send command".to_string())
     }
 
     /// Receive an event from the async core (non-blocking).

@@ -74,13 +74,11 @@ impl Config {
     pub fn save(&self) -> crate::Result<()> {
         let path = config_file_path()?;
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(AppError::Io)?;
+            std::fs::create_dir_all(parent).map_err(AppError::Io)?;
         }
         let content = toml::to_string_pretty(self)
             .map_err(|e| AppError::Config(format!("Failed to serialize config: {}", e)))?;
-        std::fs::write(path, content)
-            .map_err(AppError::Io)?;
+        std::fs::write(path, content).map_err(AppError::Io)?;
         Ok(())
     }
 }
@@ -91,7 +89,9 @@ fn config_file_path() -> crate::Result<PathBuf> {
         .ok()
         .map(PathBuf::from)
         .or_else(|| {
-            std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".config"))
+            std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".config"))
         })
         .ok_or_else(|| AppError::Config("No config directory found".to_string()))?;
 
@@ -134,7 +134,8 @@ mod tests {
     #[test]
     fn config_custom_fields() {
         let mut cfg = Config::default();
-        cfg.custom.insert("user_name".to_string(), "Alice".to_string());
+        cfg.custom
+            .insert("user_name".to_string(), "Alice".to_string());
         let toml_str = toml::to_string(&cfg).expect("should serialize");
         let cfg2: Config = toml::from_str(&toml_str).expect("should deserialize");
         assert_eq!(cfg2.custom.get("user_name"), Some(&"Alice".to_string()));

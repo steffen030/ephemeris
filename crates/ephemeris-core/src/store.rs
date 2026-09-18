@@ -79,14 +79,18 @@ impl MemoryStore {
 
     /// Serialize the whole page to a JSON string.
     pub fn to_json(&self) -> Result<String, StoreError> {
-        let page = StrokePage { strokes: self.strokes.clone() };
+        let page = StrokePage {
+            strokes: self.strokes.clone(),
+        };
         Ok(serde_json::to_string(&page)?)
     }
 
     /// Reconstruct a store from a JSON string produced by [`Self::to_json`].
     pub fn from_json(json: &str) -> Result<Self, StoreError> {
         let page: StrokePage = serde_json::from_str(json)?;
-        Ok(Self { strokes: page.strokes })
+        Ok(Self {
+            strokes: page.strokes,
+        })
     }
 }
 
@@ -254,7 +258,10 @@ mod tests {
     #[test]
     fn json_file_store_persists_and_reloads() {
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("ephemeris-strokes-test-{}.json", uuid::Uuid::new_v4()));
+        let path = dir.join(format!(
+            "ephemeris-strokes-test-{}.json",
+            uuid::Uuid::new_v4()
+        ));
 
         let s = sample_stroke();
         {

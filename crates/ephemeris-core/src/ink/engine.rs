@@ -186,12 +186,21 @@ pub struct InkEngine {
 
 impl InkEngine {
     pub fn new(cfg: InkConfig) -> Self {
-        Self { cfg, active: None, clock_ms: 0 }
+        Self {
+            cfg,
+            active: None,
+            clock_ms: 0,
+        }
     }
 
     /// Whether a stroke is currently in progress.
     pub fn is_drawing(&self) -> bool {
         self.active.is_some()
+    }
+
+    /// Read-only access to the engine's current configuration.
+    pub fn config(&self) -> &InkConfig {
+        &self.cfg
     }
 
     /// Feed one input event. `t_ms` is the sample's absolute timestamp; pass a
@@ -218,7 +227,10 @@ impl InkEngine {
                 Some(mut b) => {
                     let damage = b.push_sample(s, t_ms, true).unwrap_or(b.total_damage);
                     let stroke = b.finish(self.cfg.spline_segments);
-                    InkUpdate::Finished { stroke: Box::new(stroke), damage }
+                    InkUpdate::Finished {
+                        stroke: Box::new(stroke),
+                        damage,
+                    }
                 }
                 None => InkUpdate::Idle,
             },
@@ -242,7 +254,13 @@ mod tests {
     use ephemeris_pal::input::PenSample;
 
     fn sample(x: f32, y: f32, pressure: f32) -> PenSample {
-        PenSample { x, y, pressure, tilt: 0.0, in_range: true }
+        PenSample {
+            x,
+            y,
+            pressure,
+            tilt: 0.0,
+            in_range: true,
+        }
     }
 
     /// Feed a full PenDown -> PenMove* -> PenUp stream at constant pressure and
@@ -273,24 +291,37 @@ mod tests {
     }
 
     fn diagonal(n: usize) -> Vec<(f32, f32)> {
-        (0..n).map(|i| (10.0 + i as f32 * 4.0, 20.0 + i as f32 * 3.0)).collect()
+        (0..n)
+            .map(|i| (10.0 + i as f32 * 4.0, 20.0 + i as f32 * 3.0))
+            .collect()
     }
 
     #[test]
     fn lifecycle_started_extended_finished() {
         let (updates, _stroke) = drive(&diagonal(6), 0.5);
         assert!(matches!(updates.first().unwrap(), InkUpdate::Started));
-        assert!(matches!(updates.last().unwrap(), InkUpdate::Finished { .. }));
+        assert!(matches!(
+            updates.last().unwrap(),
+            InkUpdate::Finished { .. }
+        ));
         assert_eq!(
-            updates.iter().filter(|u| matches!(u, InkUpdate::Started)).count(),
+            updates
+                .iter()
+                .filter(|u| matches!(u, InkUpdate::Started))
+                .count(),
             1
         );
         assert_eq!(
-            updates.iter().filter(|u| matches!(u, InkUpdate::Finished { .. })).count(),
+            updates
+                .iter()
+                .filter(|u| matches!(u, InkUpdate::Finished { .. }))
+                .count(),
             1
         );
         assert!(
-            updates.iter().any(|u| matches!(u, InkUpdate::Extended { .. })),
+            updates
+                .iter()
+                .any(|u| matches!(u, InkUpdate::Extended { .. })),
             "the growing stroke must report incremental Extended damage"
         );
     }
@@ -298,15 +329,24 @@ mod tests {
     #[test]
     fn move_before_down_is_idle() {
         let mut engine = InkEngine::new(InkConfig::default());
-        assert_eq!(engine.update_now(&InputEvent::PenMove(sample(1.0, 1.0, 0.5))), InkUpdate::Idle);
+        assert_eq!(
+            engine.update_now(&InputEvent::PenMove(sample(1.0, 1.0, 0.5))),
+            InkUpdate::Idle
+        );
         assert!(!engine.is_drawing());
     }
 
     #[test]
     fn hover_button_touch_are_idle() {
         let mut engine = InkEngine::new(InkConfig::default());
-        assert_eq!(engine.update_now(&InputEvent::Hover { x: 1.0, y: 2.0 }), InkUpdate::Idle);
-        assert_eq!(engine.update_now(&InputEvent::PenButton { pressed: true }), InkUpdate::Idle);
+        assert_eq!(
+            engine.update_now(&InputEvent::Hover { x: 1.0, y: 2.0 }),
+            InkUpdate::Idle
+        );
+        assert_eq!(
+            engine.update_now(&InputEvent::PenButton { pressed: true }),
+            InkUpdate::Idle
+        );
         assert!(!engine.is_drawing());
     }
 
@@ -356,8 +396,10 @@ mod tests {
                 saw = true;
                 union = union.union(&d);
                 assert!(
-                    d.min_x >= allowed.min_x && d.min_y >= allowed.min_y
-                        && d.max_x <= allowed.max_x && d.max_y <= allowed.max_y,
+                    d.min_x >= allowed.min_x
+                        && d.min_y >= allowed.min_y
+                        && d.max_x <= allowed.max_x
+                        && d.max_y <= allowed.max_y,
                     "damage {d:?} escaped stroke bbox {allowed:?}"
                 );
             }
@@ -388,7 +430,10 @@ mod tests {
         }
         assert!(!union.is_empty());
         // A single short diagonal stroke: bounded, tens of px, never thousands.
-        assert!(union.width() < 200.0 && union.height() < 200.0, "damage union too large: {union:?}");
+        assert!(
+            union.width() < 200.0 && union.height() < 200.0,
+            "damage union too large: {union:?}"
+        );
     }
 
     #[test]
@@ -424,15 +469,24 @@ mod tests {
         // duplicate moves must be dropped (Idle), but the stroke must still have
         // its anchored endpoints.
         let mut engine = InkEngine::new(InkConfig::default());
-        assert!(matches!(engine.update_now(&InputEvent::PenDown(sample(0.0, 0.0, 0.5))), InkUpdate::Started));
+        assert!(matches!(
+            engine.update_now(&InputEvent::PenDown(sample(0.0, 0.0, 0.5))),
+            InkUpdate::Started
+        ));
         for _ in 0..5 {
             // Same coordinate: below min_sample_dist -> dropped.
-            assert_eq!(engine.update_now(&InputEvent::PenMove(sample(0.0, 0.0, 0.5))), InkUpdate::Idle);
+            assert_eq!(
+                engine.update_now(&InputEvent::PenMove(sample(0.0, 0.0, 0.5))),
+                InkUpdate::Idle
+            );
         }
         let fin = engine.update_now(&InputEvent::PenUp(sample(0.05, 0.05, 0.5)));
         match fin {
             InkUpdate::Finished { stroke, .. } => {
-                assert!(stroke.points.len() >= 2, "endpoints must be recorded even if moves dropped");
+                assert!(
+                    stroke.points.len() >= 2,
+                    "endpoints must be recorded even if moves dropped"
+                );
             }
             other => panic!("expected Finished, got {other:?}"),
         }
@@ -442,7 +496,10 @@ mod tests {
     fn single_tap_down_up_produces_a_stroke() {
         // Degenerate stroke: PenDown immediately followed by PenUp.
         let mut engine = InkEngine::new(InkConfig::default());
-        assert!(matches!(engine.update_now(&InputEvent::PenDown(sample(3.0, 4.0, 0.5))), InkUpdate::Started));
+        assert!(matches!(
+            engine.update_now(&InputEvent::PenDown(sample(3.0, 4.0, 0.5))),
+            InkUpdate::Started
+        ));
         match engine.update_now(&InputEvent::PenUp(sample(3.0, 4.0, 0.5))) {
             InkUpdate::Finished { stroke, .. } => {
                 assert!(!stroke.points.is_empty());

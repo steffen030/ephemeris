@@ -187,7 +187,9 @@ impl WaylandInput {
     /// the `[−90.0, 90.0]` range documented on [`PenSample::tilt`].
     fn on_pen_tilt(&self, tilt_x: f32, tilt_y: f32) {
         let mut state = self.state.lock().unwrap();
-        state.pen_tilt = (tilt_x * tilt_x + tilt_y * tilt_y).sqrt().clamp(-90.0, 90.0);
+        state.pen_tilt = (tilt_x * tilt_x + tilt_y * tilt_y)
+            .sqrt()
+            .clamp(-90.0, 90.0);
     }
 
     /// Handle the stylus side button (`zwp_tablet_tool_v2::button`).
@@ -353,7 +355,10 @@ mod tests {
         input.on_pen_button(false);
         let events = drain(&input);
         assert!(matches!(events[0], InputEvent::PenButton { pressed: true }));
-        assert!(matches!(events[1], InputEvent::PenButton { pressed: false }));
+        assert!(matches!(
+            events[1],
+            InputEvent::PenButton { pressed: false }
+        ));
     }
 
     #[test]
@@ -364,8 +369,14 @@ mod tests {
         input.on_touch_up(1);
         let events = drain(&input);
 
-        assert!(matches!(events[0], InputEvent::TouchBegin(TouchSample { id: 1, .. })));
-        assert!(matches!(events[1], InputEvent::TouchMove(TouchSample { id: 1, .. })));
+        assert!(matches!(
+            events[0],
+            InputEvent::TouchBegin(TouchSample { id: 1, .. })
+        ));
+        assert!(matches!(
+            events[1],
+            InputEvent::TouchMove(TouchSample { id: 1, .. })
+        ));
         // up reuses the last tracked position (150, 150).
         assert!(matches!(
             &events[2],
@@ -390,6 +401,9 @@ mod tests {
         .join()
         .unwrap();
         let events = drain(&input);
-        assert!(matches!(events[0], InputEvent::TouchBegin(TouchSample { id: 9, .. })));
+        assert!(matches!(
+            events[0],
+            InputEvent::TouchBegin(TouchSample { id: 9, .. })
+        ));
     }
 }

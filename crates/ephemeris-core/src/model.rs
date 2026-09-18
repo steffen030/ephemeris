@@ -14,8 +14,8 @@
 //! - [`CalendarEvent`]: Calendar event from any source (ICS feed, CalDAV).
 
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 use std::collections::HashMap;
+use uuid::Uuid;
 
 /// Newtype id for a profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -139,7 +139,10 @@ pub struct Profile {
 
 impl Profile {
     pub fn new(name: impl Into<String>) -> Self {
-        Profile { id: ProfileId::new(), name: name.into() }
+        Profile {
+            id: ProfileId::new(),
+            name: name.into(),
+        }
     }
 }
 
@@ -186,7 +189,12 @@ pub struct Note {
 
 impl Note {
     pub fn new(title: impl Into<String>, now: u64) -> Self {
-        Note { id: NoteId::new(), title: title.into(), created: now, updated: now }
+        Note {
+            id: NoteId::new(),
+            title: title.into(),
+            created: now,
+            updated: now,
+        }
     }
 }
 
@@ -199,7 +207,6 @@ pub enum PageTemplate {
     Dot,
 }
 
-
 /// A page: canvas for ink strokes, indexed within a note.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Page {
@@ -211,7 +218,12 @@ pub struct Page {
 
 impl Page {
     pub fn new(note_id: NoteId, index: usize, template: PageTemplate) -> Self {
-        Page { id: PageId::new(), note_id, index, template }
+        Page {
+            id: PageId::new(),
+            note_id,
+            index,
+            template,
+        }
     }
 }
 
@@ -309,8 +321,18 @@ pub struct Color {
 }
 
 impl Color {
-    pub const BLACK: Color = Color { r: 0, g: 0, b: 0, a: 255 };
-    pub const WHITE: Color = Color { r: 255, g: 255, b: 255, a: 255 };
+    pub const BLACK: Color = Color {
+        r: 0,
+        g: 0,
+        b: 0,
+        a: 255,
+    };
+    pub const WHITE: Color = Color {
+        r: 255,
+        g: 255,
+        b: 255,
+        a: 255,
+    };
 
     pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
         Color { r, g, b, a: 255 }
@@ -340,7 +362,13 @@ pub struct Point {
 
 impl Point {
     pub fn new(x: f32, y: f32, pressure: f32, tilt: f32, t_ms: u32) -> Self {
-        Point { x, y, pressure, tilt, t_ms }
+        Point {
+            x,
+            y,
+            pressure,
+            tilt,
+            t_ms,
+        }
     }
 }
 
@@ -468,7 +496,9 @@ mod tests {
     fn account_serde_round_trip() {
         let profile_id = ProfileId::new();
         let mut account = Account::new(profile_id, AccountKind::CalDAV, "work@example.com");
-        account.config.insert("url".to_string(), "https://example.com/caldav".to_string());
+        account
+            .config
+            .insert("url".to_string(), "https://example.com/caldav".to_string());
 
         let json = serde_json::to_string(&account).unwrap();
         let back: Account = serde_json::from_str(&json).unwrap();
@@ -513,13 +543,7 @@ mod tests {
     #[test]
     fn calendar_event_serde_round_trip() {
         let profile_id = ProfileId::new();
-        let mut event = CalendarEvent::new(
-            "uid-12345",
-            1000,
-            2000,
-            "Team Meeting",
-            profile_id,
-        );
+        let mut event = CalendarEvent::new("uid-12345", 1000, 2000, "Team Meeting", profile_id);
         event.location = Some("Conference Room A".to_string());
 
         let json = serde_json::to_string(&event).unwrap();
@@ -530,7 +554,13 @@ mod tests {
 
     #[test]
     fn account_kind_serde_all_variants() {
-        for kind in [AccountKind::Email, AccountKind::CalDAV, AccountKind::Obsidian, AccountKind::WebDAV, AccountKind::Local] {
+        for kind in [
+            AccountKind::Email,
+            AccountKind::CalDAV,
+            AccountKind::Obsidian,
+            AccountKind::WebDAV,
+            AccountKind::Local,
+        ] {
             let json = serde_json::to_string(&kind).unwrap();
             assert_eq!(kind, serde_json::from_str::<AccountKind>(&json).unwrap());
         }
@@ -540,7 +570,10 @@ mod tests {
     fn page_template_serde_all_variants() {
         for template in [PageTemplate::Blank, PageTemplate::Grid, PageTemplate::Dot] {
             let json = serde_json::to_string(&template).unwrap();
-            assert_eq!(template, serde_json::from_str::<PageTemplate>(&json).unwrap());
+            assert_eq!(
+                template,
+                serde_json::from_str::<PageTemplate>(&json).unwrap()
+            );
         }
     }
 
@@ -548,7 +581,10 @@ mod tests {
     fn task_priority_serde_all_variants() {
         for priority in [TaskPriority::Low, TaskPriority::Medium, TaskPriority::High] {
             let json = serde_json::to_string(&priority).unwrap();
-            assert_eq!(priority, serde_json::from_str::<TaskPriority>(&json).unwrap());
+            assert_eq!(
+                priority,
+                serde_json::from_str::<TaskPriority>(&json).unwrap()
+            );
         }
     }
 
