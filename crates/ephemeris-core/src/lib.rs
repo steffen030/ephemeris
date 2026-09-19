@@ -12,6 +12,7 @@ pub mod geom;
 pub mod ics;
 pub mod ink;
 pub mod model;
+pub mod refresh;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 pub mod store;
@@ -24,6 +25,7 @@ pub use model::{
     Account, AccountId, AccountKind, CalendarEvent, Color, EventId, Note, NoteId, Page, PageId,
     PageTemplate, Point, Profile, ProfileId, Stroke, StrokeId, Task, TaskId, TaskPriority, Tool,
 };
+pub use refresh::{DamageSource, Present, RefreshConfig, RefreshScheduler};
 
 /// Initialize tracing with environment filter.
 pub fn init_tracing() {

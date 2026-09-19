@@ -73,14 +73,15 @@
 //! // 2. Feed pen events directly (call from your input loop):
 //! let update = ui.feed_input(&InputEvent::PenDown(sample), t_ms);
 //!
-//! // 3. Render; ink is composited automatically:
-//! ui.render_frame(&mut display, RefreshMode::Fast)?;
+//! // 3. Render; ink is composited automatically and the refresh scheduler
+//! //    picks the RefreshMode (Fast/Partial/Clear/periodic Full):
+//! ui.render_frame(&mut display)?;
 //!
 //! // 4. Push pre-rasterized pixels explicitly (optional, for external renderers):
 //! ui.push_canvas_pixels(&my_ink_buf);
 //! ```
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
@@ -89,7 +90,8 @@ use slint::{PhysicalSize, SharedString};
 
 use ephemeris_core::ink::{InkConfig, InkEngine, InkUpdate};
 use ephemeris_core::model::Point;
-use ephemeris_pal::display::{Display, PixelBuf, Rect, RefreshMode};
+use ephemeris_core::refresh::{DamageSource, RefreshConfig, RefreshScheduler};
+use ephemeris_pal::display::{Display, PixelBuf, Rect};
 use ephemeris_pal::input::InputEvent;
 
 pub mod raster;
@@ -292,6 +294,21 @@ pub struct EphemerisUi {
     pages: RefCell<PageBook>,
     /// Default [`InkConfig::base_width`], kept for constructing blank pages.
     default_base_width: f32,
+    /// Ink damage rects (full-buffer coordinates) accumulated since the last
+    /// present.  Drained by [`render_frame`].  This lets ink-only updates drive
+    /// a present even when Slint's UI is otherwise clean (Slint's own
+    /// `draw_if_needed` never reports the ink layer as dirty because the ink is
+    /// composited *after* the software renderer runs).
+    ink_damage: RefCell<Vec<Rect>>,
+    /// Refresh scheduler (ADR ephemeris-btg, task ephemeris-2ql.7).  Chooses the
+    /// [`RefreshMode`](ephemeris_pal::display::RefreshMode) per present from the accumulated damage sources and
+    /// injects periodic `Full` refreshes to clear e-ink ghosting, so callers no
+    /// longer pass a mode to [`render_frame`](EphemerisUi::render_frame).
+    scheduler: RefCell<RefreshScheduler>,
+    /// Set when the whole screen changed (page navigation, canvas clear, first
+    /// paint) so the next [`render_frame`] forces a `Clear` refresh.  Cleared
+    /// once consumed.
+    screen_change: Cell<bool>,
 }
 
 impl EphemerisUi {
@@ -343,7 +360,18 @@ impl EphemerisUi {
             in_progress_base_width: RefCell::new(default_base_width),
             pages: RefCell::new(PageBook::new(width, canvas_h, default_base_width)),
             default_base_width,
+            ink_damage: RefCell::new(Vec::new()),
+            scheduler: RefCell::new(RefreshScheduler::default()),
+            // The first frame paints a fresh screen — treat it as a screen
+            // change so the initial present is a full/clear refresh.
+            screen_change: Cell::new(true),
         })
+    }
+
+    /// Replace the [`RefreshScheduler`]'s thresholds (periodic-full interval,
+    /// coalescing gap, max damage rects).  See [`RefreshConfig`].
+    pub fn set_refresh_config(&self, config: RefreshConfig) {
+        *self.scheduler.borrow_mut() = RefreshScheduler::new(config);
     }
 
     // ── Property setters ──────────────────────────────────────────────────
@@ -525,9 +553,15 @@ impl EphemerisUi {
                         tilt: s.tilt,
                         t_ms: 0,
                     });
+                    // The anchor dot is stamped on the next render; report a
+                    // small damage rect around it so the frame is presented.
+                    let pad = bw + 1.0;
+                    self.push_ink_damage(
+                        ephemeris_core::geom::Rect::new(s.x, s.y, s.x, s.y).inflate(pad),
+                    );
                 }
             }
-            InkUpdate::Extended { .. } => {
+            InkUpdate::Extended { damage } => {
                 // Append the new sample to the in-progress buffer.
                 if let InputEvent::PenMove(s) = event {
                     self.in_progress.borrow_mut().push(Point {
@@ -538,8 +572,9 @@ impl EphemerisUi {
                         t_ms,
                     });
                 }
+                self.push_ink_damage(*damage);
             }
-            InkUpdate::Finished { stroke, .. } => {
+            InkUpdate::Finished { stroke, damage } => {
                 // Commit the completed stroke to the permanent layer.
                 let canvas_h = self.canvas_height();
                 raster::rasterize_stroke(
@@ -552,6 +587,7 @@ impl EphemerisUi {
                 );
                 // Clear the in-progress buffer.
                 self.in_progress.borrow_mut().clear();
+                self.push_ink_damage(*damage);
             }
             InkUpdate::Idle => {}
         }
@@ -572,6 +608,11 @@ impl EphemerisUi {
         let canvas_h = self.canvas_height();
         if pixels.width == self.width && pixels.height == canvas_h {
             *self.committed_layer.borrow_mut() = pixels.clone();
+            // The whole canvas may have changed; mark it dirty so the next
+            // `render_frame` presents even if Slint's UI is otherwise clean.
+            self.ink_damage
+                .borrow_mut()
+                .push(Rect::new(0, STATUS_BAR_H, self.width, canvas_h));
         }
     }
 
@@ -593,6 +634,14 @@ impl EphemerisUi {
             .current_page_mut()
             .in_progress
             .clear();
+
+        // The whole canvas went white; mark it dirty so the clear is presented.
+        self.ink_damage
+            .borrow_mut()
+            .push(Rect::new(0, STATUS_BAR_H, self.width, canvas_h));
+
+        // A full wipe is the ideal moment to flush ghosting with a Clear refresh.
+        self.screen_change.set(true);
     }
 
     // ── Render ────────────────────────────────────────────────────────────
@@ -607,13 +656,33 @@ impl EphemerisUi {
     ///    composited over the canvas region using `min()` blend (dark ink wins).
     /// 5. The result is presented to `display`.
     ///
-    /// Returns the damage rectangles that were repainted (may be empty if
-    /// nothing changed since the last call).  The refresh mode is `Full` on
-    /// first render, `Partial` on subsequent renders.
+    /// Returns the damage rectangles that were presented (empty when nothing
+    /// changed since the last call, in which case `display.present` is *not*
+    /// invoked — this is the eink render loop's "no idle repaint" guarantee).
+    ///
+    /// The [`RefreshMode`](ephemeris_pal::display::RefreshMode) is chosen by the owned [`RefreshScheduler`] rather
+    /// than passed in: this frame's damage is submitted to the scheduler tagged
+    /// by source, and the scheduler returns the coalesced damage and the mode
+    /// (`Fast` for ink, `Partial` for UI, `Clear` on screen changes, and a
+    /// periodic `Full` to flush ghosting).  Tune it via [`set_refresh_config`].
+    ///
+    /// The damage submitted to the scheduler comes from three sources:
+    ///
+    /// * **Slint's partial-render region** — the exact rectangles the software
+    ///   renderer repainted this frame, taken from the [`PhysicalRegion`]
+    ///   returned by `renderer.render()` (tagged [`DamageSource::Ui`]).
+    /// * **Ink damage** — rects accumulated by [`feed_input`],
+    ///   [`push_canvas_pixels`] and [`clear_ink`] since the last present, since
+    ///   the ink layer is composited *after* Slint runs and is therefore
+    ///   invisible to Slint's own dirty-tracking (tagged [`DamageSource::Ink`]).
+    /// * **Screen change** — a full-window rect on the first frame, page
+    ///   navigation or canvas clear (tagged [`DamageSource::ScreenChange`]).
+    ///
+    /// [`PhysicalRegion`]: slint::platform::software_renderer::PhysicalRegion
+    /// [`set_refresh_config`]: EphemerisUi::set_refresh_config
     pub fn render_frame<D: Display>(
         &self,
         display: &mut D,
-        mode: RefreshMode,
     ) -> Result<Vec<Rect>, Box<dyn std::error::Error>> {
         // 1. Pump Slint's event loop one tick (process pending events / layout).
         slint::platform::update_timers_and_animations();
@@ -622,21 +691,44 @@ impl EphemerisUi {
         //    RGB565 buffer.  With `RepaintBufferType::ReusedBuffer` Slint only
         //    updates the regions that changed, so we must carry the buffer across
         //    calls rather than allocating a fresh zero-filled one each time.
+        //    The returned `PhysicalRegion` tells us *which* rects were touched —
+        //    that is the display damage for the eink refresh.
         let w = self.width as usize;
 
-        let mut repainted = false;
+        let mut slint_damage: Vec<Rect> = Vec::new();
         self.window.draw_if_needed(|renderer| {
             let mut pixels = self.rgb565_buf.borrow_mut();
-            renderer.render(pixels.as_mut_slice(), w);
-            repainted = true;
+            let region = renderer.render(pixels.as_mut_slice(), w);
+            for (pos, size) in region.iter() {
+                if size.width == 0 || size.height == 0 {
+                    continue;
+                }
+                slint_damage.push(Rect::new(
+                    pos.x.max(0) as u32,
+                    pos.y.max(0) as u32,
+                    size.width,
+                    size.height,
+                ));
+            }
+            // Slint reported a repaint but no concrete sub-rects (rare): fall
+            // back to a full-window rect so a genuine repaint is never dropped.
+            if slint_damage.is_empty() {
+                slint_damage.push(Rect::new(0, 0, self.width, self.height));
+            }
         });
 
-        if !repainted {
-            // Nothing changed; skip present.
+        // 3. Drain ink damage accumulated since the last present.
+        let ink_damage = std::mem::take(&mut *self.ink_damage.borrow_mut());
+
+        // Did a page switch / clear / first paint invalidate the whole screen?
+        let screen_change = self.screen_change.replace(false);
+
+        // eink render loop: only present when something actually changed.
+        if slint_damage.is_empty() && ink_damage.is_empty() && !screen_change {
             return Ok(vec![]);
         }
 
-        // 3. Convert RGB565 → 8-bpp grayscale.
+        // 4. Convert RGB565 → 8-bpp grayscale.
         //    Luma = 0.2126·R + 0.7152·G + 0.0722·B  (BT.709)
         let pixels = self.rgb565_buf.borrow();
         let mut pal_buf = PixelBuf::new(self.width, self.height);
@@ -646,7 +738,7 @@ impl EphemerisUi {
             pal_buf.data[i] = luma;
         }
 
-        // 4. Composite ink layers over the canvas region.
+        // 5. Composite ink layers over the canvas region.
         //
         //    The canvas occupies rows [STATUS_BAR_H, height - TOOLBAR_H).
         //    Both the committed layer and any in-progress points are composited
@@ -655,7 +747,7 @@ impl EphemerisUi {
         //    committed layer.
         let canvas_h = self.canvas_height();
 
-        // 4a. Build the in-progress layer for this frame (only if drawing).
+        // 5a. Build the in-progress layer for this frame (only if drawing).
         let in_progress_pts = self.in_progress.borrow();
         let has_in_progress = !in_progress_pts.is_empty();
         let ip_layer = if has_in_progress {
@@ -675,7 +767,7 @@ impl EphemerisUi {
         };
         drop(in_progress_pts); // release borrow before compositing
 
-        // 4b. Composite committed layer + optional in-progress layer into pal_buf.
+        // 5b. Composite committed layer + optional in-progress layer into pal_buf.
         let committed = self.committed_layer.borrow();
         let stride = self.width as usize;
 
@@ -698,12 +790,35 @@ impl EphemerisUi {
             }
         }
 
-        // 5. Build a single full-screen damage rect and present.
-        let damage = vec![Rect::new(0, 0, self.width, self.height)];
+        // 6. Feed this frame's damage to the refresh scheduler, tagged by source,
+        //    and let it pick the RefreshMode and coalesce the rects.
+        let mut scheduler = self.scheduler.borrow_mut();
+        if screen_change {
+            // A whole-screen change: submit the full window so the coalesced
+            // damage matches the Clear refresh the scheduler will choose.
+            scheduler.submit(
+                Rect::new(0, 0, self.width, self.height),
+                DamageSource::ScreenChange,
+            );
+        }
+        for rect in slint_damage {
+            scheduler.submit(rect, DamageSource::Ui);
+        }
+        for rect in ink_damage {
+            scheduler.submit(rect, DamageSource::Ink);
+        }
 
-        display.present(&pal_buf, &damage, mode)?;
+        // flush() yields Some: the early-return above guarantees we submitted at
+        // least one non-empty rect (Slint/ink rects are pre-filtered, and a
+        // screen change submits the full window).
+        let present = scheduler
+            .flush()
+            .expect("damage was submitted, so flush must yield a present");
+        drop(scheduler);
 
-        Ok(damage)
+        display.present(&pal_buf, &present.damage, present.mode)?;
+
+        Ok(present.damage)
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────
@@ -712,6 +827,29 @@ impl EphemerisUi {
     #[inline]
     fn canvas_height(&self) -> u32 {
         self.height.saturating_sub(STATUS_BAR_H + TOOLBAR_H)
+    }
+
+    /// Record ink damage for the next present.
+    ///
+    /// `canvas_rect` is in **canvas-relative** coordinates (the same space as
+    /// the ink engine's damage rects).  It is clamped to the canvas bounds and
+    /// offset by [`STATUS_BAR_H`] into full-buffer space before being stored.
+    /// Empty or fully-clipped rects are ignored.
+    fn push_ink_damage(&self, canvas_rect: ephemeris_core::geom::Rect) {
+        if canvas_rect.is_empty() {
+            return;
+        }
+        let canvas_h = self.canvas_height();
+        let x0 = canvas_rect.min_x.max(0.0).floor() as u32;
+        let y0 = canvas_rect.min_y.max(0.0).floor() as u32;
+        let x1 = (canvas_rect.max_x.ceil() as i64).clamp(0, self.width as i64) as u32;
+        let y1 = (canvas_rect.max_y.ceil() as i64).clamp(0, canvas_h as i64) as u32;
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        self.ink_damage
+            .borrow_mut()
+            .push(Rect::new(x0, STATUS_BAR_H + y0, x1 - x0, y1 - y0));
     }
 
     /// Capture the current live ink state into a [`PageState`] snapshot.
@@ -758,6 +896,10 @@ impl EphemerisUi {
         // Update the Slint status bar (1-based display index).
         self.component.set_page_index((new_cur + 1) as i32);
         self.component.set_page_count(new_count as i32);
+
+        // Switching pages replaces the whole canvas — force a Clear refresh so
+        // the outgoing page leaves no ghost and the incoming ink is presented.
+        self.screen_change.set(true);
     }
 }
 
@@ -810,9 +952,7 @@ mod tests {
         let mut display = MockDesktop::new(800, 600).expect("MockDesktop creation failed");
 
         // First render — should produce a full-screen damage rect.
-        let damage = ui
-            .render_frame(&mut display, RefreshMode::Full)
-            .expect("render_frame failed");
+        let damage = ui.render_frame(&mut display).expect("render_frame failed");
 
         // The first render must repaint the whole window.
         assert!(
@@ -970,8 +1110,7 @@ mod tests {
         drop(committed); // release borrow before render
 
         let mut cap = CapturingDisplay { last: None };
-        ui.render_frame(&mut cap, RefreshMode::Full)
-            .expect("render failed");
+        ui.render_frame(&mut cap).expect("render failed");
 
         if let Some(buf) = cap.last {
             let stride = buf.stride as usize;
@@ -1042,16 +1181,14 @@ mod tests {
 
         // First render captures the stroke.
         let mut cap1 = CapturingDisplay { last: None };
-        ui.render_frame(&mut cap1, RefreshMode::Full)
-            .expect("first render failed");
+        ui.render_frame(&mut cap1).expect("first render failed");
         let _buf1 = cap1.last.expect("first render must produce a frame");
 
         // Second render — Slint may skip (nothing dirty), but the ink layer
         // must still be composited.  Force a re-render by touching a property.
         ui.set_page_title("Page 2");
         let mut cap2 = CapturingDisplay { last: None };
-        ui.render_frame(&mut cap2, RefreshMode::Full)
-            .expect("second render failed");
+        ui.render_frame(&mut cap2).expect("second render failed");
 
         // If Slint skipped (nothing repainted) we cannot observe the second frame.
         // The important assertion is that the committed layer still holds the
@@ -1106,8 +1243,7 @@ mod tests {
         }
 
         let mut cap = CapturingDisplay { last: None };
-        ui.render_frame(&mut cap, RefreshMode::Full)
-            .expect("render failed");
+        ui.render_frame(&mut cap).expect("render failed");
 
         if let Some(buf) = cap.last {
             // The black bar at canvas row 50 should appear at buf row 24+50=74.
@@ -1333,6 +1469,221 @@ mod tests {
             ui.current_page_index(),
             (2, 2),
             "swipe-right must call next_page (auto-create)"
+        );
+    }
+
+    // ── Eink render-loop / damage tests (acceptance criteria for 2ql.2) ───
+
+    /// A display that records every `present` call: how many times it was
+    /// invoked and the damage passed to the last call.
+    struct RecordingDisplay {
+        presents: usize,
+        last_damage: Vec<Rect>,
+        last_mode: Option<RefreshMode>,
+    }
+    impl RecordingDisplay {
+        fn new() -> Self {
+            RecordingDisplay {
+                presents: 0,
+                last_damage: Vec::new(),
+                last_mode: None,
+            }
+        }
+    }
+    impl Display for RecordingDisplay {
+        fn size(&self) -> (u32, u32) {
+            (800, 600)
+        }
+        fn present(
+            &mut self,
+            _buf: &PixelBuf,
+            damage: &[Rect],
+            mode: RefreshMode,
+        ) -> Result<(), ephemeris_pal::DisplayError> {
+            self.presents += 1;
+            self.last_damage = damage.to_vec();
+            self.last_mode = Some(mode);
+            Ok(())
+        }
+    }
+
+    /// Bounding box (x0, y0, x1, y1) of a damage list; panics if empty.
+    fn damage_bbox(rects: &[Rect]) -> (u32, u32, u32, u32) {
+        let x0 = rects.iter().map(|r| r.x).min().unwrap();
+        let y0 = rects.iter().map(|r| r.y).min().unwrap();
+        let x1 = rects.iter().map(|r| r.x + r.width).max().unwrap();
+        let y1 = rects.iter().map(|r| r.y + r.height).max().unwrap();
+        (x0, y0, x1, y1)
+    }
+
+    /// The eink loop must not repaint when nothing changed: after the first
+    /// frame is flushed, a second `render_frame` with no state change returns
+    /// empty damage and never calls `present`.
+    #[test]
+    fn idle_render_produces_no_damage_and_no_present() {
+        let ui = EphemerisUi::new(800, 600).expect("UI construction failed");
+        let mut disp = RecordingDisplay::new();
+
+        // First frame: Slint paints the whole window → damage + one present.
+        let d1 = ui.render_frame(&mut disp).expect("first render failed");
+        assert!(!d1.is_empty(), "first render must report damage");
+        assert_eq!(disp.presents, 1, "first render must present once");
+
+        // Second frame: nothing changed → no damage, no present (no idle repaint).
+        let d2 = ui.render_frame(&mut disp).expect("second render failed");
+        assert!(
+            d2.is_empty(),
+            "idle render must report no damage, got {d2:?}"
+        );
+        assert_eq!(
+            disp.presents, 1,
+            "idle render must not call present (no idle repaint)"
+        );
+    }
+
+    /// An ink-only update (no Slint property touched) must still present, and
+    /// the reported damage must be confined to the canvas region — proving the
+    /// damage comes from real partial-render info, not a hardcoded full-screen
+    /// rect.
+    #[test]
+    fn ink_only_update_reports_canvas_bounded_damage() {
+        let ui = EphemerisUi::new(800, 600).expect("UI construction failed");
+        let mut disp = RecordingDisplay::new();
+
+        // Flush the initial full-window paint so Slint is clean afterwards.
+        ui.render_frame(&mut disp).expect("initial render failed");
+        // Confirm the UI is now idle.
+        assert!(ui
+            .render_frame(&mut disp)
+            .expect("idle render failed")
+            .is_empty());
+        let presents_before = disp.presents;
+
+        // Draw a short stroke — this only touches the ink layer.
+        ui.feed_input(&InputEvent::PenDown(pen_sample(100.0, 40.0)), 0);
+        ui.feed_input(&InputEvent::PenMove(pen_sample(300.0, 40.0)), 8);
+        ui.feed_input(&InputEvent::PenUp(pen_sample(300.0, 40.0)), 16);
+
+        let damage = ui.render_frame(&mut disp).expect("ink render failed");
+
+        assert!(
+            !damage.is_empty(),
+            "ink-only update must produce damage so the frame is presented"
+        );
+        assert_eq!(
+            disp.presents,
+            presents_before + 1,
+            "ink-only update must trigger exactly one present"
+        );
+
+        // Damage must lie strictly inside the canvas region: below the status
+        // bar and above the toolbar. This proves it is not a full-screen rect.
+        let (_x0, y0, _x1, y1) = damage_bbox(&damage);
+        assert!(
+            y0 >= STATUS_BAR_H,
+            "ink damage top {y0} must not intrude into the status bar (< {STATUS_BAR_H})"
+        );
+        assert!(
+            y1 <= 600 - TOOLBAR_H,
+            "ink damage bottom {y1} must not intrude into the toolbar (> {})",
+            600 - TOOLBAR_H
+        );
+    }
+
+    /// A partial UI change (status-bar text) must report damage taken from
+    /// Slint's partial-render region, i.e. strictly smaller than the full
+    /// window — otherwise we would just be emitting a hardcoded full-screen rect.
+    #[test]
+    fn partial_ui_change_reports_partial_slint_damage() {
+        let ui = EphemerisUi::new(800, 600).expect("UI construction failed");
+        let mut disp = RecordingDisplay::new();
+
+        // Flush the initial full-window paint.
+        ui.render_frame(&mut disp).expect("initial render failed");
+        assert!(ui
+            .render_frame(&mut disp)
+            .expect("idle render failed")
+            .is_empty());
+
+        // Change only the status-bar title → Slint repaints just that text.
+        ui.set_page_title("A different title");
+        let damage = ui.render_frame(&mut disp).expect("partial render failed");
+
+        assert!(!damage.is_empty(), "title change must report damage");
+        let (_x0, _y0, _x1, y1) = damage_bbox(&damage);
+        assert!(
+            y1 < 600,
+            "partial repaint of the status bar must not span the full window \
+             height (bottom={y1}); damage should reflect Slint's partial region"
+        );
+    }
+
+    /// The refresh scheduler drives the [`RefreshMode`] handed to the display:
+    /// the first paint is a `Clear`, a subsequent ink-only frame is `Fast`, a
+    /// UI-only change is `Partial`, and a page switch is `Clear`.
+    #[test]
+    fn scheduler_drives_refresh_mode() {
+        let ui = EphemerisUi::new(800, 600).expect("UI construction failed");
+        let mut disp = RecordingDisplay::new();
+
+        // First paint of a fresh screen → Clear.
+        ui.render_frame(&mut disp).expect("first render failed");
+        assert_eq!(disp.last_mode, Some(RefreshMode::Clear));
+        // Drain to idle.
+        assert!(ui
+            .render_frame(&mut disp)
+            .expect("idle render failed")
+            .is_empty());
+
+        // Ink-only frame → Fast.
+        ui.feed_input(&InputEvent::PenDown(pen_sample(100.0, 40.0)), 0);
+        ui.feed_input(&InputEvent::PenMove(pen_sample(300.0, 40.0)), 8);
+        ui.feed_input(&InputEvent::PenUp(pen_sample(300.0, 40.0)), 16);
+        ui.render_frame(&mut disp).expect("ink render failed");
+        assert_eq!(disp.last_mode, Some(RefreshMode::Fast));
+
+        // UI-only change (status-bar title) → Partial.
+        ui.set_page_title("Another title");
+        ui.render_frame(&mut disp).expect("ui render failed");
+        assert_eq!(disp.last_mode, Some(RefreshMode::Partial));
+
+        // Page navigation → Clear.
+        ui.next_page();
+        ui.render_frame(&mut disp).expect("nav render failed");
+        assert_eq!(disp.last_mode, Some(RefreshMode::Clear));
+    }
+
+    /// The scheduler's periodic-full policy is configurable via
+    /// [`EphemerisUi::set_refresh_config`]: after N fast/partial frames it emits
+    /// a `Full` to flush accumulated ghosting.
+    #[test]
+    fn set_refresh_config_controls_periodic_full() {
+        let ui = EphemerisUi::new(800, 600).expect("UI construction failed");
+        ui.set_refresh_config(RefreshConfig {
+            full_refresh_interval: 3,
+            ..RefreshConfig::default()
+        });
+        let mut disp = RecordingDisplay::new();
+
+        // Drain the initial screen-change paint (resets the counter).
+        ui.render_frame(&mut disp).expect("first render failed");
+        assert!(ui
+            .render_frame(&mut disp)
+            .expect("idle render failed")
+            .is_empty());
+
+        // Three ink frames: Fast, Fast, then Full (3rd hits the interval).
+        let mut modes = Vec::new();
+        for i in 0..3 {
+            let t = i * 16;
+            ui.feed_input(&InputEvent::PenDown(pen_sample(10.0, 40.0)), t);
+            ui.feed_input(&InputEvent::PenUp(pen_sample(12.0, 40.0)), t + 8);
+            ui.render_frame(&mut disp).expect("ink render failed");
+            modes.push(disp.last_mode.unwrap());
+        }
+        assert_eq!(
+            modes,
+            vec![RefreshMode::Fast, RefreshMode::Fast, RefreshMode::Full]
         );
     }
 }
