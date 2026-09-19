@@ -16,6 +16,7 @@ pub mod model;
 pub mod sqlite;
 pub mod store;
 
+pub use action::{Action, ActionMap, ActionRouter, CanvasPoint, DefaultActionMap, RouterOutput};
 pub use config::Config;
 pub use error::{AppError, Result};
 pub use ink::{InkConfig, InkEngine, InkUpdate};
