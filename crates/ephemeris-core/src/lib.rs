@@ -41,4 +41,5 @@ pub mod obsidian;
 pub mod profile_manager;
 pub mod stroke_persistence;
 pub mod task_provider;
+#[cfg(feature = "webdav")]
 pub mod webdav;
