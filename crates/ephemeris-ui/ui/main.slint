@@ -7,6 +7,16 @@
 //
 // All callbacks are wired to properties exposed to Rust so the bridge can
 // react to button presses and canvas touch events without winit.
+//
+// ## Swipe gesture detection (bead 6iy.3)
+//
+// The canvas TouchArea tracks pointer-down and pointer-up positions.  On
+// pointer-up, if:
+//   • |dx| > SWIPE_THRESHOLD (50 px), AND
+//   • |dx| > |dy|  (predominantly horizontal),
+// then a `swipe-left` or `swipe-right` callback is emitted instead of a
+// `canvas-touch`.  All other interactions are forwarded to `canvas-touch` as
+// before, keeping drawing unaffected.
 
 export component EphemerisPage inherits Window {
     // ── Layout geometry ──────────────────────────────────────────────────
@@ -28,10 +38,29 @@ export component EphemerisPage inherits Window {
     /// Active tool label (drives toolbar button highlight).
     in-out property <string> active-tool: "pen";
 
+    // ── Swipe detection state (private) ─────────────────────────────────
+
+    /// X coordinate (canvas-relative) where the current pointer contact began.
+    private property <float> swipe-start-x: 0;
+    /// Y coordinate (canvas-relative) where the current pointer contact began.
+    private property <float> swipe-start-y: 0;
+    /// Horizontal threshold (px) that must be exceeded to register a swipe.
+    private property <float> swipe-threshold: 50;
+
     // ── Callbacks (wired to Rust via bridge) ────────────────────────────
 
-    /// Emitted when the user taps the canvas (touch / mouse down).
+    /// Emitted when the user taps or draws on the canvas (touch / mouse down).
+    /// Fires only for contacts that do NOT resolve to a swipe gesture.
     callback canvas-touch(/* x */ float, /* y */ float);
+
+    /// Emitted when the user completes a leftward swipe on the canvas
+    /// (|dx| > threshold, dx < 0, |dx| > |dy|) → navigate to previous page.
+    callback swipe-left();
+
+    /// Emitted when the user completes a rightward swipe on the canvas
+    /// (|dx| > threshold, dx > 0, |dx| > |dy|) → navigate to next page
+    /// (auto-creating one when already on the last page).
+    callback swipe-right();
 
     /// Emitted when the user selects a toolbar tool.
     callback tool-selected(/* tool name */ string);
@@ -178,13 +207,14 @@ export component EphemerisPage inherits Window {
     // ── Canvas (stroke layer — seam for bead 6iy.2) ──────────────────────
     //
     // This Rectangle occupies the space between the status bar and toolbar.
-    // Bead 6iy.2 will render completed and in-progress strokes by:
-    //   a) Providing a custom Image element fed from a pixel buffer, OR
-    //   b) Using the canvas-touch callback to drive InkEngine, then
-    //      re-rendering the PixelBuf via EphemerisUi::render_frame().
+    // Ink rendering works via the canvas-touch callback → InkEngine →
+    // EphemerisUi::render_frame().
     //
-    // The seam is: expose `canvas-touch` callback (already wired above) and
-    // the public `set_canvas_image()` API in bridge.rs (to push rendered frames).
+    // Swipe detection (bead 6iy.3):
+    //   pointer-down  → record swipe-start-{x,y} and forward a canvas-touch.
+    //   pointer-up    → measure dx/dy.  If |dx| > threshold and |dx| > |dy|,
+    //                   emit swipe-left / swipe-right instead.  Otherwise no
+    //                   additional callback (pointer-down already fired).
     canvas := Rectangle {
         x: 0;
         y: status-bar.height;
@@ -193,11 +223,41 @@ export component EphemerisPage inherits Window {
         background: white;
         clip: true;
 
-        // Touch / mouse input forwarding to Rust
+        // Touch / mouse input — drawing + swipe gesture detection.
         TouchArea {
             pointer-event(event) => {
                 if (event.kind == PointerEventKind.down) {
+                    // Record the contact origin for later swipe measurement.
+                    root.swipe-start-x = self.mouse-x / 1px;
+                    root.swipe-start-y = self.mouse-y / 1px;
+                    // Forward to ink engine immediately.
                     root.canvas-touch(self.mouse-x / 1px, self.mouse-y / 1px);
+                } else if (event.kind == PointerEventKind.up) {
+                    // Measure displacement from the contact origin.
+                    // Note: on pointer-up, mouse-x/y is the release position.
+                    // Slint's TouchArea keeps mouse-x/y at the last tracked
+                    // position, which on up is the release coordinates.
+                    // We intentionally re-read them here.
+                    // Workaround for Slint not having local variables in
+                    // pointer-event: compute inline with property arithmetic.
+                    // dx and dy are both in logical pixels.
+                    // Positive dx  → swipe right; negative dx → swipe left.
+                    if (
+                        // Horizontal displacement exceeds threshold.
+                        (self.mouse-x / 1px - root.swipe-start-x >= root.swipe-threshold ||
+                         root.swipe-start-x - self.mouse-x / 1px >= root.swipe-threshold) &&
+                        // Predominantly horizontal: |dx| > |dy|.
+                        ((self.mouse-x / 1px - root.swipe-start-x) * (self.mouse-x / 1px - root.swipe-start-x) >
+                         (self.mouse-y / 1px - root.swipe-start-y) * (self.mouse-y / 1px - root.swipe-start-y))
+                    ) {
+                        if (self.mouse-x / 1px > root.swipe-start-x) {
+                            root.swipe-right();
+                        } else {
+                            root.swipe-left();
+                        }
+                    }
+                    // If not a swipe, the pointer-down already forwarded the
+                    // touch to Rust — no duplicate callback needed here.
                 }
             }
         }

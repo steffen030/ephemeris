@@ -10,9 +10,8 @@
 //!      │
 //!      ├─ InkEngine (owned, behind RefCell for interior mutability)
 //!      │
-//!      ├─ committed ink layer  (PixelBuf — rasterized completed strokes)
-//!      │
-//!      ├─ in-progress layer    (points of the active stroke, not yet Finished)
+//!      ├─ PageBook — per-page ink state roster
+//!      │       └─ PageState × N  (committed layer + in-progress points)
 //!      │
 //!      └─ render_frame() ──► SoftwareRenderer ──► Rgb8 pixel buffer
 //!                                  │
@@ -41,6 +40,29 @@
 //!
 //! Compositing is restricted to the canvas region (rows `status_bar_h` to
 //! `height - toolbar_h`), so chrome pixels are never overwritten by ink.
+//!
+//! ## Page navigation model (bead 6iy.3)
+//!
+//! [`EphemerisUi`] owns a [`PageBook`] which stores one [`PageState`] per page.
+//! Navigating pages:
+//!
+//! * [`EphemerisUi::next_page`] — advance to the next page; if already on the
+//!   last page, a new blank page is auto-created and appended.
+//! * [`EphemerisUi::prev_page`] — move to the previous page (clamped at 0; no
+//!   wrap-around).
+//!
+//! On each navigation the active page's ink state is saved, the target page's
+//! state is loaded, and `page-index` / `page-count` in the status bar are
+//! updated.
+//!
+//! The [`PageBook`] is designed so it can later be backed by `SqliteStore`
+//! (by serializing/deserializing per-page state on demand), but in this
+//! implementation all pages live in memory.
+//!
+//! Swipe gestures in the `.slint` UI fire `swipe-left` / `swipe-right`
+//! callbacks.  Wire them to [`EphemerisUi::prev_page`] / [`EphemerisUi::next_page`]
+//! from the application layer, or use the convenience method
+//! [`EphemerisUi::wire_swipe_navigation`].
 //!
 //! ## Live drawing API
 //!
@@ -71,6 +93,122 @@ use ephemeris_pal::display::{Display, PixelBuf, Rect, RefreshMode};
 use ephemeris_pal::input::InputEvent;
 
 pub mod raster;
+
+// ── Per-page ink state ────────────────────────────────────────────────────────
+
+/// Snapshot of the ink layers for one page.
+///
+/// Stored inside [`PageBook`] so that navigating away and back preserves all
+/// committed strokes and the in-progress state for each page.
+///
+/// The `base_width` mirrors `EphemerisUi::in_progress_base_width` — it is
+/// persisted alongside the in-progress points so that a mid-stroke navigation
+/// (edge case) can be recovered without re-borrowing the engine.
+#[derive(Clone)]
+struct PageState {
+    /// Rasterized committed strokes layer for this page (canvas-sized, 8 bpp).
+    committed: PixelBuf,
+    /// Points of any in-progress stroke on this page (empty when no stroke is
+    /// active or after the stroke was committed).
+    in_progress: Vec<Point>,
+    /// Nominal base_width of the in-progress stroke (copied at PenDown time).
+    in_progress_base_width: f32,
+}
+
+impl PageState {
+    /// Construct a blank (all-white) page state for the given canvas dimensions.
+    fn blank(canvas_w: u32, canvas_h: u32, default_base_width: f32) -> Self {
+        PageState {
+            committed: PixelBuf::new(canvas_w, canvas_h),
+            in_progress: Vec::new(),
+            in_progress_base_width: default_base_width,
+        }
+    }
+}
+
+// ── Page roster ───────────────────────────────────────────────────────────────
+
+/// Ordered roster of per-page ink states.
+///
+/// Invariants:
+/// * `pages` is never empty (at least one page always exists).
+/// * `current` is always a valid index into `pages`.
+///
+/// Designed so it can later be backed by `SqliteStore`: replace the `Vec`
+/// with on-demand serialization/deserialization without changing the public
+/// API surface.
+struct PageBook {
+    pages: Vec<PageState>,
+    /// Zero-based index of the currently displayed page.
+    current: usize,
+}
+
+impl PageBook {
+    /// Create a book with a single blank page.
+    fn new(canvas_w: u32, canvas_h: u32, default_base_width: f32) -> Self {
+        PageBook {
+            pages: vec![PageState::blank(canvas_w, canvas_h, default_base_width)],
+            current: 0,
+        }
+    }
+
+    /// Zero-based index of the current page.
+    #[inline]
+    fn current_index(&self) -> usize {
+        self.current
+    }
+
+    /// Total number of pages.
+    #[inline]
+    fn page_count(&self) -> usize {
+        self.pages.len()
+    }
+
+    /// Borrow the current page's state immutably.
+    #[inline]
+    fn current_page(&self) -> &PageState {
+        &self.pages[self.current]
+    }
+
+    /// Borrow the current page's state mutably.
+    #[inline]
+    fn current_page_mut(&mut self) -> &mut PageState {
+        &mut self.pages[self.current]
+    }
+
+    /// Save `state` as the current page's snapshot, then navigate to `target`.
+    ///
+    /// Returns `true` if the navigation actually changed the page, `false` if
+    /// `target == current` (e.g. clamped at 0 when already on page 0).
+    fn navigate_to(&mut self, state: PageState, target: usize) -> bool {
+        // Persist the caller's live state into the current page slot.
+        self.pages[self.current] = state;
+
+        if target == self.current {
+            return false;
+        }
+        self.current = target;
+        true
+    }
+
+    /// Append a new blank page and navigate to it, saving `state` first.
+    ///
+    /// Returns the new zero-based index.
+    fn push_blank_page(
+        &mut self,
+        state: PageState,
+        canvas_w: u32,
+        canvas_h: u32,
+        default_base_width: f32,
+    ) -> usize {
+        self.pages[self.current] = state;
+        let new_idx = self.pages.len();
+        self.pages
+            .push(PageState::blank(canvas_w, canvas_h, default_base_width));
+        self.current = new_idx;
+        new_idx
+    }
+}
 
 // Include the generated Slint bindings (produced by build.rs → slint-build).
 slint::include_modules!();
@@ -111,13 +249,21 @@ impl Platform for HeadlessPlatform {
 /// Create once per application session, call [`render_frame`] to drive the
 /// render loop and push pixels to a [`Display`].
 ///
-/// The `EphemerisUi` owns an [`InkEngine`] and two ink layers:
+/// The `EphemerisUi` owns an [`InkEngine`] and a [`PageBook`] that stores
+/// per-page ink layers:
 ///
-/// * **committed layer** — rasterized completed strokes, persists across frames.
+/// * **committed layer** — rasterized completed strokes for the current page,
+///   persists across frames and is saved/restored on page navigation.
 /// * **in-progress layer** — the current unfinished stroke (cleared on `PenUp`).
 ///
 /// Both layers are composited onto the Slint-rendered grayscale frame inside
 /// [`render_frame`] using a `min()` blend, restricted to the canvas region.
+///
+/// ## Page navigation
+///
+/// Call [`next_page`] / [`prev_page`] from the application layer.  The
+/// convenience method [`wire_swipe_navigation`] wires the `.slint` swipe
+/// callbacks to these methods automatically.
 pub struct EphemerisUi {
     window: Rc<MinimalSoftwareWindow>,
     component: EphemerisPage,
@@ -131,13 +277,21 @@ pub struct EphemerisUi {
     // ── Ink state (interior-mutable so the callbacks can borrow independently) ─
     /// The ink engine: tracks the active stroke builder.
     engine: RefCell<InkEngine>,
-    /// Rasterized committed strokes layer (canvas-sized, 8 bpp).
+    /// Rasterized committed strokes layer for the *current page* (canvas-sized,
+    /// 8 bpp).  Aliased from `pages.current_page().committed`; updated live as
+    /// strokes are drawn, then saved back on navigation.
     committed_layer: RefCell<PixelBuf>,
     /// Points of the currently in-progress stroke (canvas-relative).
     in_progress: RefCell<Vec<Point>>,
     /// `base_width` of the in-progress stroke (copied from `InkConfig` at
     /// `PenDown` time so we can re-rasterize without re-borrowing the engine).
     in_progress_base_width: RefCell<f32>,
+    /// Per-page ink state roster.  The active page's committed layer and
+    /// in-progress state are kept live in `committed_layer` / `in_progress` /
+    /// `in_progress_base_width`; all other pages are held exclusively in `pages`.
+    pages: RefCell<PageBook>,
+    /// Default [`InkConfig::base_width`], kept for constructing blank pages.
+    default_base_width: f32,
 }
 
 impl EphemerisUi {
@@ -170,6 +324,7 @@ impl EphemerisUi {
         // The canvas height is the total height minus both chrome bars.
         let canvas_h = height.saturating_sub(STATUS_BAR_H + TOOLBAR_H);
         let pixel_count = (width * height) as usize;
+        let default_base_width = ink_cfg.base_width;
 
         Ok(EphemerisUi {
             window,
@@ -185,7 +340,9 @@ impl EphemerisUi {
             engine: RefCell::new(InkEngine::new(ink_cfg.clone())),
             committed_layer: RefCell::new(PixelBuf::new(width, canvas_h)),
             in_progress: RefCell::new(Vec::new()),
-            in_progress_base_width: RefCell::new(ink_cfg.base_width),
+            in_progress_base_width: RefCell::new(default_base_width),
+            pages: RefCell::new(PageBook::new(width, canvas_h, default_base_width)),
+            default_base_width,
         })
     }
 
@@ -234,6 +391,99 @@ impl EphemerisUi {
         F: FnMut() + 'static,
     {
         self.component.on_clear_page(handler);
+    }
+
+    /// Register a closure called when the user completes a leftward swipe
+    /// on the canvas (→ navigate to the previous page).
+    pub fn on_swipe_left<F>(&self, handler: F)
+    where
+        F: FnMut() + 'static,
+    {
+        self.component.on_swipe_left(handler);
+    }
+
+    /// Register a closure called when the user completes a rightward swipe
+    /// on the canvas (→ navigate to the next page, auto-creating when needed).
+    pub fn on_swipe_right<F>(&self, handler: F)
+    where
+        F: FnMut() + 'static,
+    {
+        self.component.on_swipe_right(handler);
+    }
+
+    // ── Page navigation API ───────────────────────────────────────────────
+
+    /// Navigate to the next page.
+    ///
+    /// If the current page is the last page, a new blank page is auto-created
+    /// and appended before navigating to it.  In either case the current page's
+    /// ink state is saved before switching and the status bar is updated.
+    pub fn next_page(&self) {
+        let canvas_h = self.canvas_height();
+        let live_state = self.snapshot_live_state(canvas_h);
+
+        let new_idx = {
+            let mut book = self.pages.borrow_mut();
+            let cur = book.current_index();
+            let count = book.page_count();
+            if cur + 1 >= count {
+                // Auto-create a new blank page.
+                book.push_blank_page(live_state, self.width, canvas_h, self.default_base_width)
+            } else {
+                book.navigate_to(live_state, cur + 1);
+                cur + 1
+            }
+        };
+
+        self.load_page_state(new_idx);
+    }
+
+    /// Navigate to the previous page.
+    ///
+    /// Clamped at index 0 — calling `prev_page` on the first page is a no-op
+    /// (the current page's state is still saved to the book).
+    pub fn prev_page(&self) {
+        let canvas_h = self.canvas_height();
+        let live_state = self.snapshot_live_state(canvas_h);
+
+        let target = {
+            let mut book = self.pages.borrow_mut();
+            let cur = book.current_index();
+            let target = cur.saturating_sub(1);
+            book.navigate_to(live_state, target);
+            target
+        };
+
+        self.load_page_state(target);
+    }
+
+    /// Return `(current_index_1based, total_page_count)` reflecting the status
+    /// bar display (1-based index, matching the `page-index / page-count` text).
+    pub fn current_page_index(&self) -> (u32, u32) {
+        let book = self.pages.borrow();
+        ((book.current_index() + 1) as u32, book.page_count() as u32)
+    }
+
+    /// Wire the `.slint` `swipe-left` / `swipe-right` callbacks to
+    /// [`prev_page`] / [`next_page`] respectively, using a shared `Rc<Self>`.
+    ///
+    /// This is a convenience helper; you can also call [`on_swipe_left`] /
+    /// [`on_swipe_right`] manually if you need custom logic between gestures.
+    ///
+    /// ```ignore
+    /// let ui = Rc::new(EphemerisUi::new(800, 600)?);
+    /// EphemerisUi::wire_swipe_navigation(ui.clone());
+    /// ```
+    pub fn wire_swipe_navigation(ui: Rc<Self>) {
+        let ui_left = ui.clone();
+        ui.on_swipe_left(move || {
+            ui_left.prev_page();
+        });
+
+        let ui_right = ui.clone();
+        ui.on_swipe_right(move || {
+            ui_right.next_page();
+        });
     }
 
     // ── Ink input API ─────────────────────────────────────────────────────
@@ -325,13 +575,24 @@ impl EphemerisUi {
         }
     }
 
-    /// Clear both ink layers (committed and in-progress).
+    /// Clear both ink layers (committed and in-progress) for the current page.
     ///
-    /// Typically called in response to the `clear-page` callback.
+    /// Typically called in response to the `clear-page` callback.  The cleared
+    /// state is also persisted into `PageBook` so that navigating away and back
+    /// returns to a blank page.
     pub fn clear_ink(&self) {
         let canvas_h = self.canvas_height();
-        *self.committed_layer.borrow_mut() = PixelBuf::new(self.width, canvas_h);
+        let blank = PixelBuf::new(self.width, canvas_h);
+        *self.committed_layer.borrow_mut() = blank.clone();
         self.in_progress.borrow_mut().clear();
+
+        // Persist the cleared state into the page roster.
+        self.pages.borrow_mut().current_page_mut().committed = blank;
+        self.pages
+            .borrow_mut()
+            .current_page_mut()
+            .in_progress
+            .clear();
     }
 
     // ── Render ────────────────────────────────────────────────────────────
@@ -451,6 +712,52 @@ impl EphemerisUi {
     #[inline]
     fn canvas_height(&self) -> u32 {
         self.height.saturating_sub(STATUS_BAR_H + TOOLBAR_H)
+    }
+
+    /// Capture the current live ink state into a [`PageState`] snapshot.
+    ///
+    /// Clones `committed_layer`, `in_progress`, and `in_progress_base_width`
+    /// so they can be stored in `PageBook` and later restored.
+    fn snapshot_live_state(&self, _canvas_h: u32) -> PageState {
+        PageState {
+            committed: self.committed_layer.borrow().clone(),
+            in_progress: self.in_progress.borrow().clone(),
+            in_progress_base_width: *self.in_progress_base_width.borrow(),
+        }
+    }
+
+    /// Restore the live ink state from `PageBook` for `page_index` and update
+    /// the status bar properties.
+    ///
+    /// Must be called *after* `PageBook::navigate_to` or `push_blank_page` so
+    /// that `book.current_index()` already reflects the target.
+    fn load_page_state(&self, _page_index: usize) {
+        let (new_committed, new_ip, new_bw, new_cur, new_count) = {
+            let book = self.pages.borrow();
+            let ps = book.current_page();
+            (
+                ps.committed.clone(),
+                ps.in_progress.clone(),
+                ps.in_progress_base_width,
+                book.current_index(),
+                book.page_count(),
+            )
+        };
+
+        // Restore ink layers.
+        *self.committed_layer.borrow_mut() = new_committed;
+        *self.in_progress.borrow_mut() = new_ip;
+        *self.in_progress_base_width.borrow_mut() = new_bw;
+
+        // Reset the ink engine so no dangling stroke state bleeds across pages.
+        *self.engine.borrow_mut() = InkEngine::new(InkConfig {
+            base_width: new_bw,
+            ..InkConfig::default()
+        });
+
+        // Update the Slint status bar (1-based display index).
+        self.component.set_page_index((new_cur + 1) as i32);
+        self.component.set_page_count(new_count as i32);
     }
 }
 
@@ -858,6 +1165,174 @@ mod tests {
             ui.committed_layer.borrow().height,
             expected_canvas_h,
             "committed layer dimensions must match canvas height"
+        );
+    }
+
+    // ── Page navigation tests (acceptance criteria for 6iy.3) ────────────
+
+    /// `prev_page` on the first page is a no-op: index stays at 1/1.
+    #[test]
+    fn prev_page_clamps_at_first_page() {
+        let ui = EphemerisUi::new(800, 600).expect("UI construction failed");
+
+        // Start: page 1 of 1.
+        assert_eq!(ui.current_page_index(), (1, 1));
+
+        // Calling prev_page should clamp — index must remain 1 of 1.
+        ui.prev_page();
+        assert_eq!(
+            ui.current_page_index(),
+            (1, 1),
+            "prev_page on page 1 must not change index"
+        );
+
+        // A second call must still clamp.
+        ui.prev_page();
+        assert_eq!(ui.current_page_index(), (1, 1));
+    }
+
+    /// `next_page` past the last page auto-creates a new page and increments
+    /// the page count.
+    #[test]
+    fn next_page_past_last_auto_creates_page() {
+        let ui = EphemerisUi::new(800, 600).expect("UI construction failed");
+        assert_eq!(ui.current_page_index(), (1, 1));
+
+        // Navigate forward — a new blank page should be created.
+        ui.next_page();
+        assert_eq!(
+            ui.current_page_index(),
+            (2, 2),
+            "next_page past last page must create page 2 of 2"
+        );
+
+        // Navigate forward again — page 3 created.
+        ui.next_page();
+        assert_eq!(ui.current_page_index(), (3, 3));
+    }
+
+    /// Round-tripping next_page / prev_page returns to the starting page.
+    #[test]
+    fn next_then_prev_returns_to_start() {
+        let ui = EphemerisUi::new(800, 600).expect("UI construction failed");
+
+        ui.next_page(); // → page 2
+        ui.prev_page(); // → page 1
+
+        assert_eq!(
+            ui.current_page_index(),
+            (1, 2),
+            "returning from page 2 to page 1 must show (1, 2)"
+        );
+    }
+
+    /// Per-page ink layers are preserved across navigation: draw on page 1,
+    /// navigate to page 2 (blank), return to page 1 — the committed layer
+    /// must still contain the original stroke.
+    #[test]
+    fn per_page_ink_preserved_across_navigation() {
+        let ui = EphemerisUi::new(800, 600).expect("UI construction failed");
+
+        // ── Draw a stroke on page 1 ─────────────────────────────────────
+        let mut t = 0u32;
+        let step = 8u32;
+        ui.feed_input(&InputEvent::PenDown(pen_sample(100.0, 80.0)), t);
+        t += step;
+        for x in (110..500u32).step_by(5) {
+            ui.feed_input(&InputEvent::PenMove(pen_sample(x as f32, 80.0)), t);
+            t += step;
+        }
+        ui.feed_input(&InputEvent::PenUp(pen_sample(500.0, 80.0)), t);
+
+        // Verify ink on page 1.
+        let had_ink_page1 = {
+            let committed = ui.committed_layer.borrow();
+            let stride = committed.stride as usize;
+            (100..500usize).any(|col| committed.data[80 * stride + col] < 200)
+        };
+        assert!(had_ink_page1, "page 1 must have ink before navigation");
+
+        // ── Navigate to page 2 — should be blank ────────────────────────
+        ui.next_page();
+        assert_eq!(ui.current_page_index(), (2, 2));
+
+        let page2_blank = {
+            let committed = ui.committed_layer.borrow();
+            committed.data.iter().all(|&v| v == 255)
+        };
+        assert!(page2_blank, "page 2 must be blank after auto-create");
+
+        // ── Return to page 1 — ink must be intact ───────────────────────
+        ui.prev_page();
+        assert_eq!(ui.current_page_index(), (1, 2));
+
+        let ink_survived = {
+            let committed = ui.committed_layer.borrow();
+            let stride = committed.stride as usize;
+            (100..500usize).any(|col| committed.data[80 * stride + col] < 200)
+        };
+        assert!(
+            ink_survived,
+            "page 1 committed ink layer must survive round-trip navigation"
+        );
+    }
+
+    /// Status bar properties reflect the correct page index and count after
+    /// navigation.
+    #[test]
+    fn status_bar_reflects_page_after_navigation() {
+        let ui = EphemerisUi::new(800, 600).expect("UI construction failed");
+
+        // Initial state.
+        assert_eq!(ui.component.get_page_index(), 1);
+        assert_eq!(ui.component.get_page_count(), 1);
+
+        ui.next_page();
+        assert_eq!(ui.component.get_page_index(), 2);
+        assert_eq!(ui.component.get_page_count(), 2);
+
+        ui.prev_page();
+        assert_eq!(ui.component.get_page_index(), 1);
+        assert_eq!(ui.component.get_page_count(), 2);
+    }
+
+    /// `swipe-left` callback emitted from `.slint` wires correctly to
+    /// `prev_page` via `wire_swipe_navigation`.
+    #[test]
+    fn swipe_left_callback_wires_to_prev_page() {
+        let ui = Rc::new(EphemerisUi::new(800, 600).expect("UI construction failed"));
+
+        // Create two pages so we have somewhere to go back from.
+        ui.next_page();
+        assert_eq!(ui.current_page_index(), (2, 2));
+
+        EphemerisUi::wire_swipe_navigation(ui.clone());
+
+        // Simulate the `.slint` swipe-left callback firing.
+        ui.component.invoke_swipe_left();
+
+        assert_eq!(
+            ui.current_page_index(),
+            (1, 2),
+            "swipe-left must call prev_page"
+        );
+    }
+
+    /// `swipe-right` callback emitted from `.slint` wires correctly to
+    /// `next_page` via `wire_swipe_navigation`.
+    #[test]
+    fn swipe_right_callback_wires_to_next_page() {
+        let ui = Rc::new(EphemerisUi::new(800, 600).expect("UI construction failed"));
+
+        EphemerisUi::wire_swipe_navigation(ui.clone());
+
+        // Simulate the `.slint` swipe-right callback firing — auto-creates page.
+        ui.component.invoke_swipe_right();
+
+        assert_eq!(
+            ui.current_page_index(),
+            (2, 2),
+            "swipe-right must call next_page (auto-create)"
         );
     }
 }
