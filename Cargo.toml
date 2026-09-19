@@ -42,3 +42,11 @@ slint-build = "1.18"
 # WebDAV client (opt-in; pulled in only when the `webdav` feature is active)
 reqwest_dav = { version = "0.3", default-features = false, features = ["rustls-tls"] }
 bytes = "1"
+
+# ICS calendar parsing
+icalendar = "0.16"
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+
+# HTTP client (opt-in; used by the `ics` feature for HTTPS feed fetch)
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
