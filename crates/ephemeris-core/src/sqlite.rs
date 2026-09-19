@@ -46,7 +46,7 @@ use crate::{
 
 /// Current schema version. Bump this and add a migration step in
 /// [`run_migrations`] whenever the schema changes.
-const CURRENT_VERSION: u32 = 1;
+const CURRENT_VERSION: u32 = 2;
 
 /// The migration SQL for each version level, indexed `0..CURRENT_VERSION`.
 /// Entry `i` takes the schema from version `i` to `i+1`.
@@ -121,6 +121,14 @@ static MIGRATIONS: &[&str] = &[
         -- Insertion order (z-order for re-rendering).
         z_order    INTEGER NOT NULL
     );
+    "#,
+    // 1 → 2: app_state key-value table for persisted app state (e.g. active_profile_id)
+    r#"
+    CREATE TABLE IF NOT EXISTS app_state (
+        key   TEXT NOT NULL PRIMARY KEY,
+        value TEXT NOT NULL
+    );
+    UPDATE schema_version SET version = 2;
     "#,
 ];
 
@@ -317,6 +325,18 @@ impl SqliteStore {
         Ok(out)
     }
 
+    /// Rename a profile.  Returns `true` if the row was found and updated.
+    pub fn rename_profile(&self, id: ProfileId, new_name: &str) -> Result<bool> {
+        let n = self
+            .conn
+            .execute(
+                "UPDATE profiles SET name = ?1 WHERE id = ?2",
+                params![new_name, id.0.to_string()],
+            )
+            .map_err(storage_err)?;
+        Ok(n > 0)
+    }
+
     /// Delete a profile by id.  Returns `true` if the row was present.
     pub fn delete_profile(&self, id: ProfileId) -> Result<bool> {
         let n = self
@@ -327,6 +347,61 @@ impl SqliteStore {
             )
             .map_err(storage_err)?;
         Ok(n > 0)
+    }
+
+    // ── App state ─────────────────────────────────────────────────────────────
+
+    /// Read an app-state value by key.  Returns `None` if not set.
+    pub fn get_app_state(&self, key: &str) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT value FROM app_state WHERE key = ?1")
+            .map_err(storage_err)?;
+        match stmt.query_row(params![key], |row| row.get::<_, String>(0)) {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(storage_err(e)),
+        }
+    }
+
+    /// Write (upsert) an app-state key-value pair.
+    pub fn set_app_state(&self, key: &str, value: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO app_state (key, value) VALUES (?1, ?2)",
+                params![key, value],
+            )
+            .map_err(storage_err)?;
+        Ok(())
+    }
+
+    /// Persist the active profile id.
+    pub fn set_active_profile_id(&self, id: ProfileId) -> Result<()> {
+        self.set_app_state("active_profile_id", &id.0.to_string())
+    }
+
+    /// Load the active profile id, if one has been persisted.
+    pub fn get_active_profile_id(&self) -> Result<Option<ProfileId>> {
+        match self.get_app_state("active_profile_id")? {
+            None => Ok(None),
+            Some(s) => {
+                let uuid = s
+                    .parse()
+                    .map_err(|e| AppError::Storage(format!("bad active profile uuid: {e}")))?;
+                Ok(Some(ProfileId(uuid)))
+            }
+        }
+    }
+
+    /// Clear the persisted active profile (e.g. after deleting the active profile).
+    pub fn clear_active_profile_id(&self) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM app_state WHERE key = 'active_profile_id'",
+                [],
+            )
+            .map_err(storage_err)?;
+        Ok(())
     }
 
     // ── Accounts ──────────────────────────────────────────────────────────────
@@ -1119,6 +1194,72 @@ mod tests {
 
         let loaded = store.get_profile(p.id).unwrap().expect("must exist");
         assert_eq!(loaded.name, "New");
+    }
+
+    // ── Profile rename ───────────────────────────────────────────────────────
+
+    #[test]
+    fn profile_rename() {
+        let store = open();
+        let p = Profile::new("Old Name");
+        store.upsert_profile(&p).unwrap();
+
+        assert!(store.rename_profile(p.id, "New Name").unwrap());
+        let loaded = store.get_profile(p.id).unwrap().expect("must exist");
+        assert_eq!(loaded.name, "New Name");
+    }
+
+    #[test]
+    fn profile_rename_missing_returns_false() {
+        let store = open();
+        let fake_id = ProfileId::new();
+        assert!(!store.rename_profile(fake_id, "Ghost").unwrap());
+    }
+
+    // ── App state ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn app_state_set_get_clear() {
+        let store = open();
+        assert!(store.get_app_state("foo").unwrap().is_none());
+        store.set_app_state("foo", "bar").unwrap();
+        assert_eq!(store.get_app_state("foo").unwrap().as_deref(), Some("bar"));
+        store.set_app_state("foo", "baz").unwrap();
+        assert_eq!(store.get_app_state("foo").unwrap().as_deref(), Some("baz"));
+    }
+
+    #[test]
+    fn active_profile_id_roundtrip() {
+        let store = open();
+        let p = Profile::new("Work");
+        store.upsert_profile(&p).unwrap();
+
+        assert!(store.get_active_profile_id().unwrap().is_none());
+        store.set_active_profile_id(p.id).unwrap();
+        assert_eq!(store.get_active_profile_id().unwrap(), Some(p.id));
+        store.clear_active_profile_id().unwrap();
+        assert!(store.get_active_profile_id().unwrap().is_none());
+    }
+
+    #[test]
+    fn active_profile_persists_across_reopen() {
+        use std::io::Write;
+        let path = {
+            let mut p = std::env::temp_dir();
+            p.push(format!("ephemeris_test_{}.db", uuid::Uuid::new_v4()));
+            p
+        };
+        let profile_id = {
+            let store = SqliteStore::open(&path).unwrap();
+            let p = Profile::new("Persistent");
+            store.upsert_profile(&p).unwrap();
+            store.set_active_profile_id(p.id).unwrap();
+            p.id
+        };
+        // Reopen and verify active profile survived.
+        let store2 = SqliteStore::open(&path).unwrap();
+        assert_eq!(store2.get_active_profile_id().unwrap(), Some(profile_id));
+        let _ = std::fs::remove_file(&path);
     }
 
     // ── Account CRUD ─────────────────────────────────────────────────────────
