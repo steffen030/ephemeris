@@ -43,5 +43,8 @@ pub mod obsidian;
 pub mod profile_manager;
 pub mod stroke_persistence;
 pub mod task_provider;
+pub use task_provider::{ProviderCapabilities, TaskProvider};
+#[cfg(feature = "sqlite")]
+pub use task_provider::LocalTaskProvider;
 #[cfg(feature = "webdav")]
 pub mod webdav;
