@@ -7,4 +7,4 @@
 pub mod display;
 pub mod input;
 
-pub use display::{Display, PixelBuf, Rect, RefreshMode};
+pub use display::{Display, DisplayError, PixelBuf, Rect, RefreshMode};
