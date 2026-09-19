@@ -1,3 +1,51 @@
+use thiserror::Error;
+
+/// Display errors that can occur during rendering or presentation.
+#[derive(Error, Debug)]
+pub enum DisplayError {
+    #[error("display initialization failed: {0}")]
+    Init(String),
+
+    #[error("present failed: {0}")]
+    Present(String),
+
+    #[error("invalid dimensions: {0}")]
+    InvalidDimensions(String),
+
+    #[error("out of bounds: {0}")]
+    OutOfBounds(String),
+
+    #[error("backend error: {0}")]
+    Backend(String),
+}
+
+impl DisplayError {
+    /// Create a new `Init` error with the given message.
+    pub fn init<S: Into<String>>(msg: S) -> Self {
+        DisplayError::Init(msg.into())
+    }
+
+    /// Create a new `Present` error with the given message.
+    pub fn present<S: Into<String>>(msg: S) -> Self {
+        DisplayError::Present(msg.into())
+    }
+
+    /// Create a new `InvalidDimensions` error with the given message.
+    pub fn invalid_dimensions<S: Into<String>>(msg: S) -> Self {
+        DisplayError::InvalidDimensions(msg.into())
+    }
+
+    /// Create a new `OutOfBounds` error with the given message.
+    pub fn out_of_bounds<S: Into<String>>(msg: S) -> Self {
+        DisplayError::OutOfBounds(msg.into())
+    }
+
+    /// Create a new `Backend` error with the given message.
+    pub fn backend<S: Into<String>>(msg: S) -> Self {
+        DisplayError::Backend(msg.into())
+    }
+}
+
 /// Pixel buffer for display rendering (grayscale, 8-bit per pixel).
 #[derive(Debug, Clone)]
 pub struct PixelBuf {
@@ -82,7 +130,7 @@ pub trait Display {
         buf: &PixelBuf,
         damage: &[Rect],
         mode: RefreshMode,
-    ) -> Result<(), Box<dyn std::error::Error>>;
+    ) -> Result<(), DisplayError>;
 }
 
 /// Mock desktop display (stub for future winit/softbuffer integration).
@@ -93,7 +141,12 @@ pub struct MockDesktop {
 
 impl MockDesktop {
     /// Create a new mock desktop display.
-    pub fn new(width: u32, height: u32) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(width: u32, height: u32) -> Result<Self, DisplayError> {
+        if width == 0 || height == 0 {
+            return Err(DisplayError::invalid_dimensions(
+                "display dimensions must be > 0",
+            ));
+        }
         Ok(MockDesktop { width, height })
     }
 }
@@ -108,8 +161,10 @@ impl Display for MockDesktop {
         buf: &PixelBuf,
         _damage: &[Rect],
         _mode: RefreshMode,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        assert!(!buf.data.is_empty(), "buffer should not be empty");
+    ) -> Result<(), DisplayError> {
+        if buf.data.is_empty() {
+            return Err(DisplayError::present("buffer data is empty"));
+        }
         Ok(())
     }
 }
@@ -173,5 +228,33 @@ mod tests {
     #[test]
     fn display_trait_is_object_safe() {
         let _: &dyn Display;
+    }
+
+    #[test]
+    fn mock_desktop_rejects_zero_dimensions() {
+        let result = MockDesktop::new(0, 600);
+        assert!(result.is_err());
+        match result {
+            Err(DisplayError::InvalidDimensions(msg)) => {
+                assert!(msg.contains("must be > 0"));
+            }
+            _ => panic!("expected InvalidDimensions error"),
+        }
+    }
+
+    #[test]
+    fn mock_desktop_present_fails_on_empty_buffer() {
+        let mut display = MockDesktop::new(800, 600).expect("should create");
+        let mut buf = PixelBuf::new(800, 600);
+        buf.data.clear(); // empty the buffer
+
+        let result = display.present(&buf, &[], RefreshMode::Full);
+        assert!(result.is_err());
+        match result {
+            Err(DisplayError::Present(msg)) => {
+                assert!(msg.contains("empty"));
+            }
+            _ => panic!("expected Present error"),
+        }
     }
 }

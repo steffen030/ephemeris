@@ -655,7 +655,7 @@ mod tests {
                 buf: &PixelBuf,
                 _: &[Rect],
                 _: RefreshMode,
-            ) -> Result<(), Box<dyn std::error::Error>> {
+            ) -> Result<(), ephemeris_pal::DisplayError> {
                 self.last = Some(buf.clone());
                 Ok(())
             }
@@ -727,7 +727,7 @@ mod tests {
                 buf: &PixelBuf,
                 _: &[Rect],
                 _: RefreshMode,
-            ) -> Result<(), Box<dyn std::error::Error>> {
+            ) -> Result<(), ephemeris_pal::DisplayError> {
                 self.last = Some(buf.clone());
                 Ok(())
             }
@@ -792,7 +792,7 @@ mod tests {
                 buf: &PixelBuf,
                 _: &[Rect],
                 _: RefreshMode,
-            ) -> Result<(), Box<dyn std::error::Error>> {
+            ) -> Result<(), ephemeris_pal::DisplayError> {
                 self.last = Some(buf.clone());
                 Ok(())
             }
