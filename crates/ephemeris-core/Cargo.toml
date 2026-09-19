@@ -16,6 +16,8 @@ sqlite = []
 # Not included in the default build so that the offline/headless build stays
 # network-free and link-time-lean.
 webdav = ["dep:reqwest_dav", "dep:bytes"]
+# `ics` enables HTTPS ICS feed fetching (pulls in reqwest).
+ics = ["dep:reqwest"]
 
 [dependencies]
 ephemeris-pal = { workspace = true }
@@ -28,6 +30,11 @@ toml = { workspace = true }
 uuid = { workspace = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+icalendar = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
 # Optional — activated only when the `webdav` feature is enabled.
 reqwest_dav = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
+# Optional — activated only when the `ics` feature is enabled.
+reqwest = { workspace = true, optional = true }
