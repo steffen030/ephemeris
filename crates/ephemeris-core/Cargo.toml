@@ -12,6 +12,10 @@ default = ["fs"]
 fs = []
 # `sqlite` enables the SQLite-backed storage layer (rusqlite, bundled libsqlite3).
 sqlite = []
+# `webdav` enables the WebDAV sync backend (pulls in reqwest_dav + bytes).
+# Not included in the default build so that the offline/headless build stays
+# network-free and link-time-lean.
+webdav = ["dep:reqwest_dav", "dep:bytes"]
 
 [dependencies]
 ephemeris-pal = { workspace = true }
@@ -24,3 +28,6 @@ toml = { workspace = true }
 uuid = { workspace = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# Optional — activated only when the `webdav` feature is enabled.
+reqwest_dav = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }

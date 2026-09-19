@@ -38,3 +38,7 @@ winit = { version = "0.30", features = ["rwh_06"] }
 # Slint UI framework (software renderer — headless/CI-safe, no GPU required)
 slint = { version = "1.18", default-features = false, features = ["renderer-software", "std", "compat-1-18"] }
 slint-build = "1.18"
+
+# WebDAV client (opt-in; pulled in only when the `webdav` feature is active)
+reqwest_dav = { version = "0.3", default-features = false, features = ["rustls-tls"] }
+bytes = "1"
