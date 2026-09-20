@@ -1,0 +1,11 @@
+# cross configuration for aarch64-unknown-linux-gnu (Pinenote/Kobo-class targets).
+#
+# The pre-build commands install arm64 system libraries that winit and softbuffer
+# need to link against inside the cross Docker sysroot.
+
+[target.aarch64-unknown-linux-gnu]
+pre-build = [
+    "dpkg --add-architecture arm64",
+    "apt-get update -q",
+    "apt-get install -y --no-install-recommends libxkbcommon-dev:arm64",
+]

@@ -1,6 +1,10 @@
 use crate::{AppError, CalendarEvent, ProfileId};
-use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveDateTime, TimeZone, Timelike, Utc, Weekday};
-use icalendar::{Calendar, CalendarComponent, CalendarDateTime, Component, DatePerhapsTime, EventLike};
+use chrono::{
+    DateTime, Datelike, Duration, NaiveDate, NaiveDateTime, TimeZone, Timelike, Utc, Weekday,
+};
+use icalendar::{
+    Calendar, CalendarComponent, CalendarDateTime, Component, DatePerhapsTime, EventLike,
+};
 use std::str::FromStr;
 
 /// ICS (iCalendar) feed reader — parses HTTPS calendar feeds (RFC 5545).

@@ -203,6 +203,11 @@ impl InkEngine {
         &self.cfg
     }
 
+    /// Switch the active drawing tool. Takes effect on the next stroke.
+    pub fn set_tool(&mut self, tool: crate::model::Tool) {
+        self.cfg.tool = tool;
+    }
+
     /// Feed one input event. `t_ms` is the sample's absolute timestamp; pass a
     /// monotonically increasing clock (see [`InkEngine::update_now`] if you
     /// don't have real timestamps).

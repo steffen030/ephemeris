@@ -5,7 +5,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
 
     let app = App::new()?;
-    app.run()?;
+    app.run_windowed()?;
 
     tracing::info!("Ephemeris exiting cleanly");
     Ok(())

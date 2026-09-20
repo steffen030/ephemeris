@@ -26,7 +26,11 @@ impl ProfileManager {
     }
 
     /// Rename a profile in place.  Returns `false` if no profile with that id exists.
-    pub fn rename_profile(&self, id: ProfileId, new_name: impl Into<String>) -> crate::Result<bool> {
+    pub fn rename_profile(
+        &self,
+        id: ProfileId,
+        new_name: impl Into<String>,
+    ) -> crate::Result<bool> {
         let new_name = new_name.into();
         let mut profiles = self.profiles.lock().unwrap();
         match profiles.iter_mut().find(|p| p.id == id) {

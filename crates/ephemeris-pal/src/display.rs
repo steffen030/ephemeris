@@ -85,18 +85,13 @@ impl PixelBuf {
 }
 
 /// Refresh mode hint for e-ink displays.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RefreshMode {
+    #[default]
     Full,
     Partial,
     Fast,
     Clear,
-}
-
-impl Default for RefreshMode {
-    fn default() -> Self {
-        RefreshMode::Full
-    }
 }
 
 /// Rectangle for damage/dirty regions.
@@ -132,6 +127,106 @@ pub trait Display {
         mode: RefreshMode,
     ) -> Result<(), DisplayError>;
 }
+
+// ── Desktop window backend (winit + softbuffer) ──────────────────────────────
+
+use std::num::NonZeroU32;
+use std::sync::Arc;
+
+/// Live desktop window backed by winit + softbuffer.
+///
+/// Created inside an `ApplicationHandler::resumed` callback; presents an
+/// 8-bpp grayscale [`PixelBuf`] as XRGB8888 to the OS compositor.
+pub struct DesktopWindow {
+    window: Arc<winit::window::Window>,
+    // Context must outlive surface; prefixed `_` because it is only kept alive.
+    _ctx: softbuffer::Context<Arc<winit::window::Window>>,
+    surface: softbuffer::Surface<Arc<winit::window::Window>, Arc<winit::window::Window>>,
+    width: u32,
+    height: u32,
+}
+
+impl DesktopWindow {
+    /// Create a window of the given logical size from within a winit
+    /// `ApplicationHandler::resumed` callback.
+    pub fn new(
+        event_loop: &winit::event_loop::ActiveEventLoop,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, DisplayError> {
+        use winit::dpi::LogicalSize;
+        use winit::window::Window;
+
+        let attrs = Window::default_attributes()
+            .with_title("Ephemeris")
+            .with_inner_size(LogicalSize::new(width, height))
+            .with_resizable(false);
+
+        let window = Arc::new(
+            event_loop
+                .create_window(attrs)
+                .map_err(|e| DisplayError::init(e.to_string()))?,
+        );
+
+        let ctx = softbuffer::Context::new(window.clone())
+            .map_err(|e| DisplayError::init(e.to_string()))?;
+
+        let mut surface = softbuffer::Surface::new(&ctx, window.clone())
+            .map_err(|e| DisplayError::init(e.to_string()))?;
+
+        surface
+            .resize(
+                NonZeroU32::new(width).unwrap(),
+                NonZeroU32::new(height).unwrap(),
+            )
+            .map_err(|e| DisplayError::init(e.to_string()))?;
+
+        Ok(DesktopWindow {
+            window,
+            _ctx: ctx,
+            surface,
+            width,
+            height,
+        })
+    }
+
+    /// Ask the OS to schedule a redraw (triggers `WindowEvent::RedrawRequested`).
+    pub fn request_redraw(&self) {
+        self.window.request_redraw();
+    }
+}
+
+impl Display for DesktopWindow {
+    fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    fn present(
+        &mut self,
+        buf: &PixelBuf,
+        _damage: &[Rect],
+        _mode: RefreshMode,
+    ) -> Result<(), DisplayError> {
+        let mut sb = self
+            .surface
+            .buffer_mut()
+            .map_err(|e| DisplayError::present(e.to_string()))?;
+
+        let pixel_count = (self.width * self.height) as usize;
+        for (i, dst) in sb.iter_mut().enumerate().take(pixel_count) {
+            // 8-bpp gray (0=black, 255=white) → XRGB8888
+            let g = buf.data.get(i).copied().unwrap_or(255) as u32;
+            *dst = (g << 16) | (g << 8) | g;
+        }
+
+        sb.present()
+            .map_err(|e| DisplayError::present(e.to_string()))?;
+
+        Ok(())
+    }
+}
+
+// ── Mock desktop display (headless stub for tests) ────────────────────────────
 
 /// Mock desktop display (stub for future winit/softbuffer integration).
 pub struct MockDesktop {

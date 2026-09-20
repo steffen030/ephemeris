@@ -17,12 +17,32 @@
 // then a `swipe-left` or `swipe-right` callback is emitted instead of a
 // `canvas-touch`.  All other interactions are forwarded to `canvas-touch` as
 // before, keeping drawing unaffected.
+//
+// ## Eink theme (bead 2ql.6)
+//
+// All chrome and button colors flow through the exported `EinkTheme` global so
+// the Rust bridge can apply Config.theme ("light" / "dark") at runtime without
+// touching the layout logic.  Defaults are the light eink theme: pure white
+// background, pure black borders and text.  No grays, no color, no gradients.
+
+export global EinkTheme {
+    in property <color> canvas-bg: white;
+    in property <color> chrome-bg: white;
+    in property <color> chrome-border: black;
+    in property <color> btn-bg: white;
+    in property <color> btn-fg: black;
+    in property <color> btn-active-bg: black;
+    in property <color> btn-active-fg: white;
+    in property <color> btn-border: black;
+    in property <color> text-secondary: black;
+    in property <color> danger-fg: black;
+}
 
 export component EphemerisPage inherits Window {
     // ── Layout geometry ──────────────────────────────────────────────────
     preferred-width:  800px;
     preferred-height: 600px;
-    background: white;
+    background: EinkTheme.canvas-bg;
 
     // ── Exposed state ────────────────────────────────────────────────────
 
@@ -37,6 +57,26 @@ export component EphemerisPage inherits Window {
 
     /// Active tool label (drives toolbar button highlight).
     in-out property <string> active-tool: "pen";
+
+    // ── Action ring state ────────────────────────────────────────────────────
+
+    /// Show the action ring overlay.
+    in property <bool> ring-visible: false;
+
+    /// Canvas-relative X center for the ring (from the triggering tap).
+    in property <float> ring-cx: 400;
+
+    /// Canvas-relative Y center for the ring (from the triggering tap).
+    in property <float> ring-cy: 300;
+
+    /// Show the Audio slice (only on mic-equipped devices like PineNote).
+    in property <bool> ring-show-audio: true;
+
+    callback ring-note-tapped();
+    callback ring-calendar-tapped();
+    callback ring-task-tapped();
+    callback ring-audio-tapped();
+    callback ring-dismissed();
 
     // ── Swipe detection state (private) ─────────────────────────────────
 
@@ -73,7 +113,7 @@ export component EphemerisPage inherits Window {
         x: 0; y: 0;
         width: parent.width;
         height: 24px;
-        background: #e0e0e0;
+        background: EinkTheme.chrome-bg;
 
         HorizontalLayout {
             padding-left: 8px;
@@ -83,16 +123,23 @@ export component EphemerisPage inherits Window {
             Text {
                 text: root.page-title;
                 font-size: 13px;
-                color: black;
+                color: EinkTheme.btn-fg;
                 vertical-alignment: center;
             }
 
             Text {
                 text: root.page-index + " / " + root.page-count;
                 font-size: 13px;
-                color: #444444;
+                color: EinkTheme.text-secondary;
                 vertical-alignment: center;
             }
+        }
+
+        // Bottom divider — 2 px black line separating status bar from canvas.
+        Rectangle {
+            x: 0; y: parent.height - 2px;
+            width: parent.width; height: 2px;
+            background: EinkTheme.chrome-border;
         }
     }
 
@@ -102,7 +149,7 @@ export component EphemerisPage inherits Window {
         y: parent.height - self.height;
         width: parent.width;
         height: 48px;
-        background: #e8e8e8;
+        background: EinkTheme.chrome-bg;
 
         HorizontalLayout {
             padding: 4px;
@@ -112,15 +159,15 @@ export component EphemerisPage inherits Window {
             // Pen button
             pen-btn := Rectangle {
                 width: 80px; height: 40px;
-                background: root.active-tool == "pen" ? #b0b0b0 : #f0f0f0;
+                background: root.active-tool == "pen" ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
                 border-radius: 4px;
-                border-width: 1px;
-                border-color: #999999;
+                border-width: 2px;
+                border-color: EinkTheme.btn-border;
 
                 Text {
                     text: "Pen";
                     font-size: 14px;
-                    color: black;
+                    color: root.active-tool == "pen" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
                     horizontal-alignment: center;
                     vertical-alignment: center;
                 }
@@ -136,15 +183,15 @@ export component EphemerisPage inherits Window {
             // Highlighter button
             hl-btn := Rectangle {
                 width: 100px; height: 40px;
-                background: root.active-tool == "highlighter" ? #b0b0b0 : #f0f0f0;
+                background: root.active-tool == "highlighter" ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
                 border-radius: 4px;
-                border-width: 1px;
-                border-color: #999999;
+                border-width: 2px;
+                border-color: EinkTheme.btn-border;
 
                 Text {
                     text: "Highlighter";
                     font-size: 14px;
-                    color: black;
+                    color: root.active-tool == "highlighter" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
                     horizontal-alignment: center;
                     vertical-alignment: center;
                 }
@@ -160,15 +207,15 @@ export component EphemerisPage inherits Window {
             // Eraser button
             eraser-btn := Rectangle {
                 width: 80px; height: 40px;
-                background: root.active-tool == "eraser" ? #b0b0b0 : #f0f0f0;
+                background: root.active-tool == "eraser" ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
                 border-radius: 4px;
-                border-width: 1px;
-                border-color: #999999;
+                border-width: 2px;
+                border-color: EinkTheme.btn-border;
 
                 Text {
                     text: "Eraser";
                     font-size: 14px;
-                    color: black;
+                    color: root.active-tool == "eraser" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
                     horizontal-alignment: center;
                     vertical-alignment: center;
                 }
@@ -184,15 +231,15 @@ export component EphemerisPage inherits Window {
             // Clear button (rightmost, with stronger visual separation)
             clear-btn := Rectangle {
                 width: 80px; height: 40px;
-                background: #f0f0f0;
+                background: EinkTheme.btn-bg;
                 border-radius: 4px;
-                border-width: 1px;
-                border-color: #999999;
+                border-width: 2px;
+                border-color: EinkTheme.btn-border;
 
                 Text {
                     text: "Clear";
                     font-size: 14px;
-                    color: #cc0000;
+                    color: EinkTheme.danger-fg;
                     horizontal-alignment: center;
                     vertical-alignment: center;
                 }
@@ -201,6 +248,13 @@ export component EphemerisPage inherits Window {
                     clicked => { root.clear-page(); }
                 }
             }
+        }
+
+        // Top divider — 2 px black line separating canvas from toolbar.
+        Rectangle {
+            x: 0; y: 0;
+            width: parent.width; height: 2px;
+            background: EinkTheme.chrome-border;
         }
     }
 
@@ -220,7 +274,7 @@ export component EphemerisPage inherits Window {
         y: status-bar.height;
         width: parent.width;
         height: parent.height - status-bar.height - toolbar.height;
-        background: white;
+        background: EinkTheme.canvas-bg;
         clip: true;
 
         // Touch / mouse input — drawing + swipe gesture detection.
@@ -260,6 +314,113 @@ export component EphemerisPage inherits Window {
                     // touch to Rust — no duplicate callback needed here.
                 }
             }
+        }
+    }
+
+    // ── Action ring overlay ──────────────────────────────────────────────────
+    //
+    // Shown when Action::OpenActionRing fires (pen-button + tap via ActionRouter).
+    // Four large eink-friendly buttons arranged in a cross around (ring-cx, ring-cy)
+    // in canvas-relative coordinates.  A full-canvas backdrop captures taps outside
+    // any button and dismisses the ring.
+    //
+    // Z-order: declared last so it paints on top of canvas, status bar, and toolbar.
+    ring-backdrop := Rectangle {
+        visible: root.ring-visible;
+        x: 0px;
+        y: status-bar.height;
+        width: parent.width;
+        height: parent.height - status-bar.height - toolbar.height;
+
+        // Tap outside any button dismisses the ring.
+        TouchArea {
+            clicked => { root.ring-dismissed(); }
+        }
+
+        // Note — top
+        Rectangle {
+            x: root.ring-cx * 1px - 50px;
+            y: root.ring-cy * 1px - 96px;
+            width: 100px; height: 48px;
+            background: EinkTheme.btn-bg;
+            border-radius: 6px;
+            border-width: 2px;
+            border-color: EinkTheme.btn-border;
+            Text {
+                text: "Note";
+                font-size: 14px; color: EinkTheme.btn-fg;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
+            TouchArea { clicked => { root.ring-note-tapped(); } }
+        }
+
+        // Calendar — right
+        Rectangle {
+            x: root.ring-cx * 1px + 56px;
+            y: root.ring-cy * 1px - 24px;
+            width: 100px; height: 48px;
+            background: EinkTheme.btn-bg;
+            border-radius: 6px;
+            border-width: 2px;
+            border-color: EinkTheme.btn-border;
+            Text {
+                text: "Event";
+                font-size: 14px; color: EinkTheme.btn-fg;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
+            TouchArea { clicked => { root.ring-calendar-tapped(); } }
+        }
+
+        // Task — bottom
+        Rectangle {
+            x: root.ring-cx * 1px - 50px;
+            y: root.ring-cy * 1px + 48px;
+            width: 100px; height: 48px;
+            background: EinkTheme.btn-bg;
+            border-radius: 6px;
+            border-width: 2px;
+            border-color: EinkTheme.btn-border;
+            Text {
+                text: "Task";
+                font-size: 14px; color: EinkTheme.btn-fg;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
+            TouchArea { clicked => { root.ring-task-tapped(); } }
+        }
+
+        // Audio — left (hidden on devices without a microphone)
+        Rectangle {
+            visible: root.ring-show-audio;
+            x: root.ring-cx * 1px - 156px;
+            y: root.ring-cy * 1px - 24px;
+            width: 100px; height: 48px;
+            background: EinkTheme.btn-bg;
+            border-radius: 6px;
+            border-width: 2px;
+            border-color: EinkTheme.btn-border;
+            Text {
+                text: "Audio";
+                font-size: 14px; color: EinkTheme.btn-fg;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
+            TouchArea { clicked => { root.ring-audio-tapped(); } }
+        }
+
+        // Centre dismiss button — filled black/white for visual prominence.
+        Rectangle {
+            x: root.ring-cx * 1px - 24px;
+            y: root.ring-cy * 1px - 24px;
+            width: 48px; height: 48px;
+            background: EinkTheme.btn-active-bg;
+            border-radius: 24px;
+            border-width: 2px;
+            border-color: EinkTheme.btn-border;
+            Text {
+                text: "x";
+                font-size: 18px; color: EinkTheme.btn-active-fg;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
+            TouchArea { clicked => { root.ring-dismissed(); } }
         }
     }
 }

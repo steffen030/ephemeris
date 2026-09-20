@@ -2,6 +2,13 @@ use ephemeris_core::Result;
 use std::sync::mpsc::{channel, Receiver};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::UnboundedSender;
+use winit::application::ApplicationHandler;
+use winit::event::WindowEvent;
+use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::window::WindowId;
+
+use ephemeris_pal::display::{DesktopWindow, PixelBuf};
+use ephemeris_ui::{EphemerisUi, STATUS_BAR_H, TOOLBAR_H};
 
 /// Commands from UI to async core.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +100,80 @@ impl Default for App {
     fn default() -> Self {
         App::new().expect("Failed to create default App")
     }
+}
+
+impl App {
+    /// Launch the live winit window with the Ephemeris UI and a test pattern.
+    ///
+    /// Blocks until the window is closed.  Consumes `self` because the tokio
+    /// runtime is transferred into the winit event-loop handler.
+    pub fn run_windowed(self) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let ui = EphemerisUi::new(800, 600)?;
+        ui.set_page_title("Ephemeris");
+        desktop_test_pattern(&ui, 800, 600);
+
+        let mut handler = WinitHandler {
+            _rt: self.rt,
+            ui,
+            display: None,
+        };
+
+        EventLoop::new()?.run_app(&mut handler)?;
+        Ok(())
+    }
+}
+
+// ── Winit ApplicationHandler ──────────────────────────────────────────────────
+
+struct WinitHandler {
+    _rt: Runtime,
+    ui: EphemerisUi,
+    display: Option<DesktopWindow>,
+}
+
+impl ApplicationHandler for WinitHandler {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        match DesktopWindow::new(event_loop, 800, 600) {
+            Ok(d) => {
+                d.request_redraw();
+                self.display = Some(d);
+            }
+            Err(e) => {
+                tracing::error!("DesktopWindow creation failed: {e}");
+                event_loop.exit();
+            }
+        }
+    }
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::RedrawRequested => {
+                if let Some(display) = &mut self.display {
+                    if let Err(e) = self.ui.render_frame(display) {
+                        tracing::error!("render_frame failed: {e}");
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+// ── Test pattern ──────────────────────────────────────────────────────────────
+
+/// Push a 64-px checkerboard into the canvas so visual rendering is immediately
+/// verifiable without any user input.
+fn desktop_test_pattern(ui: &EphemerisUi, width: u32, height: u32) {
+    let canvas_h = height - STATUS_BAR_H - TOOLBAR_H;
+    let mut buf = PixelBuf::new(width, canvas_h);
+    for y in 0..canvas_h as usize {
+        for x in 0..width as usize {
+            let checker = ((x / 64) + (y / 64)) % 2;
+            buf.data[y * width as usize + x] = if checker == 0 { 180 } else { 230 };
+        }
+    }
+    ui.push_canvas_pixels(&buf);
 }
 
 #[cfg(test)]

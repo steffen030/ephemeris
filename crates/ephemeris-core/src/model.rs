@@ -198,11 +198,12 @@ impl Note {
     }
 }
 
-/// Page template hint (blank, grid, dot matrix).
+/// Page template hint (blank, lines, grid, dot matrix).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum PageTemplate {
     #[default]
     Blank,
+    Lines,
     Grid,
     Dot,
 }

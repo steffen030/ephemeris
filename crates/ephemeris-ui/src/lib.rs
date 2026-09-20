@@ -115,6 +115,8 @@ struct PageState {
     in_progress: Vec<Point>,
     /// Nominal base_width of the in-progress stroke (copied at PenDown time).
     in_progress_base_width: f32,
+    /// Background template for this page (blank, lines, grid, dot).
+    template: ephemeris_core::PageTemplate,
 }
 
 impl PageState {
@@ -124,6 +126,7 @@ impl PageState {
             committed: PixelBuf::new(canvas_w, canvas_h),
             in_progress: Vec::new(),
             in_progress_base_width: default_base_width,
+            template: ephemeris_core::PageTemplate::Blank,
         }
     }
 }
@@ -387,6 +390,42 @@ impl EphemerisUi {
         self.component.set_page_count(total);
     }
 
+    /// Apply a named theme to the UI by setting the [`EinkTheme`] global's
+    /// color properties.
+    ///
+    /// * `"light"` (default) — pure white backgrounds, black borders/text.
+    /// * `"dark"`             — pure black backgrounds, white borders/text.
+    /// * anything else        — treated as `"light"`.
+    ///
+    /// Maps `Config::theme` to display colors at startup.  Called after
+    /// [`EphemerisUi::new`] to honour the loaded configuration.
+    pub fn apply_theme(&self, theme: &str) {
+        let t = EinkTheme::get(&self.component);
+        let (bg, fg, border) = if theme == "dark" {
+            (
+                slint::Color::from_rgb_u8(0, 0, 0),
+                slint::Color::from_rgb_u8(255, 255, 255),
+                slint::Color::from_rgb_u8(255, 255, 255),
+            )
+        } else {
+            (
+                slint::Color::from_rgb_u8(255, 255, 255),
+                slint::Color::from_rgb_u8(0, 0, 0),
+                slint::Color::from_rgb_u8(0, 0, 0),
+            )
+        };
+        t.set_canvas_bg(bg);
+        t.set_chrome_bg(bg);
+        t.set_chrome_border(border);
+        t.set_btn_bg(bg);
+        t.set_btn_fg(fg);
+        t.set_btn_active_bg(fg);
+        t.set_btn_active_fg(bg);
+        t.set_btn_border(border);
+        t.set_text_secondary(fg);
+        t.set_danger_fg(fg);
+    }
+
     // ── Callback registration ─────────────────────────────────────────────
 
     /// Register a closure that is called when the user taps the canvas area.
@@ -437,6 +476,55 @@ impl EphemerisUi {
         F: FnMut() + 'static,
     {
         self.component.on_swipe_right(handler);
+    }
+
+    // ── Action ring API ───────────────────────────────────────────────────
+
+    /// Show the action ring centered at canvas-relative `(cx, cy)`.
+    ///
+    /// `show_audio` controls whether the Audio slice is visible; set it `false`
+    /// on devices without a microphone.  Triggered by `Action::OpenActionRing`
+    /// from the `ActionRouter`.
+    pub fn show_action_ring(&self, cx: f32, cy: f32, show_audio: bool) {
+        self.component.set_ring_cx(cx);
+        self.component.set_ring_cy(cy);
+        self.component.set_ring_show_audio(show_audio);
+        self.component.set_ring_visible(true);
+    }
+
+    /// Hide the action ring (call after any slice is tapped or dismissed).
+    pub fn hide_action_ring(&self) {
+        self.component.set_ring_visible(false);
+    }
+
+    /// `true` if the action ring is currently visible.
+    pub fn ring_visible(&self) -> bool {
+        self.component.get_ring_visible()
+    }
+
+    /// Register a closure called when the "Note" slice is tapped.
+    pub fn on_ring_note<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_ring_note_tapped(handler);
+    }
+
+    /// Register a closure called when the "Event" (calendar) slice is tapped.
+    pub fn on_ring_calendar<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_ring_calendar_tapped(handler);
+    }
+
+    /// Register a closure called when the "Task" slice is tapped.
+    pub fn on_ring_task<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_ring_task_tapped(handler);
+    }
+
+    /// Register a closure called when the "Audio" slice is tapped.
+    pub fn on_ring_audio<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_ring_audio_tapped(handler);
+    }
+
+    /// Register a closure called when the ring is dismissed (backdrop tap or ×).
+    pub fn on_ring_dismissed<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_ring_dismissed(handler);
     }
 
     // ── Page navigation API ───────────────────────────────────────────────
@@ -644,6 +732,32 @@ impl EphemerisUi {
         self.screen_change.set(true);
     }
 
+    /// Get the background template for the current page.
+    pub fn current_page_template(&self) -> ephemeris_core::PageTemplate {
+        self.pages.borrow().current_page().template
+    }
+
+    /// Set the background template for the current page and mark the canvas dirty.
+    pub fn set_current_page_template(&self, template: ephemeris_core::PageTemplate) {
+        self.pages.borrow_mut().current_page_mut().template = template;
+        let canvas_h = self.canvas_height();
+        self.ink_damage
+            .borrow_mut()
+            .push(Rect::new(0, STATUS_BAR_H, self.width, canvas_h));
+    }
+
+    /// Cycle to the next page template (Blank → Lines → Grid → Dot → Blank).
+    pub fn cycle_page_template(&self) {
+        use ephemeris_core::PageTemplate;
+        let next = match self.current_page_template() {
+            PageTemplate::Blank => PageTemplate::Lines,
+            PageTemplate::Lines => PageTemplate::Grid,
+            PageTemplate::Grid => PageTemplate::Dot,
+            PageTemplate::Dot => PageTemplate::Blank,
+        };
+        self.set_current_page_template(next);
+    }
+
     // ── Render ────────────────────────────────────────────────────────────
 
     /// Render one frame into a [`PixelBuf`] and present it via `display`.
@@ -737,6 +851,10 @@ impl EphemerisUi {
             let luma = (0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32).round() as u8;
             pal_buf.data[i] = luma;
         }
+
+        // 4b. Render background pattern (lines, grid, dots) for current page.
+        let template = self.current_page_template();
+        render_background(&mut pal_buf, template, self.width, self.height);
 
         // 5. Composite ink layers over the canvas region.
         //
@@ -854,13 +972,16 @@ impl EphemerisUi {
 
     /// Capture the current live ink state into a [`PageState`] snapshot.
     ///
-    /// Clones `committed_layer`, `in_progress`, and `in_progress_base_width`
-    /// so they can be stored in `PageBook` and later restored.
+    /// Clones `committed_layer`, `in_progress`, `in_progress_base_width`, and template.
     fn snapshot_live_state(&self, _canvas_h: u32) -> PageState {
+        let book = self.pages.borrow();
+        let current_template = book.current_page().template;
+        drop(book);
         PageState {
             committed: self.committed_layer.borrow().clone(),
             in_progress: self.in_progress.borrow().clone(),
             in_progress_base_width: *self.in_progress_base_width.borrow(),
+            template: current_template,
         }
     }
 
@@ -900,6 +1021,67 @@ impl EphemerisUi {
         // Switching pages replaces the whole canvas — force a Clear refresh so
         // the outgoing page leaves no ghost and the incoming ink is presented.
         self.screen_change.set(true);
+    }
+}
+
+// ── Background rendering ──────────────────────────────────────────────────────
+
+/// Render page background pattern (lines, grid, dots) into the canvas region.
+/// Updates `pal_buf` in place for rows [STATUS_BAR_H, height - TOOLBAR_H).
+fn render_background(
+    pal_buf: &mut PixelBuf,
+    template: ephemeris_core::PageTemplate,
+    width: u32,
+    height: u32,
+) {
+    use ephemeris_core::PageTemplate;
+    let stride = width as usize;
+    let canvas_start = STATUS_BAR_H as usize;
+    let canvas_end = (height - TOOLBAR_H) as usize;
+
+    match template {
+        PageTemplate::Blank => {
+            // No pattern; leave white (already rendered by Slint)
+        }
+        PageTemplate::Lines => {
+            // Horizontal lines every 28 pixels
+            let line_spacing = 28;
+            let line_color = 200u8; // light gray
+            for row in (canvas_start..canvas_end).step_by(line_spacing) {
+                for col in 0..width as usize {
+                    pal_buf.data[row * stride + col] = line_color;
+                }
+            }
+        }
+        PageTemplate::Grid => {
+            // Square grid 28×28, light gray
+            let spacing = 28;
+            let grid_color = 220u8;
+            for row in canvas_start..canvas_end {
+                if (row - canvas_start) % spacing == 0 {
+                    for col in 0..width as usize {
+                        pal_buf.data[row * stride + col] = grid_color;
+                    }
+                }
+            }
+            for row in canvas_start..canvas_end {
+                for col in (0..width as usize).step_by(spacing) {
+                    pal_buf.data[row * stride + col] = grid_color;
+                }
+            }
+        }
+        PageTemplate::Dot => {
+            // Dot grid 28×28, light gray
+            let spacing = 28;
+            let dot_color = 210u8;
+            for row in (canvas_start..canvas_end).step_by(spacing) {
+                for col in (0..width as usize).step_by(spacing) {
+                    if col < width as usize && row < canvas_end {
+                        pal_buf.data[row * stride + col] = dot_color;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1123,11 +1305,10 @@ mod tests {
                 "rendered frame must show dark ink pixels in canvas region (buf row {stroke_buf_row})"
             );
 
-            // Status bar and toolbar pixel values must all be ≥ some reasonable
-            // threshold proving Slint rendered UI chrome (not solid ink black).
-            // The status bar background is #e0e0e0 → luma ≈ 224; text may be
-            // darker but we just check we didn't wipe a whole row to 0.
-            for row in 0..STATUS_BAR_H as usize {
+            // Status bar content rows must not be all-black (ink bleed check).
+            // The bottom 2 rows of the status bar are the intentional chrome
+            // divider line (pure black) — skip those when checking for bleed.
+            for row in 0..(STATUS_BAR_H as usize).saturating_sub(2) {
                 let row_min = (0..800usize)
                     .map(|col| buf.data[row * stride + col])
                     .min()
@@ -1432,7 +1613,107 @@ mod tests {
         assert_eq!(ui.component.get_page_count(), 2);
     }
 
-    /// `swipe-left` callback emitted from `.slint` wires correctly to
+    // ── Action ring tests (acceptance criteria for idd.6) ────────────────
+
+    /// show_action_ring sets visible=true and centers the ring at the given coords.
+    #[test]
+    fn ring_show_positions_and_enables() {
+        let ui = EphemerisUi::new(800, 600).expect("UI construction failed");
+        assert!(!ui.ring_visible());
+
+        ui.show_action_ring(200.0, 150.0, true);
+
+        assert!(ui.ring_visible());
+        assert!((ui.component.get_ring_cx() - 200.0).abs() < f32::EPSILON);
+        assert!((ui.component.get_ring_cy() - 150.0).abs() < f32::EPSILON);
+        assert!(ui.component.get_ring_show_audio());
+    }
+
+    /// hide_action_ring clears the visible flag.
+    #[test]
+    fn ring_hide_clears_visible() {
+        let ui = EphemerisUi::new(800, 600).expect("UI construction failed");
+        ui.show_action_ring(400.0, 300.0, false);
+        assert!(ui.ring_visible());
+        ui.hide_action_ring();
+        assert!(!ui.ring_visible());
+    }
+
+    /// Audio slice can be suppressed for non-mic devices.
+    #[test]
+    fn ring_audio_hidden_when_no_mic() {
+        let ui = EphemerisUi::new(800, 600).expect("UI construction failed");
+        ui.show_action_ring(400.0, 300.0, false);
+        assert!(!ui.component.get_ring_show_audio());
+    }
+
+    /// Note slice callback fires and is wired through on_ring_note.
+    #[test]
+    fn ring_note_callback_fires() {
+        let ui = EphemerisUi::new(800, 600).expect("UI construction failed");
+        let fired = Rc::new(RefCell::new(false));
+        let fired_c = fired.clone();
+        ui.on_ring_note(move || {
+            *fired_c.borrow_mut() = true;
+        });
+        ui.component.invoke_ring_note_tapped();
+        assert!(*fired.borrow());
+    }
+
+    /// Calendar slice callback fires.
+    #[test]
+    fn ring_calendar_callback_fires() {
+        let ui = EphemerisUi::new(800, 600).expect("UI construction failed");
+        let fired = Rc::new(RefCell::new(false));
+        let fired_c = fired.clone();
+        ui.on_ring_calendar(move || {
+            *fired_c.borrow_mut() = true;
+        });
+        ui.component.invoke_ring_calendar_tapped();
+        assert!(*fired.borrow());
+    }
+
+    /// Task slice callback fires.
+    #[test]
+    fn ring_task_callback_fires() {
+        let ui = EphemerisUi::new(800, 600).expect("UI construction failed");
+        let fired = Rc::new(RefCell::new(false));
+        let fired_c = fired.clone();
+        ui.on_ring_task(move || {
+            *fired_c.borrow_mut() = true;
+        });
+        ui.component.invoke_ring_task_tapped();
+        assert!(*fired.borrow());
+    }
+
+    /// Audio slice callback fires.
+    #[test]
+    fn ring_audio_callback_fires() {
+        let ui = EphemerisUi::new(800, 600).expect("UI construction failed");
+        let fired = Rc::new(RefCell::new(false));
+        let fired_c = fired.clone();
+        ui.on_ring_audio(move || {
+            *fired_c.borrow_mut() = true;
+        });
+        ui.component.invoke_ring_audio_tapped();
+        assert!(*fired.borrow());
+    }
+
+    /// Dismissed callback fires for backdrop tap or centre × button.
+    #[test]
+    fn ring_dismissed_callback_fires() {
+        let ui = EphemerisUi::new(800, 600).expect("UI construction failed");
+        let fired = Rc::new(RefCell::new(false));
+        let fired_c = fired.clone();
+        ui.on_ring_dismissed(move || {
+            *fired_c.borrow_mut() = true;
+        });
+        ui.show_action_ring(400.0, 300.0, true);
+        ui.component.invoke_ring_dismissed();
+        assert!(*fired.borrow());
+    }
+
+    /// swipe-left callback emitted from `.slint` wires correctly to
     /// `prev_page` via `wire_swipe_navigation`.
     #[test]
     fn swipe_left_callback_wires_to_prev_page() {
@@ -1452,6 +1733,41 @@ mod tests {
             (1, 2),
             "swipe-left must call prev_page"
         );
+    }
+
+    // ── Eink theme tests (acceptance criteria for 2ql.6) ────────────────
+
+    /// Light theme: chrome and canvas are white; borders and text are black.
+    #[test]
+    fn apply_theme_light_sets_white_chrome() {
+        let ui = EphemerisUi::new(800, 600).expect("UI construction failed");
+        ui.apply_theme("light");
+        let theme = EinkTheme::get(&ui.component);
+        let white = slint::Color::from_rgb_u8(255, 255, 255);
+        let black = slint::Color::from_rgb_u8(0, 0, 0);
+        assert_eq!(theme.get_chrome_bg(), white, "chrome-bg must be white");
+        assert_eq!(theme.get_canvas_bg(), white, "canvas-bg must be white");
+        assert_eq!(theme.get_chrome_border(), black, "chrome-border must be black");
+        assert_eq!(theme.get_btn_bg(), white, "btn-bg must be white");
+        assert_eq!(theme.get_btn_fg(), black, "btn-fg must be black");
+        assert_eq!(theme.get_btn_active_bg(), black, "active btn fill must be black");
+        assert_eq!(theme.get_btn_active_fg(), white, "active btn text must be white");
+        assert_eq!(theme.get_danger_fg(), black, "danger-fg must be black (not red)");
+    }
+
+    /// Dark theme: chrome and canvas are black; borders and text are white.
+    #[test]
+    fn apply_theme_dark_inverts_chrome() {
+        let ui = EphemerisUi::new(800, 600).expect("UI construction failed");
+        ui.apply_theme("dark");
+        let theme = EinkTheme::get(&ui.component);
+        let white = slint::Color::from_rgb_u8(255, 255, 255);
+        let black = slint::Color::from_rgb_u8(0, 0, 0);
+        assert_eq!(theme.get_chrome_bg(), black, "chrome-bg must be black");
+        assert_eq!(theme.get_canvas_bg(), black, "canvas-bg must be black");
+        assert_eq!(theme.get_chrome_border(), white, "chrome-border must be white");
+        assert_eq!(theme.get_btn_active_bg(), white, "active btn fill must be white");
+        assert_eq!(theme.get_btn_active_fg(), black, "active btn text must be black");
     }
 
     /// `swipe-right` callback emitted from `.slint` wires correctly to
@@ -1685,5 +2001,30 @@ mod tests {
             modes,
             vec![RefreshMode::Fast, RefreshMode::Fast, RefreshMode::Full]
         );
+    }
+
+    /// Verify that text elements (status bar, toolbar) render without panicking
+    /// and that rendering completes successfully. This validates that the Slint
+    /// software renderer can rasterize text glyphs, confirming system-fonts support
+    /// is working in the headless environment.
+    #[test]
+    fn text_elements_render_headless() {
+        let ui = EphemerisUi::new(800, 600).expect("UI construction failed");
+        ui.set_page_title("Rendering Test");
+        ui.set_page_index(1, 2);
+
+        let mut display = MockDesktop::new(800, 600).expect("MockDesktop creation failed");
+
+        // Render multiple frames with different titles to stress text rendering.
+        for i in 0..3 {
+            let title = format!("Page {}", i);
+            ui.set_page_title(&title);
+            let damage = ui.render_frame(&mut display)
+                .expect("render_frame should not fail with text elements");
+            // First frame should always have damage.
+            if i == 0 {
+                assert!(!damage.is_empty(), "first frame should produce damage");
+            }
+        }
     }
 }

@@ -12,10 +12,12 @@
 //! See [`crate::store`] for persistence of completed strokes.
 
 pub mod engine;
+pub mod eraser;
 pub mod one_euro;
 pub mod spline;
 pub mod width;
 
 pub use engine::{InkConfig, InkEngine, InkUpdate};
+pub use eraser::{EraserConfig, EraserEngine, EraserUpdate};
 pub use one_euro::{OneEuroConfig, OneEuroFilter, OneEuroFilter2D};
 pub use width::{width_for, WidthConfig};

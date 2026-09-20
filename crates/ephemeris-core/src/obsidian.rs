@@ -2,6 +2,7 @@ use crate::Note;
 
 /// Obsidian vault filesystem reader.
 pub struct ObsidianVault {
+    #[allow(dead_code)]
     vault_path: String,
 }
 

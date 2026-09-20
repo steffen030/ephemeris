@@ -20,7 +20,7 @@ pub mod store;
 pub use action::{Action, ActionMap, ActionRouter, CanvasPoint, DefaultActionMap, RouterOutput};
 pub use config::Config;
 pub use error::{AppError, Result};
-pub use ink::{InkConfig, InkEngine, InkUpdate};
+pub use ink::{EraserConfig, EraserEngine, EraserUpdate, InkConfig, InkEngine, InkUpdate};
 pub use model::{
     Account, AccountId, AccountKind, CalendarEvent, Color, EventId, Note, NoteId, Page, PageId,
     PageTemplate, Point, Profile, ProfileId, Stroke, StrokeId, Task, TaskId, TaskPriority, Tool,
@@ -43,8 +43,8 @@ pub mod obsidian;
 pub mod profile_manager;
 pub mod stroke_persistence;
 pub mod task_provider;
-pub use task_provider::{ProviderCapabilities, TaskProvider};
 #[cfg(feature = "sqlite")]
 pub use task_provider::LocalTaskProvider;
+pub use task_provider::{ProviderCapabilities, TaskProvider};
 #[cfg(feature = "webdav")]
 pub mod webdav;

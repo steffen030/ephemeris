@@ -107,7 +107,10 @@ mod tests {
     fn setup() -> (LocalTaskProvider, ProfileId) {
         let provider = LocalTaskProvider::open_in_memory().expect("in-memory store");
         let profile = Profile::new("Test");
-        provider.store.upsert_profile(&profile).expect("upsert profile");
+        provider
+            .store
+            .upsert_profile(&profile)
+            .expect("upsert profile");
         (provider, profile.id)
     }
 
@@ -170,7 +173,10 @@ mod tests {
         provider.create(&task).unwrap();
 
         assert!(provider.delete(task.id).unwrap());
-        assert!(!provider.delete(task.id).unwrap(), "second delete returns false");
+        assert!(
+            !provider.delete(task.id).unwrap(),
+            "second delete returns false"
+        );
         assert!(provider.list(pid).unwrap().is_empty());
     }
 

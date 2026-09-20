@@ -188,6 +188,7 @@ fn account_kind_from_str(s: &str) -> Result<AccountKind> {
 fn page_template_to_str(t: PageTemplate) -> &'static str {
     match t {
         PageTemplate::Blank => "Blank",
+        PageTemplate::Lines => "Lines",
         PageTemplate::Grid => "Grid",
         PageTemplate::Dot => "Dot",
     }
@@ -196,6 +197,7 @@ fn page_template_to_str(t: PageTemplate) -> &'static str {
 fn page_template_from_str(s: &str) -> Result<PageTemplate> {
     match s {
         "Blank" => Ok(PageTemplate::Blank),
+        "Lines" => Ok(PageTemplate::Lines),
         "Grid" => Ok(PageTemplate::Grid),
         "Dot" => Ok(PageTemplate::Dot),
         other => Err(AppError::Storage(format!("unknown PageTemplate: {other}"))),
@@ -396,10 +398,7 @@ impl SqliteStore {
     /// Clear the persisted active profile (e.g. after deleting the active profile).
     pub fn clear_active_profile_id(&self) -> Result<()> {
         self.conn
-            .execute(
-                "DELETE FROM app_state WHERE key = 'active_profile_id'",
-                [],
-            )
+            .execute("DELETE FROM app_state WHERE key = 'active_profile_id'", [])
             .map_err(storage_err)?;
         Ok(())
     }

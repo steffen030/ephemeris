@@ -23,8 +23,10 @@
 //!   supporting background threads.
 
 pub mod mock;
+pub mod palm;
 pub mod wayland;
 
+pub use palm::{PalmRejector, PalmRejectorConfig};
 pub use wayland::WaylandInput;
 
 use crossbeam_channel::Receiver;
