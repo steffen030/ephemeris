@@ -1058,7 +1058,7 @@ fn render_background(
             let spacing = 28;
             let grid_color = 220u8;
             for row in canvas_start..canvas_end {
-                if (row - canvas_start) % spacing == 0 {
+                if (row - canvas_start).is_multiple_of(spacing) {
                     for col in 0..width as usize {
                         pal_buf.data[row * stride + col] = grid_color;
                     }
