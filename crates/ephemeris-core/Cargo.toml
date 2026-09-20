@@ -38,3 +38,6 @@ reqwest_dav = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 # Optional — activated only when the `ics` feature is enabled.
 reqwest = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = "3"
