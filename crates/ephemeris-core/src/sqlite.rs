@@ -781,6 +781,58 @@ impl SqliteStore {
         }
     }
 
+    /// List all tasks across all profiles.
+    pub fn list_all_tasks(&self) -> Result<Vec<Task>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, profile_id, title, due, priority, tags, source, done
+                 FROM tasks",
+            )
+            .map_err(storage_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)?,
+                ))
+            })
+            .map_err(storage_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id_s, pid_s, title, due, prio, tags_s, source, done) = row.map_err(storage_err)?;
+            let id = id_s
+                .parse()
+                .map_err(|e| AppError::Storage(format!("bad task uuid: {e}")))?;
+            let pid = pid_s
+                .parse()
+                .map_err(|e| AppError::Storage(format!("bad profile uuid: {e}")))?;
+            let priority = match prio {
+                0 => TaskPriority::Low,
+                2 => TaskPriority::High,
+                _ => TaskPriority::Medium,
+            };
+            let tags: Vec<String> = serde_json::from_str(&tags_s).map_err(serde_err)?;
+            out.push(Task {
+                id: TaskId(id),
+                profile_id: ProfileId(pid),
+                title,
+                due: due.map(|d| d as u64),
+                priority,
+                tags,
+                source,
+                done: done != 0,
+            });
+        }
+        Ok(out)
+    }
+
     /// List all tasks for a profile.
     pub fn list_tasks_for_profile(&self, profile_id: ProfileId) -> Result<Vec<Task>> {
         let mut stmt = self
@@ -908,6 +960,53 @@ impl SqliteStore {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(storage_err(e)),
         }
+    }
+
+    /// List all calendar events across all profiles.
+    pub fn list_all_events(&self) -> Result<Vec<CalendarEvent>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, profile_id, uid, start, end, title, location, source
+                 FROM events ORDER BY start ASC",
+            )
+            .map_err(storage_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            })
+            .map_err(storage_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id_s, pid_s, uid, start, end, title, location, source) =
+                row.map_err(storage_err)?;
+            let id = id_s
+                .parse()
+                .map_err(|e| AppError::Storage(format!("bad event uuid: {e}")))?;
+            let pid = pid_s
+                .parse()
+                .map_err(|e| AppError::Storage(format!("bad profile uuid: {e}")))?;
+            out.push(CalendarEvent {
+                id: EventId(id),
+                profile_id: ProfileId(pid),
+                uid,
+                start: start as u64,
+                end: end as u64,
+                title,
+                location,
+                source,
+            });
+        }
+        Ok(out)
     }
 
     /// List all events for a profile.

@@ -6,6 +6,8 @@
 //! lands.
 
 pub mod action;
+#[cfg(feature = "sqlite")]
+pub mod aggregation;
 pub mod config;
 pub mod error;
 pub mod geom;
@@ -43,8 +45,16 @@ pub mod obsidian;
 pub mod profile_manager;
 pub mod stroke_persistence;
 pub mod task_provider;
+pub mod markdown_tasks;
+pub mod calendar_cache;
+pub mod task_cache;
 #[cfg(feature = "sqlite")]
 pub use task_provider::LocalTaskProvider;
 pub use task_provider::{ProviderCapabilities, TaskProvider};
+#[cfg(feature = "sqlite")]
+pub use aggregation::AggregationService;
+pub use markdown_tasks::MarkdownTaskExtractor;
+pub use calendar_cache::CalendarCache;
+pub use task_cache::TaskCache;
 #[cfg(feature = "webdav")]
 pub mod webdav;
