@@ -25,6 +25,52 @@
 // touching the layout logic.  Defaults are the light eink theme: pure white
 // background, pure black borders and text.  No grays, no color, no gradients.
 
+/// A ranked task row for the start page.
+export struct TaskEntry {
+    title: string,
+    priority-label: string,  // "!!!" / "!!" / "!" or ""
+    due-label: string,       // "overdue" / "today" / "2d" / "" etc
+    overdue: bool,
+}
+
+/// A calendar event row for the agenda view.
+export struct AgendaEntry {
+    title: string,
+    time-label: string,    // "HH:MM" or "ddd HH:MM"
+    location-label: string,
+}
+
+/// A task row for the full task CRUD view.
+export struct TaskViewEntry {
+    id: string,
+    title: string,
+    priority-label: string,
+    due-label: string,
+    overdue: bool,
+    done: bool,
+}
+
+/// A filesystem entry for the settings file browser.
+export struct FileBrowserEntry {
+    name: string,
+    full-path: string,
+    is-dir: bool,
+    is-vault: bool,
+}
+
+/// A configured calendar source (local file path or remote URL).
+export struct CalSource {
+    display: string,
+    value: string,
+}
+
+/// A note entry in the note browser list.
+export struct NoteEntry {
+    id: string,
+    title: string,
+    date-label: string,
+}
+
 export global EinkTheme {
     in property <color> canvas-bg: white;
     in property <color> chrome-bg: white;
@@ -58,6 +104,20 @@ export component EphemerisPage inherits Window {
     /// Active tool label (drives toolbar button highlight).
     in-out property <string> active-tool: "pen";
 
+    /// When true, the start page (tasks-ahead list) replaces the canvas.
+    in property <bool> show-start-page: false;
+
+    /// Ranked task list for the start page.
+    in property <[TaskEntry]> task-list: [];
+
+    /// Agenda range: 0 = Day, 1 = Week, 2 = Month.
+    in-out property <int> agenda-range: 0;
+
+    /// Agenda event list for the selected range.
+    in property <[AgendaEntry]> agenda-list: [];
+
+    callback agenda-range-changed(/* range */ int);
+
     // ── Action ring state ────────────────────────────────────────────────────
 
     /// Show the action ring overlay.
@@ -77,6 +137,112 @@ export component EphemerisPage inherits Window {
     callback ring-task-tapped();
     callback ring-audio-tapped();
     callback ring-dismissed();
+
+    // ── Task CRUD view ────────────────────────────────────────────────────────
+
+    /// Show the full task list view (CRUD) instead of the canvas/start-page.
+    in property <bool> show-task-view: false;
+
+    /// Full task list for the CRUD view.
+    in property <[TaskViewEntry]> full-task-list: [];
+
+    /// Add/edit dialog state.
+    in-out property <bool> task-dialog-visible: false;
+    in-out property <bool> task-dialog-is-edit: false;
+    in-out property <string> task-dialog-id: "";
+    in-out property <string> task-dialog-title: "";
+    in-out property <int> task-dialog-priority: 1;
+
+    /// Emitted when the user taps the page title in the status bar (→ home/start page).
+    callback page-title-tapped();
+
+    callback start-page-notes-tapped();
+    callback start-page-tasks-tapped();
+    callback task-back-tapped();
+    callback task-complete-toggled(/* id */ string);
+    callback task-edit-requested(/* id */ string);
+    callback task-confirm-add(/* title */ string, /* priority */ int);
+    callback task-confirm-edit(/* id */ string, /* title */ string, /* priority */ int);
+    callback task-dialog-cancel();
+
+    // ── Settings view state ──────────────────────────────────────────────────
+
+    /// Show the settings view instead of the canvas/start-page.
+    in property <bool> show-settings: false;
+
+    /// Active theme index: 0 = light, 1 = dark.  Toggled by buttons in the view.
+    in-out property <int> settings-theme-idx: 0;
+
+    /// Currently configured vault path (empty string = not configured).
+    in property <string> settings-vault-path: "";
+
+    /// Currently configured calendar sources (files + URLs).
+    in property <[CalSource]> settings-cal-sources: [];
+
+    /// Staging field bound to the "Add URL" TextInput.
+    in-out property <string> settings-new-url: "";
+
+    callback settings-open();
+    callback settings-back();
+    callback settings-save();
+    callback settings-clear-vault();
+    callback settings-browse-vault();
+    callback settings-browse-ics();
+    callback settings-add-url(/* url */ string);
+    callback settings-remove-source(/* index */ int);
+
+    // ── File browser state ────────────────────────────────────────────────────
+
+    /// Show the file browser view (navigates to vault or .ics selection).
+    in property <bool> show-filebrowser: false;
+
+    /// When true the user is selecting a vault folder; when false, an .ics file.
+    in property <bool> fb-vault-mode: true;
+
+    /// Absolute path of the directory currently displayed.
+    in property <string> fb-current-path: "";
+
+    /// Entries in the current directory (populated by Rust on navigation).
+    in property <[FileBrowserEntry]> fb-entries: [];
+
+    callback fb-navigate(/* path */ string);
+    callback fb-select-vault(/* path */ string);
+    callback fb-add-ics(/* path */ string);
+    callback fb-cancel();
+
+    // ── Navigation rail state ────────────────────────────────────────────────
+
+    /// Width of the persistent left navigation rail.
+    property <length> nav-w: 80px;
+
+    /// Active navigation section: 0 = Overview, 1 = Notes.
+    in-out property <int> nav-section: 0;
+
+    callback nav-overview-tapped();
+    callback nav-notes-tapped();
+
+    // ── Note browser state ───────────────────────────────────────────────────
+
+    /// Show the note browser list view (inside the Notes section).
+    in property <bool> show-note-list: false;
+
+    /// Note entries populated by the app layer.
+    in property <[NoteEntry]> note-list: [];
+
+    /// ID of the currently open note (empty = none open).
+    in-out property <string> active-note-id: "";
+
+    callback note-tapped(/* id */ string);
+    callback note-new-tapped();
+
+    // ── Note rename dialog state ──────────────────────────────────────────────
+
+    in-out property <bool> note-rename-visible: false;
+    in-out property <string> note-rename-id: "";
+    in-out property <string> note-rename-title: "";
+
+    callback note-rename-confirm(/* id */ string, /* title */ string);
+    callback note-rename-cancel();
 
     // ── Swipe detection state (private) ─────────────────────────────────
 
@@ -120,11 +286,18 @@ export component EphemerisPage inherits Window {
             padding-right: 8px;
             alignment: space-between;
 
-            Text {
-                text: root.page-title;
-                font-size: 13px;
-                color: EinkTheme.btn-fg;
-                vertical-alignment: center;
+            // Tappable title — tap to return to start page (home).
+            Rectangle {
+                width: parent.width / 2;
+                height: parent.height;
+                background: transparent;
+                Text {
+                    text: root.page-title;
+                    font-size: 13px;
+                    color: EinkTheme.btn-fg;
+                    vertical-alignment: center;
+                }
+                TouchArea { clicked => { root.page-title-tapped(); } }
             }
 
             Text {
@@ -154,7 +327,6 @@ export component EphemerisPage inherits Window {
         HorizontalLayout {
             padding: 4px;
             spacing: 4px;
-            alignment: start;
 
             // Pen button
             pen-btn := Rectangle {
@@ -228,7 +400,7 @@ export component EphemerisPage inherits Window {
                 }
             }
 
-            // Clear button (rightmost, with stronger visual separation)
+            // Clear button
             clear-btn := Rectangle {
                 width: 80px; height: 40px;
                 background: EinkTheme.btn-bg;
@@ -246,6 +418,30 @@ export component EphemerisPage inherits Window {
 
                 TouchArea {
                     clicked => { root.clear-page(); }
+                }
+            }
+
+            // Flexible spacer — pushes Settings button to the right.
+            Rectangle { horizontal-stretch: 1; }
+
+            // Settings button (right-aligned in toolbar)
+            cfg-btn := Rectangle {
+                width: 80px; height: 40px;
+                background: EinkTheme.btn-bg;
+                border-radius: 4px;
+                border-width: 2px;
+                border-color: EinkTheme.btn-border;
+
+                Text {
+                    text: "Settings";
+                    font-size: 13px;
+                    color: EinkTheme.btn-fg;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+
+                TouchArea {
+                    clicked => { root.settings-open(); }
                 }
             }
         }
@@ -317,6 +513,681 @@ export component EphemerisPage inherits Window {
         }
     }
 
+    // ── Start page (Tasks Ahead) ─────────────────────────────────────────────
+    //
+    // Shown when show-start-page is true. Renders the ranked task list returned
+    // by the prioritization engine. Overlays the canvas in the same region.
+    start-page := Rectangle {
+        visible: root.show-start-page;
+        x: root.nav-w;
+        y: status-bar.height;
+        width: parent.width - root.nav-w;
+        height: parent.height - status-bar.height - toolbar.height;
+        background: EinkTheme.canvas-bg;
+        clip: true;
+
+        VerticalLayout {
+            padding: 16px;
+            spacing: 0px;
+
+            // Section header — "Tasks Ahead" label + "All Tasks" navigation button
+            Rectangle {
+                height: 44px;
+                background: transparent;
+                HorizontalLayout {
+                    alignment: space-between;
+                    padding-top: 4px;
+                    padding-bottom: 4px;
+
+                    Text {
+                        text: "Tasks Ahead";
+                        font-size: 18px;
+                        font-weight: 700;
+                        color: EinkTheme.btn-fg;
+                        vertical-alignment: center;
+                    }
+
+                    Rectangle {
+                        width: 80px; height: 36px;
+                        background: EinkTheme.btn-bg;
+                        border-radius: 4px;
+                        border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        Text {
+                            text: "Notes \u{2192}";
+                            font-size: 13px;
+                            color: EinkTheme.btn-fg;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        TouchArea { clicked => { root.start-page-notes-tapped(); } }
+                    }
+
+                    Rectangle {
+                        width: 96px; height: 36px;
+                        background: EinkTheme.btn-bg;
+                        border-radius: 4px;
+                        border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        Text {
+                            text: "All Tasks \u{2192}";
+                            font-size: 13px;
+                            color: EinkTheme.btn-fg;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        TouchArea { clicked => { root.start-page-tasks-tapped(); } }
+                    }
+                }
+            }
+
+            // Divider
+            Rectangle {
+                height: 2px;
+                background: EinkTheme.chrome-border;
+            }
+
+            // Task rows
+            for item[i] in root.task-list: Rectangle {
+                height: 52px;
+                background: transparent;
+
+                HorizontalLayout {
+                    padding-left: 4px;
+                    padding-right: 4px;
+                    spacing: 8px;
+                    alignment: start;
+
+                    // Priority badge
+                    Text {
+                        text: item.priority-label;
+                        font-size: 14px;
+                        color: EinkTheme.btn-fg;
+                        vertical-alignment: center;
+                        width: 28px;
+                        horizontal-alignment: center;
+                    }
+
+                    // Title (stretches to fill)
+                    Text {
+                        text: item.title;
+                        font-size: 14px;
+                        color: EinkTheme.btn-fg;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        horizontal-stretch: 1;
+                    }
+
+                    // Due label (right-aligned)
+                    Text {
+                        text: item.due-label;
+                        font-size: 12px;
+                        color: item.overdue ? EinkTheme.danger-fg : EinkTheme.text-secondary;
+                        vertical-alignment: center;
+                        width: 64px;
+                        horizontal-alignment: right;
+                    }
+                }
+
+                // Row divider
+                Rectangle {
+                    x: 0; y: parent.height - 1px;
+                    width: parent.width; height: 1px;
+                    background: EinkTheme.chrome-border;
+                    opacity: 0.3;
+                }
+            }
+
+            // Empty state
+            if root.task-list.length == 0: Rectangle {
+                height: 80px;
+                background: transparent;
+                Text {
+                    text: "All clear — no tasks ahead";
+                    font-size: 14px;
+                    color: EinkTheme.text-secondary;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+
+            // ── Agenda section ───────────────────────────────────────────────
+
+            // Spacing
+            Rectangle { height: 12px; background: transparent; }
+
+            // Agenda header + range tabs
+            Rectangle {
+                height: 36px;
+                background: transparent;
+                HorizontalLayout {
+                    spacing: 6px;
+                    alignment: start;
+
+                    Text {
+                        text: "Agenda";
+                        font-size: 16px;
+                        font-weight: 700;
+                        color: EinkTheme.btn-fg;
+                        vertical-alignment: center;
+                        width: 70px;
+                    }
+
+                    // Day tab
+                    Rectangle {
+                        width: 44px; height: 28px;
+                        background: root.agenda-range == 0 ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+                        border-radius: 4px;
+                        border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        Text {
+                            text: "Day";
+                            font-size: 12px;
+                            color: root.agenda-range == 0 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        TouchArea {
+                            clicked => {
+                                root.agenda-range = 0;
+                                root.agenda-range-changed(0);
+                            }
+                        }
+                    }
+
+                    // Week tab
+                    Rectangle {
+                        width: 52px; height: 28px;
+                        background: root.agenda-range == 1 ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+                        border-radius: 4px;
+                        border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        Text {
+                            text: "Week";
+                            font-size: 12px;
+                            color: root.agenda-range == 1 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        TouchArea {
+                            clicked => {
+                                root.agenda-range = 1;
+                                root.agenda-range-changed(1);
+                            }
+                        }
+                    }
+
+                    // Month tab
+                    Rectangle {
+                        width: 58px; height: 28px;
+                        background: root.agenda-range == 2 ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+                        border-radius: 4px;
+                        border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        Text {
+                            text: "Month";
+                            font-size: 12px;
+                            color: root.agenda-range == 2 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        TouchArea {
+                            clicked => {
+                                root.agenda-range = 2;
+                                root.agenda-range-changed(2);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Agenda divider
+            Rectangle { height: 2px; background: EinkTheme.chrome-border; }
+
+            // Agenda event rows
+            for item[i] in root.agenda-list: Rectangle {
+                height: 48px;
+                background: transparent;
+
+                HorizontalLayout {
+                    padding-left: 4px;
+                    padding-right: 4px;
+                    spacing: 8px;
+                    alignment: start;
+
+                    // Time label
+                    Text {
+                        text: item.time-label;
+                        font-size: 12px;
+                        color: EinkTheme.text-secondary;
+                        vertical-alignment: center;
+                        width: 64px;
+                    }
+
+                    // Title
+                    Text {
+                        text: item.title;
+                        font-size: 14px;
+                        color: EinkTheme.btn-fg;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        horizontal-stretch: 1;
+                    }
+
+                    // Location (optional)
+                    Text {
+                        text: item.location-label;
+                        font-size: 11px;
+                        color: EinkTheme.text-secondary;
+                        vertical-alignment: center;
+                        width: 100px;
+                        overflow: elide;
+                        horizontal-alignment: right;
+                    }
+                }
+
+                Rectangle {
+                    x: 0; y: parent.height - 1px;
+                    width: parent.width; height: 1px;
+                    background: EinkTheme.chrome-border;
+                    opacity: 0.3;
+                }
+            }
+
+            // Agenda empty state
+            if root.agenda-list.length == 0: Rectangle {
+                height: 48px;
+                background: transparent;
+                Text {
+                    text: "No events in this period";
+                    font-size: 13px;
+                    color: EinkTheme.text-secondary;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+
+    // ── Task CRUD view ───────────────────────────────────────────────────────
+    //
+    // Full-screen list of all tasks with complete/edit/add actions.
+    // Shown when show-task-view is true. Ring and dialog overlay above it.
+    task-view := Rectangle {
+        visible: root.show-task-view;
+        x: root.nav-w; y: status-bar.height;
+        width: parent.width - root.nav-w;
+        height: parent.height - status-bar.height - toolbar.height;
+        background: EinkTheme.canvas-bg;
+        clip: true;
+
+        VerticalLayout {
+            padding: 0px;
+            spacing: 0px;
+
+            // Header: title + add + back buttons
+            Rectangle {
+                height: 44px;
+                background: EinkTheme.canvas-bg;
+
+                HorizontalLayout {
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    padding-top: 6px;
+                    padding-bottom: 6px;
+                    spacing: 8px;
+                    alignment: start;
+
+                    Text {
+                        text: "All Tasks";
+                        font-size: 16px;
+                        font-weight: 700;
+                        color: EinkTheme.btn-fg;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+
+                    Rectangle {
+                        width: 60px; height: 32px;
+                        background: EinkTheme.btn-bg;
+                        border-radius: 4px;
+                        border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        Text {
+                            text: "+ Add";
+                            font-size: 13px;
+                            color: EinkTheme.btn-fg;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        TouchArea {
+                            clicked => {
+                                root.task-dialog-is-edit = false;
+                                root.task-dialog-id = "";
+                                root.task-dialog-title = "New Task";
+                                root.task-dialog-priority = 1;
+                                root.task-dialog-visible = true;
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        width: 56px; height: 32px;
+                        background: EinkTheme.btn-bg;
+                        border-radius: 4px;
+                        border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        Text {
+                            text: "Back";
+                            font-size: 13px;
+                            color: EinkTheme.btn-fg;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        TouchArea { clicked => { root.task-back-tapped(); } }
+                    }
+                }
+            }
+
+            Rectangle { height: 2px; background: EinkTheme.chrome-border; }
+
+            // Task rows
+            for item[i] in root.full-task-list: Rectangle {
+                height: 56px;
+                background: transparent;
+
+                HorizontalLayout {
+                    padding-left: 8px;
+                    padding-right: 8px;
+                    spacing: 8px;
+                    alignment: start;
+
+                    // Checkbox
+                    Rectangle {
+                        width: 36px; height: 36px;
+                        border-radius: 4px;
+                        border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        background: item.done ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+                        Text {
+                            text: item.done ? "v" : "";
+                            font-size: 13px;
+                            color: EinkTheme.btn-active-fg;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        TouchArea { clicked => { root.task-complete-toggled(item.id); } }
+                    }
+
+                    // Priority badge
+                    Text {
+                        text: item.priority-label;
+                        font-size: 13px;
+                        color: EinkTheme.btn-fg;
+                        vertical-alignment: center;
+                        width: 28px;
+                        horizontal-alignment: center;
+                    }
+
+                    // Title
+                    Text {
+                        text: item.title;
+                        font-size: 14px;
+                        color: EinkTheme.btn-fg;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        horizontal-stretch: 1;
+                    }
+
+                    // Due label
+                    Text {
+                        text: item.due-label;
+                        font-size: 12px;
+                        color: item.overdue ? EinkTheme.danger-fg : EinkTheme.text-secondary;
+                        vertical-alignment: center;
+                        width: 52px;
+                        horizontal-alignment: right;
+                    }
+
+                    // Edit button
+                    Rectangle {
+                        width: 56px; height: 40px;
+                        background: EinkTheme.btn-bg;
+                        border-radius: 4px;
+                        border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        Text {
+                            text: "Edit";
+                            font-size: 13px;
+                            color: EinkTheme.btn-fg;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        TouchArea { clicked => { root.task-edit-requested(item.id); } }
+                    }
+                }
+
+                Rectangle {
+                    x: 0; y: parent.height - 1px;
+                    width: parent.width; height: 1px;
+                    background: EinkTheme.chrome-border;
+                    opacity: 0.3;
+                }
+            }
+
+            // Empty state
+            if root.full-task-list.length == 0: Rectangle {
+                height: 60px;
+                background: transparent;
+                Text {
+                    text: "No tasks yet — tap + Add to create one";
+                    font-size: 14px;
+                    color: EinkTheme.text-secondary;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+
+    // ── Note list / browser view ─────────────────────────────────────────────
+    //
+    // Shown when show-note-list is true.  Lists all notes (title + date) and
+    // provides a "+ New Note" button.  Occupies the content area to the right of
+    // the nav rail.
+    note-list-view := Rectangle {
+        visible: root.show-note-list;
+        x: root.nav-w; y: status-bar.height;
+        width: parent.width - root.nav-w;
+        height: parent.height - status-bar.height - toolbar.height;
+        background: EinkTheme.canvas-bg;
+        clip: true;
+
+        VerticalLayout {
+            padding: 0px; spacing: 0px;
+
+            // Header: title + "+ New Note" button
+            Rectangle {
+                height: 44px;
+                background: EinkTheme.canvas-bg;
+                HorizontalLayout {
+                    padding-left: 12px; padding-right: 12px;
+                    padding-top: 6px; padding-bottom: 6px;
+                    spacing: 8px;
+
+                    Text {
+                        text: "Notes";
+                        font-size: 16px; font-weight: 700;
+                        color: EinkTheme.btn-fg;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+
+                    Rectangle {
+                        width: 96px; height: 32px;
+                        background: EinkTheme.btn-active-bg;
+                        border-radius: 4px; border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        Text {
+                            text: "+ New Note";
+                            font-size: 13px; color: EinkTheme.btn-active-fg;
+                            horizontal-alignment: center; vertical-alignment: center;
+                        }
+                        TouchArea { clicked => { root.note-new-tapped(); } }
+                    }
+                }
+            }
+
+            Rectangle { height: 2px; background: EinkTheme.chrome-border; }
+
+            for note[i] in root.note-list: Rectangle {
+                height: 56px;
+                background: EinkTheme.canvas-bg;
+
+                HorizontalLayout {
+                    padding-left: 16px; padding-right: 8px;
+                    padding-top: 10px; padding-bottom: 10px;
+                    spacing: 8px;
+
+                    // Tappable title + date area
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        background: transparent;
+
+                        VerticalLayout {
+                            spacing: 4px;
+                            alignment: center;
+
+                            Text {
+                                text: note.title;
+                                font-size: 14px; color: EinkTheme.btn-fg;
+                                overflow: elide;
+                            }
+                            Text {
+                                text: note.date-label;
+                                font-size: 11px; color: EinkTheme.text-secondary;
+                            }
+                        }
+                        TouchArea { clicked => { root.note-tapped(note.id); } }
+                    }
+
+                    // Rename button
+                    Rectangle {
+                        width: 64px; height: 36px;
+                        background: EinkTheme.btn-bg;
+                        border-radius: 4px; border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        Text {
+                            text: "Rename";
+                            font-size: 11px; color: EinkTheme.btn-fg;
+                            horizontal-alignment: center; vertical-alignment: center;
+                        }
+                        TouchArea {
+                            clicked => {
+                                root.note-rename-id = note.id;
+                                root.note-rename-title = note.title;
+                                root.note-rename-visible = true;
+                            }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    x: 0; y: parent.height - 1px;
+                    width: parent.width; height: 1px;
+                    background: EinkTheme.chrome-border; opacity: 0.3;
+                }
+            }
+
+            if root.note-list.length == 0: Rectangle {
+                height: 80px;
+                background: EinkTheme.canvas-bg;
+                Text {
+                    text: "No notes yet — tap + New Note";
+                    font-size: 14px; color: EinkTheme.text-secondary;
+                    horizontal-alignment: center; vertical-alignment: center;
+                }
+            }
+        }
+    }
+
+    // ── Left navigation rail ─────────────────────────────────────────────────
+    //
+    // Always-visible 80px left strip that provides top-level navigation.
+    // Declared after all content views so it sits on top of them, but before
+    // ring-backdrop so the ring can float above it when visible.
+    nav-rail := Rectangle {
+        x: 0;
+        y: status-bar.height;
+        width: root.nav-w;
+        height: parent.height - status-bar.height - toolbar.height;
+        background: EinkTheme.chrome-bg;
+        clip: true;
+
+        VerticalLayout {
+            padding: 0px; spacing: 0px;
+
+            // Home / Overview item
+            Rectangle {
+                height: 72px;
+                background: root.nav-section == 0 ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+
+                VerticalLayout {
+                    padding: 8px; spacing: 4px;
+                    alignment: center;
+                    Text {
+                        text: "Home";
+                        font-size: 12px;
+                        color: root.nav-section == 0 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                        horizontal-alignment: center;
+                    }
+                }
+                TouchArea {
+                    clicked => {
+                        root.nav-section = 0;
+                        root.nav-overview-tapped();
+                    }
+                }
+            }
+
+            Rectangle { height: 1px; background: EinkTheme.chrome-border; }
+
+            // Notes item
+            Rectangle {
+                height: 72px;
+                background: root.nav-section == 1 ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+
+                VerticalLayout {
+                    padding: 8px; spacing: 4px;
+                    alignment: center;
+                    Text {
+                        text: "Notes";
+                        font-size: 12px;
+                        color: root.nav-section == 1 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                        horizontal-alignment: center;
+                    }
+                }
+                TouchArea {
+                    clicked => {
+                        root.nav-section = 1;
+                        root.nav-notes-tapped();
+                    }
+                }
+            }
+
+            // Spacer fills remaining height
+            Rectangle { vertical-stretch: 1; background: EinkTheme.chrome-bg; }
+        }
+
+        // Right border line
+        Rectangle {
+            x: root.nav-w - 2px; y: 0;
+            width: 2px;
+            height: parent.height;
+            background: EinkTheme.chrome-border;
+        }
+    }
+
     // ── Action ring overlay ──────────────────────────────────────────────────
     //
     // Shown when Action::OpenActionRing fires (pen-button + tap via ActionRouter).
@@ -324,7 +1195,7 @@ export component EphemerisPage inherits Window {
     // in canvas-relative coordinates.  A full-canvas backdrop captures taps outside
     // any button and dismisses the ring.
     //
-    // Z-order: declared last so it paints on top of canvas, status bar, and toolbar.
+    // Z-order: declared after nav-rail so the ring floats above it.
     ring-backdrop := Rectangle {
         visible: root.ring-visible;
         x: 0px;
@@ -421,6 +1292,668 @@ export component EphemerisPage inherits Window {
                 horizontal-alignment: center; vertical-alignment: center;
             }
             TouchArea { clicked => { root.ring-dismissed(); } }
+        }
+    }
+
+    // ── Settings view ────────────────────────────────────────────────────────
+    //
+    // Full-page view for configuring vault path, calendar sources, and theme.
+    // Shown when show-settings is true.  Declared before the task dialog so
+    // the dialog still floats above it when both are visible (edge case).
+    settings-view := Rectangle {
+        visible: root.show-settings;
+        x: root.nav-w; y: status-bar.height;
+        width: parent.width - root.nav-w;
+        height: parent.height - status-bar.height - toolbar.height;
+        background: EinkTheme.canvas-bg;
+        clip: true;
+
+        VerticalLayout {
+            padding: 0px;
+            spacing: 0px;
+
+            // Header: Back + title + Save
+            Rectangle {
+                height: 44px;
+                background: EinkTheme.canvas-bg;
+                HorizontalLayout {
+                    padding-left: 12px; padding-right: 12px;
+                    padding-top: 6px; padding-bottom: 6px;
+                    spacing: 8px;
+
+                    Rectangle {
+                        width: 56px; height: 32px;
+                        background: EinkTheme.btn-bg;
+                        border-radius: 4px; border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        Text { text: "Back"; font-size: 13px; color: EinkTheme.btn-fg;
+                               horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea { clicked => { root.settings-back(); } }
+                    }
+
+                    Text {
+                        text: "Settings";
+                        font-size: 16px; font-weight: 700;
+                        color: EinkTheme.btn-fg;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        horizontal-alignment: center;
+                    }
+
+                    Rectangle {
+                        width: 56px; height: 32px;
+                        background: EinkTheme.btn-active-bg;
+                        border-radius: 4px; border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        Text { text: "Save"; font-size: 13px; color: EinkTheme.btn-active-fg;
+                               horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea { clicked => { root.settings-save(); } }
+                    }
+                }
+            }
+
+            Rectangle { height: 2px; background: EinkTheme.chrome-border; }
+
+            // Theme row
+            Rectangle {
+                height: 44px;
+                background: EinkTheme.canvas-bg;
+                HorizontalLayout {
+                    padding-left: 12px; padding-right: 12px;
+                    padding-top: 6px; padding-bottom: 6px;
+                    spacing: 8px;
+
+                    Text {
+                        text: "Theme";
+                        font-size: 14px; color: EinkTheme.btn-fg;
+                        vertical-alignment: center;
+                        width: 80px;
+                    }
+
+                    Rectangle {
+                        width: 72px; height: 32px;
+                        background: root.settings-theme-idx == 0 ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+                        border-radius: 4px; border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        Text { text: "Light"; font-size: 13px;
+                               color: root.settings-theme-idx == 0 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                               horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea { clicked => { root.settings-theme-idx = 0; } }
+                    }
+
+                    Rectangle {
+                        width: 72px; height: 32px;
+                        background: root.settings-theme-idx == 1 ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+                        border-radius: 4px; border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        Text { text: "Dark"; font-size: 13px;
+                               color: root.settings-theme-idx == 1 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                               horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea { clicked => { root.settings-theme-idx = 1; } }
+                    }
+
+                    Rectangle { horizontal-stretch: 1; }
+                }
+            }
+
+            Rectangle { height: 2px; background: EinkTheme.chrome-border; }
+
+            // Vault row
+            Rectangle {
+                height: 48px;
+                background: EinkTheme.canvas-bg;
+                HorizontalLayout {
+                    padding-left: 12px; padding-right: 12px;
+                    padding-top: 6px; padding-bottom: 6px;
+                    spacing: 8px;
+
+                    Text {
+                        text: "Vault";
+                        font-size: 14px; color: EinkTheme.btn-fg;
+                        vertical-alignment: center;
+                        width: 56px;
+                    }
+
+                    Text {
+                        text: root.settings-vault-path == "" ? "Not configured" : root.settings-vault-path;
+                        font-size: 11px;
+                        color: root.settings-vault-path == "" ? EinkTheme.text-secondary : EinkTheme.btn-fg;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        overflow: elide;
+                    }
+
+                    if root.settings-vault-path != "": Rectangle {
+                        width: 52px; height: 32px;
+                        background: EinkTheme.btn-bg;
+                        border-radius: 4px; border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        Text { text: "Clear"; font-size: 12px; color: EinkTheme.btn-fg;
+                               horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea { clicked => { root.settings-clear-vault(); } }
+                    }
+
+                    Rectangle {
+                        width: 76px; height: 32px;
+                        background: EinkTheme.btn-bg;
+                        border-radius: 4px; border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        Text { text: "Browse..."; font-size: 12px; color: EinkTheme.btn-fg;
+                               horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea { clicked => { root.settings-browse-vault(); } }
+                    }
+                }
+            }
+
+            Rectangle { height: 2px; background: EinkTheme.chrome-border; }
+
+            // Calendar section header
+            Rectangle {
+                height: 36px;
+                background: EinkTheme.canvas-bg;
+                HorizontalLayout {
+                    padding-left: 12px; padding-right: 12px;
+                    padding-top: 4px; padding-bottom: 4px;
+                    Text {
+                        text: "Calendar Sources";
+                        font-size: 14px; font-weight: 700;
+                        color: EinkTheme.btn-fg;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+
+            // Cal source rows
+            for src[i] in root.settings-cal-sources: Rectangle {
+                height: 40px;
+                background: EinkTheme.canvas-bg;
+                HorizontalLayout {
+                    padding-left: 20px; padding-right: 12px;
+                    padding-top: 4px; padding-bottom: 4px;
+                    spacing: 8px;
+                    Text {
+                        text: src.display;
+                        font-size: 12px; color: EinkTheme.btn-fg;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        overflow: elide;
+                    }
+                    Rectangle {
+                        width: 36px; height: 32px;
+                        background: EinkTheme.btn-bg;
+                        border-radius: 4px; border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        Text { text: "x"; font-size: 14px; color: EinkTheme.danger-fg;
+                               horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea { clicked => { root.settings-remove-source(i); } }
+                    }
+                }
+                Rectangle {
+                    x: 0; y: parent.height - 1px;
+                    width: parent.width; height: 1px;
+                    background: EinkTheme.chrome-border; opacity: 0.3;
+                }
+            }
+
+            // Empty cal source state
+            if root.settings-cal-sources.length == 0: Rectangle {
+                height: 32px;
+                background: EinkTheme.canvas-bg;
+                Text {
+                    x: 20px; y: 0; width: parent.width - 20px; height: parent.height;
+                    text: "No sources configured";
+                    font-size: 12px; color: EinkTheme.text-secondary;
+                    vertical-alignment: center;
+                }
+            }
+
+            // Browse .ics + Add URL row
+            Rectangle {
+                height: 44px;
+                background: EinkTheme.canvas-bg;
+                HorizontalLayout {
+                    padding-left: 12px; padding-right: 12px;
+                    padding-top: 6px; padding-bottom: 6px;
+                    spacing: 8px;
+                    Rectangle {
+                        width: 120px; height: 32px;
+                        background: EinkTheme.btn-bg;
+                        border-radius: 4px; border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        Text { text: "Browse .ics..."; font-size: 12px; color: EinkTheme.btn-fg;
+                               horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea { clicked => { root.settings-browse-ics(); } }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+            }
+
+            // Add URL row
+            Rectangle {
+                height: 48px;
+                background: EinkTheme.canvas-bg;
+                HorizontalLayout {
+                    padding-left: 12px; padding-right: 12px;
+                    padding-top: 6px; padding-bottom: 6px;
+                    spacing: 8px;
+
+                    Text {
+                        text: "Add URL";
+                        font-size: 12px; color: EinkTheme.text-secondary;
+                        vertical-alignment: center;
+                        width: 52px;
+                    }
+
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        height: 36px;
+                        border-radius: 4px; border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        background: EinkTheme.canvas-bg;
+
+                        TextInput {
+                            x: 6px; y: 0;
+                            width: parent.width - 12px;
+                            height: parent.height;
+                            font-size: 12px;
+                            color: EinkTheme.btn-fg;
+                            text <=> root.settings-new-url;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    Rectangle {
+                        width: 44px; height: 36px;
+                        background: EinkTheme.btn-bg;
+                        border-radius: 4px; border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        Text { text: "Add"; font-size: 12px; color: EinkTheme.btn-fg;
+                               horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea { clicked => { root.settings-add-url(root.settings-new-url); } }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── File browser view ────────────────────────────────────────────────────
+    //
+    // Lets the user navigate the filesystem to select an Obsidian vault folder
+    // (fb-vault-mode = true) or an .ics calendar file (fb-vault-mode = false).
+    fb-view := Rectangle {
+        visible: root.show-filebrowser;
+        x: root.nav-w; y: status-bar.height;
+        width: parent.width - root.nav-w;
+        height: parent.height - status-bar.height - toolbar.height;
+        background: EinkTheme.canvas-bg;
+        clip: true;
+
+        VerticalLayout {
+            padding: 0px; spacing: 0px;
+
+            // Header: Back + current path
+            Rectangle {
+                height: 44px;
+                background: EinkTheme.canvas-bg;
+                HorizontalLayout {
+                    padding-left: 8px; padding-right: 12px;
+                    padding-top: 6px; padding-bottom: 6px;
+                    spacing: 8px;
+
+                    Rectangle {
+                        width: 56px; height: 32px;
+                        background: EinkTheme.btn-bg;
+                        border-radius: 4px; border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        Text { text: "Back"; font-size: 13px; color: EinkTheme.btn-fg;
+                               horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea { clicked => { root.fb-cancel(); } }
+                    }
+
+                    Text {
+                        text: root.fb-current-path;
+                        font-size: 11px; color: EinkTheme.text-secondary;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        overflow: elide;
+                    }
+                }
+            }
+
+            Rectangle { height: 2px; background: EinkTheme.chrome-border; }
+
+            // Select-as-vault button (vault mode only)
+            if root.fb-vault-mode: Rectangle {
+                height: 44px;
+                background: EinkTheme.canvas-bg;
+                HorizontalLayout {
+                    padding-left: 12px; padding-right: 12px;
+                    padding-top: 6px; padding-bottom: 6px;
+
+                    Rectangle {
+                        width: 240px; height: 32px;
+                        background: EinkTheme.btn-active-bg;
+                        border-radius: 4px; border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        Text { text: "Select this folder as Vault";
+                               font-size: 12px; color: EinkTheme.btn-active-fg;
+                               horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea { clicked => { root.fb-select-vault(root.fb-current-path); } }
+                    }
+
+                    Rectangle { horizontal-stretch: 1; }
+                }
+            }
+
+            // Directory / file entries
+            for entry[i] in root.fb-entries: Rectangle {
+                height: 44px;
+                background: EinkTheme.canvas-bg;
+
+                // Directory tap → navigate (covered by the HorizontalLayout above)
+                if entry.is-dir: TouchArea {
+                    clicked => { root.fb-navigate(entry.full-path); }
+                }
+
+                HorizontalLayout {
+                    padding-left: 12px; padding-right: 12px;
+                    padding-top: 4px; padding-bottom: 4px;
+                    spacing: 8px;
+
+                    // Type indicator
+                    Text {
+                        text: entry.is-dir ? (entry.name == ".." ? ".." : (entry.is-vault ? "[V]" : "[D]")) : "[F]";
+                        font-size: 12px; color: EinkTheme.text-secondary;
+                        vertical-alignment: center;
+                        width: 28px;
+                        horizontal-alignment: center;
+                    }
+
+                    // Name
+                    Text {
+                        text: entry.name;
+                        font-size: 14px; color: EinkTheme.btn-fg;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        overflow: elide;
+                    }
+
+                    // Vault indicator label
+                    if entry.is-vault: Text {
+                        text: "vault";
+                        font-size: 11px; color: EinkTheme.text-secondary;
+                        vertical-alignment: center;
+                        width: 44px;
+                    }
+
+                    // Add button for .ics files in ICS mode
+                    if !root.fb-vault-mode && !entry.is-dir: Rectangle {
+                        width: 56px; height: 32px;
+                        background: EinkTheme.btn-active-bg;
+                        border-radius: 4px; border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        Text { text: "Add"; font-size: 12px; color: EinkTheme.btn-active-fg;
+                               horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea { clicked => { root.fb-add-ics(entry.full-path); } }
+                    }
+                }
+
+                Rectangle {
+                    x: 0; y: parent.height - 1px;
+                    width: parent.width; height: 1px;
+                    background: EinkTheme.chrome-border; opacity: 0.3;
+                }
+            }
+
+            // Empty state when no entries (e.g. empty dir or permission denied)
+            if root.fb-entries.length == 0: Rectangle {
+                height: 48px;
+                background: EinkTheme.canvas-bg;
+                Text {
+                    text: "Empty folder";
+                    font-size: 13px; color: EinkTheme.text-secondary;
+                    horizontal-alignment: center; vertical-alignment: center;
+                }
+            }
+        }
+    }
+
+    // ── Task add / edit dialog ───────────────────────────────────────────────
+    //
+    // Modal overlay for creating a new task or editing an existing one.
+    // Shown above all other layers (declared last).
+    task-dialog := Rectangle {
+        visible: root.task-dialog-visible;
+        x: 0; y: 0;
+        width: parent.width;
+        height: parent.height;
+        background: EinkTheme.chrome-bg;
+        opacity: 0.95;
+
+        // Dialog panel
+        Rectangle {
+            x: (parent.width - 420px) / 2;
+            y: (parent.height - 300px) / 2;
+            width: 420px;
+            height: 300px;
+            background: EinkTheme.canvas-bg;
+            border-radius: 8px;
+            border-width: 3px;
+            border-color: EinkTheme.chrome-border;
+
+            VerticalLayout {
+                padding: 20px;
+                spacing: 14px;
+
+                // Dialog title
+                Text {
+                    text: root.task-dialog-is-edit ? "Edit Task" : "New Task";
+                    font-size: 16px;
+                    font-weight: 700;
+                    color: EinkTheme.btn-fg;
+                    horizontal-alignment: center;
+                }
+
+                // Title display (read-only; set programmatically before opening)
+                Rectangle {
+                    height: 48px;
+                    border-radius: 4px;
+                    border-width: 2px;
+                    border-color: EinkTheme.btn-border;
+                    background: EinkTheme.canvas-bg;
+
+                    Text {
+                        x: 8px;
+                        y: 0px;
+                        width: parent.width - 16px;
+                        height: parent.height;
+                        font-size: 14px;
+                        color: EinkTheme.btn-fg;
+                        text: root.task-dialog-title;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+
+                // Priority selector
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: center;
+
+                    Rectangle {
+                        width: 80px; height: 34px;
+                        background: root.task-dialog-priority == 0 ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+                        border-radius: 4px;
+                        border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        Text {
+                            text: "High";
+                            font-size: 13px;
+                            color: root.task-dialog-priority == 0 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        TouchArea { clicked => { root.task-dialog-priority = 0; } }
+                    }
+
+                    Rectangle {
+                        width: 80px; height: 34px;
+                        background: root.task-dialog-priority == 1 ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+                        border-radius: 4px;
+                        border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        Text {
+                            text: "Medium";
+                            font-size: 13px;
+                            color: root.task-dialog-priority == 1 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        TouchArea { clicked => { root.task-dialog-priority = 1; } }
+                    }
+
+                    Rectangle {
+                        width: 80px; height: 34px;
+                        background: root.task-dialog-priority == 2 ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+                        border-radius: 4px;
+                        border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        Text {
+                            text: "Low";
+                            font-size: 13px;
+                            color: root.task-dialog-priority == 2 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        TouchArea { clicked => { root.task-dialog-priority = 2; } }
+                    }
+                }
+
+                // Action buttons
+                HorizontalLayout {
+                    spacing: 16px;
+                    alignment: center;
+
+                    Rectangle {
+                        width: 120px; height: 48px;
+                        background: EinkTheme.btn-bg;
+                        border-radius: 4px;
+                        border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        Text {
+                            text: "Cancel";
+                            font-size: 15px;
+                            color: EinkTheme.btn-fg;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        TouchArea { clicked => { root.task-dialog-cancel(); } }
+                    }
+
+                    Rectangle {
+                        width: 120px; height: 48px;
+                        background: EinkTheme.btn-active-bg;
+                        border-radius: 4px;
+                        border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        Text {
+                            text: "Save";
+                            font-size: 15px;
+                            color: EinkTheme.btn-active-fg;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        TouchArea {
+                            clicked => {
+                                if (root.task-dialog-is-edit) {
+                                    root.task-confirm-edit(root.task-dialog-id, root.task-dialog-title, root.task-dialog-priority);
+                                } else {
+                                    root.task-confirm-add(root.task-dialog-title, root.task-dialog-priority);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Note rename dialog ───────────────────────────────────────────────────
+    //
+    // Simple modal overlay with a TextInput for the new note title.
+    // Declared last (highest z-order).
+    note-rename-dialog := Rectangle {
+        visible: root.note-rename-visible;
+        x: 0; y: 0;
+        width: parent.width;
+        height: parent.height;
+        background: EinkTheme.chrome-bg;
+        opacity: 0.95;
+
+        Rectangle {
+            x: (parent.width - 380px) / 2;
+            y: (parent.height - 200px) / 2;
+            width: 380px; height: 200px;
+            background: EinkTheme.canvas-bg;
+            border-radius: 8px;
+            border-width: 3px;
+            border-color: EinkTheme.chrome-border;
+
+            VerticalLayout {
+                padding: 20px; spacing: 14px;
+
+                Text {
+                    text: "Rename Note";
+                    font-size: 16px; font-weight: 700;
+                    color: EinkTheme.btn-fg;
+                    horizontal-alignment: center;
+                }
+
+                Rectangle {
+                    height: 44px;
+                    border-radius: 4px; border-width: 2px;
+                    border-color: EinkTheme.btn-border;
+                    background: EinkTheme.canvas-bg;
+
+                    TextInput {
+                        x: 8px; y: 0;
+                        width: parent.width - 16px;
+                        height: parent.height;
+                        font-size: 14px;
+                        color: EinkTheme.btn-fg;
+                        text <=> root.note-rename-title;
+                        vertical-alignment: center;
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 12px; alignment: center;
+
+                    Rectangle {
+                        width: 110px; height: 42px;
+                        background: EinkTheme.btn-bg;
+                        border-radius: 4px; border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        Text { text: "Cancel"; font-size: 14px; color: EinkTheme.btn-fg;
+                               horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea { clicked => { root.note-rename-cancel(); } }
+                    }
+
+                    Rectangle {
+                        width: 110px; height: 42px;
+                        background: EinkTheme.btn-active-bg;
+                        border-radius: 4px; border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        Text { text: "Rename"; font-size: 14px; color: EinkTheme.btn-active-fg;
+                               horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea {
+                            clicked => {
+                                root.note-rename-confirm(root.note-rename-id, root.note-rename-title);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }

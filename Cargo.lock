@@ -1053,6 +1053,8 @@ dependencies = [
  "ephemeris-pal",
  "ephemeris-ui",
  "log",
+ "slint",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

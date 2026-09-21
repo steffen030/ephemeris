@@ -149,6 +149,10 @@ pub struct DesktopWindow {
 impl DesktopWindow {
     /// Create a window of the given logical size from within a winit
     /// `ApplicationHandler::resumed` callback.
+    ///
+    /// On HiDPI / Retina displays the softbuffer surface is sized to the
+    /// physical window dimensions and `present` upscales the 8-bpp logical
+    /// buffer to fill the physical surface.
     pub fn new(
         event_loop: &winit::event_loop::ActiveEventLoop,
         width: u32,
@@ -174,10 +178,13 @@ impl DesktopWindow {
         let mut surface = softbuffer::Surface::new(&ctx, window.clone())
             .map_err(|e| DisplayError::init(e.to_string()))?;
 
+        // Resize the surface to the PHYSICAL window dimensions so that the
+        // buffer covers the entire window on HiDPI / Retina displays.
+        let phys = window.inner_size();
         surface
             .resize(
-                NonZeroU32::new(width).unwrap(),
-                NonZeroU32::new(height).unwrap(),
+                NonZeroU32::new(phys.width.max(1)).unwrap(),
+                NonZeroU32::new(phys.height.max(1)).unwrap(),
             )
             .map_err(|e| DisplayError::init(e.to_string()))?;
 
@@ -190,9 +197,28 @@ impl DesktopWindow {
         })
     }
 
+    /// Resize the softbuffer surface to the current physical window dimensions.
+    ///
+    /// Must be called whenever `WindowEvent::Resized` or
+    /// `WindowEvent::ScaleFactorChanged` fires.
+    pub fn resize_surface(&mut self) -> Result<(), DisplayError> {
+        let phys = self.window.inner_size();
+        self.surface
+            .resize(
+                NonZeroU32::new(phys.width.max(1)).unwrap(),
+                NonZeroU32::new(phys.height.max(1)).unwrap(),
+            )
+            .map_err(|e| DisplayError::init(e.to_string()))
+    }
+
     /// Ask the OS to schedule a redraw (triggers `WindowEvent::RedrawRequested`).
     pub fn request_redraw(&self) {
         self.window.request_redraw();
+    }
+
+    /// Returns the window's current scale factor (physical / logical pixels).
+    pub fn scale_factor(&self) -> f64 {
+        self.window.scale_factor()
     }
 }
 
@@ -207,16 +233,32 @@ impl Display for DesktopWindow {
         _damage: &[Rect],
         _mode: RefreshMode,
     ) -> Result<(), DisplayError> {
+        let phys = self.window.inner_size();
+        let phys_w = phys.width as usize;
+        let phys_h = phys.height as usize;
+
+        let lw = self.width as usize;
+        let lh = self.height as usize;
+
+        if lw == 0 || lh == 0 || phys_w == 0 || phys_h == 0 {
+            return Ok(());
+        }
+
         let mut sb = self
             .surface
             .buffer_mut()
             .map_err(|e| DisplayError::present(e.to_string()))?;
 
-        let pixel_count = (self.width * self.height) as usize;
-        for (i, dst) in sb.iter_mut().enumerate().take(pixel_count) {
-            // 8-bpp gray (0=black, 255=white) → XRGB8888
-            let g = buf.data.get(i).copied().unwrap_or(255) as u32;
-            *dst = (g << 16) | (g << 8) | g;
+        // Nearest-neighbour upscale: each physical pixel maps back to its
+        // logical source pixel.  Handles any integer or fractional scale factor
+        // (e.g. 2× Retina, 1.5× fractional-DPI displays).
+        for py in 0..phys_h {
+            for px in 0..phys_w {
+                let lx = (px * lw / phys_w).min(lw - 1);
+                let ly = (py * lh / phys_h).min(lh - 1);
+                let g = buf.data.get(ly * lw + lx).copied().unwrap_or(255) as u32;
+                sb[py * phys_w + px] = (g << 16) | (g << 8) | g;
+            }
         }
 
         sb.present()

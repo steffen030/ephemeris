@@ -86,7 +86,7 @@ use std::rc::Rc;
 
 use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
 use slint::platform::{Platform, WindowAdapter};
-use slint::{PhysicalSize, SharedString};
+use slint::{Model, PhysicalSize, SharedString};
 
 use ephemeris_core::ink::{InkConfig, InkEngine, InkUpdate};
 use ephemeris_core::model::Point;
@@ -377,6 +377,16 @@ impl EphemerisUi {
         *self.scheduler.borrow_mut() = RefreshScheduler::new(config);
     }
 
+    // ── Component access ──────────────────────────────────────────────────
+
+    /// Return a strong clone of the underlying Slint component.
+    ///
+    /// Useful for wiring callbacks that need direct property access beyond the
+    /// methods provided by [`EphemerisUi`].
+    pub fn clone_component(&self) -> EphemerisPage {
+        self.component.clone_strong()
+    }
+
     // ── Property setters ──────────────────────────────────────────────────
 
     /// Set the page title shown in the status bar.
@@ -424,6 +434,58 @@ impl EphemerisUi {
         t.set_btn_border(border);
         t.set_text_secondary(fg);
         t.set_danger_fg(fg);
+    }
+
+    /// Switch between start page (task list) and canvas (ink) view.
+    pub fn set_show_start_page(&self, show: bool) {
+        self.component.set_show_start_page(show);
+    }
+
+    /// Push a ranked task list to the start page.
+    ///
+    /// `tasks` is a slice of `(title, priority_label, due_label, overdue)` tuples.
+    pub fn set_task_list(&self, tasks: &[(String, String, String, bool)]) {
+        let entries: Vec<TaskEntry> = tasks
+            .iter()
+            .map(|(title, priority_label, due_label, overdue)| TaskEntry {
+                title: slint::SharedString::from(title.as_str()),
+                priority_label: slint::SharedString::from(priority_label.as_str()),
+                due_label: slint::SharedString::from(due_label.as_str()),
+                overdue: *overdue,
+            })
+            .collect();
+        let model = std::rc::Rc::new(slint::VecModel::from(entries));
+        self.component.set_task_list(model.into());
+    }
+
+    /// Push agenda entries to the start page.
+    ///
+    /// Each tuple is `(title, time_label, location_label)`.
+    pub fn set_agenda_list(&self, entries: &[(String, String, String)]) {
+        let items: Vec<AgendaEntry> = entries
+            .iter()
+            .map(|(title, time_label, location_label)| AgendaEntry {
+                title: slint::SharedString::from(title.as_str()),
+                time_label: slint::SharedString::from(time_label.as_str()),
+                location_label: slint::SharedString::from(location_label.as_str()),
+            })
+            .collect();
+        let model = std::rc::Rc::new(slint::VecModel::from(items));
+        self.component.set_agenda_list(model.into());
+    }
+
+    /// Set the active agenda range tab: 0 = Day, 1 = Week, 2 = Month.
+    pub fn set_agenda_range(&self, range: i32) {
+        self.component.set_agenda_range(range);
+    }
+
+    /// Register a closure called when the user taps a Day/Week/Month tab.
+    pub fn on_agenda_range_changed<F>(&self, mut handler: F)
+    where
+        F: FnMut(i32) + 'static,
+    {
+        self.component
+            .on_agenda_range_changed(move |r| handler(r));
     }
 
     // ── Callback registration ─────────────────────────────────────────────
@@ -502,6 +564,22 @@ impl EphemerisUi {
         self.component.get_ring_visible()
     }
 
+    /// `true` when the ink canvas is the active view (no overlay is on top).
+    ///
+    /// Used by the input layer to decide whether pointer events should feed
+    /// into the ink engine rather than being passed through to the UI.
+    pub fn is_canvas_active(&self) -> bool {
+        let c = &self.component;
+        !c.get_show_start_page()
+            && !c.get_show_task_view()
+            && !c.get_show_settings()
+            && !c.get_show_filebrowser()
+            && !c.get_show_note_list()
+            && !c.get_task_dialog_visible()
+            && !c.get_note_rename_visible()
+            && !c.get_ring_visible()
+    }
+
     /// Register a closure called when the "Note" slice is tapped.
     pub fn on_ring_note<F: FnMut() + 'static>(&self, handler: F) {
         self.component.on_ring_note_tapped(handler);
@@ -525,6 +603,396 @@ impl EphemerisUi {
     /// Register a closure called when the ring is dismissed (backdrop tap or ×).
     pub fn on_ring_dismissed<F: FnMut() + 'static>(&self, handler: F) {
         self.component.on_ring_dismissed(handler);
+    }
+
+    // ── Task CRUD view API ────────────────────────────────────────────────
+
+    /// Show or hide the full task list view.
+    pub fn set_show_task_view(&self, show: bool) {
+        self.component.set_show_task_view(show);
+    }
+
+    /// Push the full task list to the CRUD view.
+    ///
+    /// Each tuple is `(id, title, priority_label, due_label, overdue, done)`.
+    pub fn set_full_task_list(&self, tasks: &[(String, String, String, String, bool, bool)]) {
+        let entries: Vec<TaskViewEntry> = tasks
+            .iter()
+            .map(|(id, title, priority_label, due_label, overdue, done)| TaskViewEntry {
+                id: slint::SharedString::from(id.as_str()),
+                title: slint::SharedString::from(title.as_str()),
+                priority_label: slint::SharedString::from(priority_label.as_str()),
+                due_label: slint::SharedString::from(due_label.as_str()),
+                overdue: *overdue,
+                done: *done,
+            })
+            .collect();
+        let model = std::rc::Rc::new(slint::VecModel::from(entries));
+        self.component.set_full_task_list(model.into());
+    }
+
+    /// Open the task add/edit dialog.
+    pub fn open_task_dialog(&self, is_edit: bool, id: &str, title: &str, priority: i32) {
+        self.component.set_task_dialog_is_edit(is_edit);
+        self.component.set_task_dialog_id(slint::SharedString::from(id));
+        self.component.set_task_dialog_title(slint::SharedString::from(title));
+        self.component.set_task_dialog_priority(priority);
+        self.component.set_task_dialog_visible(true);
+    }
+
+    /// Close the task dialog.
+    pub fn close_task_dialog(&self) {
+        self.component.set_task_dialog_visible(false);
+    }
+
+    /// Register a closure called when the page title is tapped in the status bar (→ home).
+    pub fn on_page_title_tapped<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_page_title_tapped(handler);
+    }
+
+    /// Register a closure called when "Notes →" is tapped on the start page.
+    pub fn on_start_page_notes<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_start_page_notes_tapped(handler);
+    }
+
+    /// Register a closure called when "All Tasks" is tapped on the start page.
+    pub fn on_start_page_tasks<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_start_page_tasks_tapped(handler);
+    }
+
+    /// Register a closure called when "Back" is tapped in the task view.
+    pub fn on_task_back<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_task_back_tapped(handler);
+    }
+
+    /// Register a closure called when a task's checkbox is tapped.
+    pub fn on_task_complete_toggled<F>(&self, mut handler: F)
+    where
+        F: FnMut(String) + 'static,
+    {
+        self.component
+            .on_task_complete_toggled(move |id| handler(id.to_string()));
+    }
+
+    /// Register a closure called when "Edit" is tapped on a task row.
+    pub fn on_task_edit_requested<F>(&self, mut handler: F)
+    where
+        F: FnMut(String) + 'static,
+    {
+        self.component
+            .on_task_edit_requested(move |id| handler(id.to_string()));
+    }
+
+    /// Register a closure called when "Save" is tapped in the add dialog.
+    pub fn on_task_confirm_add<F>(&self, mut handler: F)
+    where
+        F: FnMut(String, i32) + 'static,
+    {
+        self.component
+            .on_task_confirm_add(move |title, priority| handler(title.to_string(), priority));
+    }
+
+    /// Register a closure called when "Save" is tapped in the edit dialog.
+    pub fn on_task_confirm_edit<F>(&self, mut handler: F)
+    where
+        F: FnMut(String, String, i32) + 'static,
+    {
+        self.component.on_task_confirm_edit(move |id, title, priority| {
+            handler(id.to_string(), title.to_string(), priority)
+        });
+    }
+
+    /// Register a closure called when "Cancel" is tapped in the task dialog.
+    pub fn on_task_dialog_cancel<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_task_dialog_cancel(handler);
+    }
+
+    // ── Settings view API ─────────────────────────────────────────────────
+
+    /// Show or hide the settings view.
+    pub fn set_show_settings(&self, show: bool) {
+        self.component.set_show_settings(show);
+    }
+
+    /// Set the theme index shown in settings (0 = light, 1 = dark).
+    pub fn set_settings_theme_idx(&self, idx: i32) {
+        self.component.set_settings_theme_idx(idx);
+    }
+
+    /// Read the theme index currently selected in the settings view.
+    pub fn get_settings_theme_idx(&self) -> i32 {
+        self.component.get_settings_theme_idx()
+    }
+
+    /// Set the vault path shown in settings.
+    pub fn set_settings_vault_path(&self, path: &str) {
+        self.component
+            .set_settings_vault_path(slint::SharedString::from(path));
+    }
+
+    /// Read the vault path shown in settings.
+    pub fn get_settings_vault_path(&self) -> String {
+        self.component.get_settings_vault_path().to_string()
+    }
+
+    /// Push the list of calendar sources into the settings view.
+    ///
+    /// Each tuple: `(display_label, value)` where value is a full path or URL.
+    pub fn set_settings_cal_sources(&self, sources: &[(String, String)]) {
+        let items: Vec<CalSource> = sources
+            .iter()
+            .map(|(display, value)| CalSource {
+                display: slint::SharedString::from(display.as_str()),
+                value: slint::SharedString::from(value.as_str()),
+            })
+            .collect();
+        self.component
+            .set_settings_cal_sources(std::rc::Rc::new(slint::VecModel::from(items)).into());
+    }
+
+    /// Read the current calendar sources from the settings view model.
+    ///
+    /// Returns `(display_label, value)` pairs.
+    pub fn get_settings_cal_sources(&self) -> Vec<(String, String)> {
+        let model = self.component.get_settings_cal_sources();
+        (0..model.row_count())
+            .filter_map(|i| model.row_data(i))
+            .map(|s| (s.display.to_string(), s.value.to_string()))
+            .collect()
+    }
+
+    /// Register a closure called when the user taps "Settings" in the toolbar.
+    pub fn on_settings_open<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_settings_open(handler);
+    }
+
+    /// Register a closure called when the user taps "Back" in settings.
+    pub fn on_settings_back<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_settings_back(handler);
+    }
+
+    /// Register a closure called when the user taps "Save" in settings.
+    pub fn on_settings_save<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_settings_save(handler);
+    }
+
+    /// Register a closure called when "Clear" is tapped next to the vault path.
+    pub fn on_settings_clear_vault<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_settings_clear_vault(handler);
+    }
+
+    /// Register a closure called when "Browse..." is tapped for the vault.
+    pub fn on_settings_browse_vault<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_settings_browse_vault(handler);
+    }
+
+    /// Register a closure called when "Browse .ics..." is tapped.
+    pub fn on_settings_browse_ics<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_settings_browse_ics(handler);
+    }
+
+    /// Register a closure called when "Add" is tapped in the URL input row.
+    pub fn on_settings_add_url<F>(&self, mut handler: F)
+    where
+        F: FnMut(String) + 'static,
+    {
+        self.component
+            .on_settings_add_url(move |url| handler(url.to_string()));
+    }
+
+    /// Register a closure called when an "×" button is tapped on a cal source.
+    pub fn on_settings_remove_source<F>(&self, mut handler: F)
+    where
+        F: FnMut(i32) + 'static,
+    {
+        self.component
+            .on_settings_remove_source(move |idx| handler(idx));
+    }
+
+    // ── File browser API ──────────────────────────────────────────────────
+
+    /// Show or hide the file browser view.
+    pub fn set_show_filebrowser(&self, show: bool) {
+        self.component.set_show_filebrowser(show);
+    }
+
+    /// Set whether the browser is in vault-selection (true) or ICS-file (false) mode.
+    pub fn set_fb_vault_mode(&self, vault_mode: bool) {
+        self.component.set_fb_vault_mode(vault_mode);
+    }
+
+    /// Set the path label shown in the file browser header.
+    pub fn set_fb_current_path(&self, path: &str) {
+        self.component
+            .set_fb_current_path(slint::SharedString::from(path));
+    }
+
+    /// Push directory entries into the file browser list.
+    ///
+    /// Each tuple: `(name, full_path, is_dir, is_vault)`.
+    pub fn set_fb_entries(&self, entries: &[(String, String, bool, bool)]) {
+        let items: Vec<FileBrowserEntry> = entries
+            .iter()
+            .map(|(name, full_path, is_dir, is_vault)| FileBrowserEntry {
+                name: slint::SharedString::from(name.as_str()),
+                full_path: slint::SharedString::from(full_path.as_str()),
+                is_dir: *is_dir,
+                is_vault: *is_vault,
+            })
+            .collect();
+        self.component
+            .set_fb_entries(std::rc::Rc::new(slint::VecModel::from(items)).into());
+    }
+
+    /// Register a closure called when the user taps a directory row.
+    pub fn on_fb_navigate<F>(&self, mut handler: F)
+    where
+        F: FnMut(String) + 'static,
+    {
+        self.component
+            .on_fb_navigate(move |path| handler(path.to_string()));
+    }
+
+    /// Register a closure called when "Select this folder as Vault" is tapped.
+    pub fn on_fb_select_vault<F>(&self, mut handler: F)
+    where
+        F: FnMut(String) + 'static,
+    {
+        self.component
+            .on_fb_select_vault(move |path| handler(path.to_string()));
+    }
+
+    /// Register a closure called when "Add" is tapped on an .ics file row.
+    pub fn on_fb_add_ics<F>(&self, mut handler: F)
+    where
+        F: FnMut(String) + 'static,
+    {
+        self.component
+            .on_fb_add_ics(move |path| handler(path.to_string()));
+    }
+
+    /// Register a closure called when the user taps "Back" in the file browser.
+    pub fn on_fb_cancel<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_fb_cancel(handler);
+    }
+
+    // ── Navigation rail API ───────────────────────────────────────────────
+
+    /// Set the active navigation section (0 = Home/Overview, 1 = Notes).
+    pub fn set_nav_section(&self, section: i32) {
+        self.component.set_nav_section(section);
+    }
+
+    /// Read the current navigation section.
+    pub fn get_nav_section(&self) -> i32 {
+        self.component.get_nav_section()
+    }
+
+    /// Register a closure called when the "Home" nav item is tapped.
+    pub fn on_nav_overview_tapped<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_nav_overview_tapped(handler);
+    }
+
+    /// Register a closure called when the "Notes" nav item is tapped.
+    pub fn on_nav_notes_tapped<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_nav_notes_tapped(handler);
+    }
+
+    // ── Note browser API ──────────────────────────────────────────────────
+
+    /// Show or hide the note browser list view.
+    pub fn set_show_note_list(&self, show: bool) {
+        self.component.set_show_note_list(show);
+    }
+
+    /// Push note entries into the note browser.
+    ///
+    /// Each tuple: `(id, title, date_label)`.
+    pub fn set_note_list(&self, entries: &[(String, String, String)]) {
+        let items: Vec<NoteEntry> = entries
+            .iter()
+            .map(|(id, title, date_label)| NoteEntry {
+                id: slint::SharedString::from(id.as_str()),
+                title: slint::SharedString::from(title.as_str()),
+                date_label: slint::SharedString::from(date_label.as_str()),
+            })
+            .collect();
+        self.component
+            .set_note_list(std::rc::Rc::new(slint::VecModel::from(items)).into());
+    }
+
+    /// Set the ID of the currently open note.
+    pub fn set_active_note_id(&self, id: &str) {
+        self.component
+            .set_active_note_id(slint::SharedString::from(id));
+    }
+
+    /// Register a closure called when a note row is tapped.
+    pub fn on_note_tapped<F>(&self, mut handler: F)
+    where
+        F: FnMut(String) + 'static,
+    {
+        self.component
+            .on_note_tapped(move |id| handler(id.to_string()));
+    }
+
+    /// Register a closure called when "+ New Note" is tapped.
+    pub fn on_note_new_tapped<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_note_new_tapped(handler);
+    }
+
+    /// Register a closure called when the user confirms a note rename.
+    pub fn on_note_rename_confirm<F>(&self, mut handler: F)
+    where
+        F: FnMut(String, String) + 'static,
+    {
+        self.component
+            .on_note_rename_confirm(move |id, title| handler(id.to_string(), title.to_string()));
+    }
+
+    /// Register a closure called when the user cancels the rename dialog.
+    pub fn on_note_rename_cancel<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_note_rename_cancel(handler);
+    }
+
+    // ── Input event dispatch ──────────────────────────────────────────────
+
+    /// Forward a pointer-moved event (logical pixels) to the Slint component.
+    pub fn dispatch_pointer_moved(&self, x: f32, y: f32) {
+        use slint::platform::WindowEvent;
+        self.window.dispatch_event(WindowEvent::PointerMoved {
+            position: slint::LogicalPosition::new(x, y),
+        });
+    }
+
+    /// Forward a pointer-pressed event (logical pixels, left button).
+    pub fn dispatch_pointer_pressed(&self, x: f32, y: f32) {
+        use slint::platform::{PointerEventButton, WindowEvent};
+        self.window.dispatch_event(WindowEvent::PointerPressed {
+            position: slint::LogicalPosition::new(x, y),
+            button: PointerEventButton::Left,
+        });
+    }
+
+    /// Forward a pointer-released event (logical pixels, left button).
+    pub fn dispatch_pointer_released(&self, x: f32, y: f32) {
+        use slint::platform::{PointerEventButton, WindowEvent};
+        self.window.dispatch_event(WindowEvent::PointerReleased {
+            position: slint::LogicalPosition::new(x, y),
+            button: PointerEventButton::Left,
+        });
+    }
+
+    /// Forward a key-pressed event (text is the unicode representation).
+    pub fn dispatch_key_pressed(&self, text: slint::SharedString) {
+        use slint::platform::WindowEvent;
+        self.window.dispatch_event(WindowEvent::KeyPressed { text });
+    }
+
+    /// Forward a key-released event.
+    pub fn dispatch_key_released(&self, text: slint::SharedString) {
+        use slint::platform::WindowEvent;
+        self.window.dispatch_event(WindowEvent::KeyReleased { text });
     }
 
     // ── Page navigation API ───────────────────────────────────────────────
@@ -571,6 +1039,44 @@ impl EphemerisUi {
         };
 
         self.load_page_state(target);
+    }
+
+    /// Navigate directly to page `n` (zero-based index).
+    ///
+    /// Saves the current page's live state first, then loads page `n`.
+    /// Clamped to `[0, page_count - 1]`; if `n` is already the current page
+    /// this is a no-op apart from the state save.
+    pub fn navigate_to_page(&self, n: usize) {
+        let canvas_h = self.canvas_height();
+        let live_state = self.snapshot_live_state(canvas_h);
+
+        let target = {
+            let mut book = self.pages.borrow_mut();
+            let clamped = n.min(book.page_count().saturating_sub(1));
+            book.navigate_to(live_state, clamped);
+            clamped
+        };
+
+        self.load_page_state(target);
+    }
+
+    /// Append a new blank page, navigate to it, and return its zero-based index.
+    pub fn push_new_page(&self) -> usize {
+        let canvas_h = self.canvas_height();
+        let live_state = self.snapshot_live_state(canvas_h);
+
+        let new_idx = {
+            let mut book = self.pages.borrow_mut();
+            book.push_blank_page(live_state, self.width, canvas_h, self.default_base_width)
+        };
+
+        self.load_page_state(new_idx);
+        new_idx
+    }
+
+    /// Total number of pages currently in the book.
+    pub fn total_page_count(&self) -> usize {
+        self.pages.borrow().page_count()
     }
 
     /// Return `(current_index_1based, total_page_count)` reflecting the status

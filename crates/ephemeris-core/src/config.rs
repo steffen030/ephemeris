@@ -47,6 +47,33 @@ pub struct Config {
     #[serde(default = "default_logging_level")]
     pub logging_level: String,
 
+    /// Path to an Obsidian vault directory.  When set, tasks are read from
+    /// all `*.md` files in this directory tree at startup.
+    ///
+    /// Example TOML: `vault_path = "/home/user/Obsidian"`
+    #[serde(default)]
+    pub vault_path: Option<PathBuf>,
+
+    /// Local `.ics` file paths to load calendar events from.
+    /// Each path should point to a valid iCalendar file on disk.
+    ///
+    /// Example TOML:
+    /// ```toml
+    /// ics_paths = ["/home/user/calendars/personal.ics", "/home/user/calendars/work.ics"]
+    /// ```
+    #[serde(default)]
+    pub ics_paths: Vec<PathBuf>,
+
+    /// Remote ICS/webcal feed URLs.  Both `https://` and `webcal://` are
+    /// accepted (webcal is rewritten to https automatically at fetch time).
+    ///
+    /// Example TOML:
+    /// ```toml
+    /// ics_urls = ["https://calendar.google.com/calendar/ical/…/basic.ics"]
+    /// ```
+    #[serde(default)]
+    pub ics_urls: Vec<String>,
+
     /// Arbitrary key-value overrides for experimental / future settings.
     #[serde(default)]
     pub custom: HashMap<String, String>,
@@ -70,6 +97,9 @@ impl Default for Config {
             theme: default_theme(),
             sync_interval_secs: default_sync_interval(),
             logging_level: default_logging_level(),
+            vault_path: None,
+            ics_paths: Vec::new(),
+            ics_urls: Vec::new(),
             custom: HashMap::new(),
         }
     }

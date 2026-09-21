@@ -6,6 +6,7 @@
 //! lands.
 
 pub mod action;
+pub mod agenda;
 #[cfg(feature = "sqlite")]
 pub mod aggregation;
 pub mod config;
@@ -42,6 +43,7 @@ pub fn init_tracing() {
         .init();
 }
 pub mod obsidian;
+pub mod prioritizer;
 pub mod profile_manager;
 pub mod stroke_persistence;
 pub mod task_provider;
@@ -54,6 +56,8 @@ pub use task_provider::{ProviderCapabilities, TaskProvider};
 #[cfg(feature = "sqlite")]
 pub use aggregation::AggregationService;
 pub use markdown_tasks::MarkdownTaskExtractor;
+pub use prioritizer::{rank_tasks, task_score};
+pub use agenda::{filter_agenda, to_agenda_entries, AgendaEntry, AgendaRange};
 pub use calendar_cache::CalendarCache;
 pub use task_cache::TaskCache;
 #[cfg(feature = "webdav")]

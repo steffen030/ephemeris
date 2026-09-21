@@ -10,11 +10,15 @@ license.workspace = true
 name = "ephemeris"
 path = "src/main.rs"
 
+[dev-dependencies]
+tempfile = "3"
+
 [dependencies]
-ephemeris-core = { workspace = true }
+ephemeris-core = { workspace = true, features = ["ics"] }
 ephemeris-pal  = { workspace = true }
 ephemeris-ui   = { workspace = true }
 log = { workspace = true }
+slint = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
