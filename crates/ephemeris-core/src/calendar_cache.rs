@@ -26,9 +26,7 @@ impl CalendarCache {
         let profile_id = event.profile_id;
 
         // Track profile index
-        if !self.by_profile.contains_key(&profile_id) {
-            self.by_profile.insert(profile_id, Vec::new());
-        }
+        self.by_profile.entry(profile_id).or_default();
 
         // If new event, track its ID in profile index
         if !self.events_by_uid.contains_key(&key) {

@@ -156,10 +156,7 @@ impl App {
                 profile_mgr.load_profile(profile);
             }
             let profiles = profile_mgr.list_profiles().unwrap_or_default();
-            let first = profiles
-                .first()
-                .map(|p| p.id)
-                .unwrap_or_else(ProfileId::new);
+            let first = profiles.first().map(|p| p.id).unwrap_or_default();
             let second = profiles.get(1).map(|p| p.id).unwrap_or(first);
             (first, second)
         } else {
@@ -397,8 +394,8 @@ impl App {
         let download_active = Arc::new(AtomicBool::new(false));
 
         // ── Initial UI state ──────────────────────────────────────────────────
-        refresh_ui(&*ui, &tasks.borrow(), profile_id);
-        push_agenda_ui(&*ui, &calendar_events.borrow(), AgendaRange::Day, now);
+        refresh_ui(&ui, &tasks.borrow(), profile_id);
+        push_agenda_ui(&ui, &calendar_events.borrow(), AgendaRange::Day, now);
         ui.set_show_start_page(true);
         ui.set_nav_section(0);
 
@@ -3310,25 +3307,31 @@ impl App {
                     .collect();
                 drop(conns);
 
-                let mut new_cfg = Config::default();
-                new_cfg.theme = theme.to_string();
-                new_cfg.vault_tasks_inbox = cfg2.borrow().vault_tasks_inbox.clone();
-                new_cfg.vault_export_subdir = cfg2.borrow().vault_export_subdir.clone();
-                new_cfg.ocr_enabled = cfg2.borrow().ocr_enabled;
-                new_cfg.ocr_languages = cfg2.borrow().ocr_languages.clone();
-                new_cfg.ocr_tessdata = cfg2.borrow().ocr_tessdata.clone();
-                new_cfg.vault_path = if vault_str.is_empty() {
-                    None
-                } else {
-                    Some(expand_user_path(&vault_str))
-                };
+                let mut ics_urls = Vec::new();
+                let mut ics_paths = Vec::new();
                 for val in &cal_values {
                     if val.starts_with("http") || val.starts_with("webcal") {
-                        new_cfg.ics_urls.push(val.clone());
+                        ics_urls.push(val.clone());
                     } else {
-                        new_cfg.ics_paths.push(PathBuf::from(val));
+                        ics_paths.push(PathBuf::from(val));
                     }
                 }
+                let new_cfg = Config {
+                    theme: theme.to_string(),
+                    vault_tasks_inbox: cfg2.borrow().vault_tasks_inbox.clone(),
+                    vault_export_subdir: cfg2.borrow().vault_export_subdir.clone(),
+                    ocr_enabled: cfg2.borrow().ocr_enabled,
+                    ocr_languages: cfg2.borrow().ocr_languages.clone(),
+                    ocr_tessdata: cfg2.borrow().ocr_tessdata.clone(),
+                    vault_path: if vault_str.is_empty() {
+                        None
+                    } else {
+                        Some(expand_user_path(&vault_str))
+                    },
+                    ics_urls,
+                    ics_paths,
+                    ..Config::default()
+                };
 
                 if let Err(e) = new_cfg.save() {
                     tracing::warn!("Config save failed: {e}");
@@ -4649,6 +4652,7 @@ fn build_folder_list(
 }
 
 /// Notes in a folder (`0` = root / unfiled).
+#[allow(clippy::too_many_arguments)]
 fn build_note_list(
     notes: &[AppNote],
     notebook_id: u32,
@@ -4687,8 +4691,8 @@ fn build_note_list(
                 .cmp(&b.title.to_lowercase())
                 .then_with(|| note_updated_at(b).cmp(&note_updated_at(a)))
         }),
-        "created" => items.sort_by(|a, b| b.created_at.cmp(&a.created_at)),
-        _ => items.sort_by(|a, b| note_updated_at(b).cmp(&note_updated_at(a))),
+        "created" => items.sort_by_key(|a| std::cmp::Reverse(a.created_at)),
+        _ => items.sort_by_key(|a| std::cmp::Reverse(note_updated_at(a))),
     }
 
     items
@@ -5152,12 +5156,14 @@ fn cal_day_events(
 }
 
 /// Build week events: col = day-of-week offset from Monday (0=Mon).
+type CalWeekEvent = (String, String, bool, i32);
+
 fn cal_week_events(
     year: i32,
     month: u32,
     day: u32,
     events: &[CalendarEvent],
-) -> (Vec<String>, Vec<(String, String, bool, i32)>) {
+) -> (Vec<String>, Vec<CalWeekEvent>) {
     let date = NaiveDate::from_ymd_opt(year, month, day).unwrap_or_default();
     let mon_offset = date.weekday().num_days_from_monday() as i64;
     let monday = date - chrono::Duration::days(mon_offset);
@@ -5959,7 +5965,7 @@ fn build_full_task_list(
             let due_b = if b.4.is_empty() { u64::MAX } else { 0 };
             due_a.cmp(&due_b).then(a.5.cmp(&b.5))
         }),
-        "title" => v.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase())),
+        "title" => v.sort_by_key(|a| a.1.to_lowercase()),
         "added" => {} // preserve original order
         _ => {
             // priority, with open tasks before closed when mixed ("all")
@@ -6177,7 +6183,7 @@ fn format_due(due: Option<u64>, now_secs: u64) -> (String, bool) {
             if d <= now_secs {
                 ("overdue".to_string(), true)
             } else {
-                let days = (d - now_secs + DAY - 1) / DAY;
+                let days = (d - now_secs).div_ceil(DAY);
                 if days == 0 {
                     ("today".to_string(), false)
                 } else if days == 1 {
@@ -6264,9 +6270,8 @@ mod tests {
             profile,
         );
         // Either Ok(empty) or Err — both are acceptable; just must not panic.
-        match result {
-            Ok(tasks) => assert!(tasks.is_empty()),
-            Err(_) => {} // also fine
+        if let Ok(tasks) = result {
+            assert!(tasks.is_empty());
         }
     }
 

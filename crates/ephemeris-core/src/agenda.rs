@@ -29,11 +29,11 @@ pub struct AgendaEntry {
 /// Return events that start within the given range window, sorted by `start`.
 ///
 /// The window is `[now_secs, now_secs + window_secs)`.
-pub fn filter_agenda<'a>(
-    events: &'a [CalendarEvent],
+pub fn filter_agenda(
+    events: &[CalendarEvent],
     range: AgendaRange,
     now_secs: u64,
-) -> Vec<&'a CalendarEvent> {
+) -> Vec<&CalendarEvent> {
     let window = match range {
         AgendaRange::Day => SECS_PER_DAY,
         AgendaRange::Week => SECS_PER_WEEK,
@@ -165,7 +165,7 @@ mod tests {
 
     #[test]
     fn to_entries_day_uses_hhmm() {
-        let events = vec![event("standup", 3600)];
+        let events = [event("standup", 3600)];
         let filtered: Vec<&CalendarEvent> = events.iter().collect();
         let entries = to_agenda_entries(&filtered, AgendaRange::Day, NOW);
         assert_eq!(entries.len(), 1);

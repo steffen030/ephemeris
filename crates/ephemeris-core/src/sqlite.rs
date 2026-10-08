@@ -107,10 +107,7 @@ fn apply_task_meta(task: &mut Task, meta_json: Option<&str>) {
     task.recurrence = meta.recurrence;
     task.project = meta.project;
     task.section = meta.section;
-    task.parent_id = meta
-        .parent_id
-        .and_then(|s| s.parse().ok())
-        .map(TaskId);
+    task.parent_id = meta.parent_id.and_then(|s| s.parse().ok()).map(TaskId);
     task.url = meta.url;
     if task.done && task.status == TaskStatus::Todo {
         task.status = TaskStatus::Done;

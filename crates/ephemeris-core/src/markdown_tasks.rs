@@ -517,9 +517,7 @@ fn is_hidden(path: &Path) -> bool {
 fn parse_date(s: &str) -> Result<u64, ()> {
     use chrono::{NaiveDate, TimeZone, Utc};
     let date = NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|_| ())?;
-    let dt = date
-        .and_hms_opt(0, 0, 0)
-        .ok_or(())?;
+    let dt = date.and_hms_opt(0, 0, 0).ok_or(())?;
     Ok(Utc.from_utc_datetime(&dt).timestamp() as u64)
 }
 
@@ -559,10 +557,7 @@ mod tests {
     #[test]
     fn parse_emoji_due_and_priority() {
         let ext = MarkdownTaskExtractor::new("/tmp", ProfileId::new());
-        let tasks = ext.parse_tasks(
-            "- [ ] Ship feature 📅 2025-06-01 🔼 #work",
-            Some("a.md"),
-        );
+        let tasks = ext.parse_tasks("- [ ] Ship feature 📅 2025-06-01 🔼 #work", Some("a.md"));
         assert_eq!(tasks[0].title, "Ship feature");
         assert!(tasks[0].due.is_some());
         assert_eq!(tasks[0].priority, TaskPriority::High);

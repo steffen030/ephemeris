@@ -32,7 +32,7 @@ impl ObsidianVault {
         let files = self.list_files()?;
 
         for path in files {
-            if let Ok(_) = fs::read_to_string(&path) {
+            if fs::read_to_string(&path).is_ok() {
                 let title = path
                     .file_stem()
                     .and_then(|s| s.to_str())

@@ -82,6 +82,7 @@ pub fn rasterize_stroke(
 /// Used during live drawing before the stroke is finalised.  Parameters are
 /// the same as [`rasterize_stroke`].  `tool` controls how pixels are blended
 /// (see [`rasterize_stroke`] for per-tool semantics).
+#[allow(clippy::too_many_arguments)]
 pub fn rasterize_points(
     buf: &mut PixelBuf,
     points: &[Point],

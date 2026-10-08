@@ -596,11 +596,11 @@ impl EphemerisUi {
     }
 
     /// Register a closure called when the user taps a Day/Week/Month tab.
-    pub fn on_agenda_range_changed<F>(&self, mut handler: F)
+    pub fn on_agenda_range_changed<F>(&self, handler: F)
     where
         F: FnMut(i32) + 'static,
     {
-        self.component.on_agenda_range_changed(move |r| handler(r));
+        self.component.on_agenda_range_changed(handler);
     }
 
     // ── Callback registration ─────────────────────────────────────────────
@@ -992,11 +992,11 @@ impl EphemerisUi {
         self.component.set_profile_list(list);
     }
 
-    pub fn on_profile_changed<F>(&self, mut handler: F)
+    pub fn on_profile_changed<F>(&self, handler: F)
     where
         F: FnMut(slint::SharedString) + 'static,
     {
-        self.component.on_profile_changed(move |id| handler(id));
+        self.component.on_profile_changed(handler);
     }
 
     // ── Settings view API ─────────────────────────────────────────────────
@@ -1201,12 +1201,11 @@ impl EphemerisUi {
     }
 
     /// Register a closure called when an "×" button is tapped on a cal source.
-    pub fn on_settings_remove_source<F>(&self, mut handler: F)
+    pub fn on_settings_remove_source<F>(&self, handler: F)
     where
         F: FnMut(i32) + 'static,
     {
-        self.component
-            .on_settings_remove_source(move |idx| handler(idx));
+        self.component.on_settings_remove_source(handler);
     }
 
     pub fn set_whisper_model_installed(&self, v: bool) {
@@ -1301,12 +1300,11 @@ impl EphemerisUi {
             });
     }
 
-    pub fn on_create_profile_pick_cancel<F>(&self, mut handler: F)
+    pub fn on_create_profile_pick_cancel<F>(&self, handler: F)
     where
         F: FnMut() + 'static,
     {
-        self.component
-            .on_create_profile_pick_cancel(move || handler());
+        self.component.on_create_profile_pick_cancel(handler);
     }
 
     pub fn set_connect_profile_id(&self, id: &str) {
@@ -1334,19 +1332,18 @@ impl EphemerisUi {
             .on_connect_profile_changed(move |id| handler(id.to_string()));
     }
 
-    pub fn on_connection_remove<F>(&self, mut handler: F)
+    pub fn on_connection_remove<F>(&self, handler: F)
     where
         F: FnMut(i32) + 'static,
     {
-        self.component.on_connection_remove(move |idx| handler(idx));
+        self.component.on_connection_remove(handler);
     }
 
-    pub fn on_connection_cycle_profile<F>(&self, mut handler: F)
+    pub fn on_connection_cycle_profile<F>(&self, handler: F)
     where
         F: FnMut(i32) + 'static,
     {
-        self.component
-            .on_connection_cycle_profile(move |idx| handler(idx));
+        self.component.on_connection_cycle_profile(handler);
     }
 
     pub fn on_connection_set_profile<F>(&self, mut handler: F)
@@ -1357,12 +1354,11 @@ impl EphemerisUi {
             .on_connection_set_profile(move |idx, pid| handler(idx, pid.to_string()));
     }
 
-    pub fn on_connection_toggle_aggregated<F>(&self, mut handler: F)
+    pub fn on_connection_toggle_aggregated<F>(&self, handler: F)
     where
         F: FnMut(i32) + 'static,
     {
-        self.component
-            .on_connection_toggle_aggregated(move |idx| handler(idx));
+        self.component.on_connection_toggle_aggregated(handler);
     }
 
     pub fn on_rec_transcription_save<F>(&self, mut handler: F)
@@ -1787,11 +1783,11 @@ impl EphemerisUi {
         self.component.on_nav_calendar_tapped(handler);
     }
 
-    pub fn on_cal_sub_view_changed<F>(&self, mut handler: F)
+    pub fn on_cal_sub_view_changed<F>(&self, handler: F)
     where
         F: FnMut(i32) + 'static,
     {
-        self.component.on_cal_sub_view_changed(move |v| handler(v));
+        self.component.on_cal_sub_view_changed(handler);
     }
 
     pub fn on_cal_prev<F: FnMut() + 'static>(&self, handler: F) {
@@ -1806,20 +1802,18 @@ impl EphemerisUi {
         self.component.on_cal_today(handler);
     }
 
-    pub fn on_cal_day_tapped<F>(&self, mut handler: F)
+    pub fn on_cal_day_tapped<F>(&self, handler: F)
     where
         F: FnMut(i32, i32, i32) + 'static,
     {
-        self.component
-            .on_cal_day_tapped(move |y, m, d| handler(y, m, d));
+        self.component.on_cal_day_tapped(handler);
     }
 
-    pub fn on_cal_open_day_note<F>(&self, mut handler: F)
+    pub fn on_cal_open_day_note<F>(&self, handler: F)
     where
         F: FnMut(i32, i32, i32) + 'static,
     {
-        self.component
-            .on_cal_open_day_note(move |y, m, d| handler(y, m, d));
+        self.component.on_cal_open_day_note(handler);
     }
 
     pub fn set_cal_day_note_exists(&self, v: bool) {
@@ -3516,11 +3510,9 @@ mod tests {
 
         // Damage must lie strictly inside the canvas region: below the status
         // bar and above the toolbar. This proves it is not a full-screen rect.
-        let (_x0, y0, _x1, y1) = damage_bbox(&damage);
-        assert!(
-            y0 >= STATUS_BAR_H,
-            "ink damage top {y0} must not intrude into the status bar (< {STATUS_BAR_H})"
-        );
+        let (_x0, _y0, _x1, y1) = damage_bbox(&damage);
+        // STATUS_BAR_H is currently 0 (fullscreen canvas), so a "below status
+        // bar" bound is not meaningful to assert. Keep the toolbar bound.
         assert!(
             y1 <= 600 - TOOLBAR_H,
             "ink damage bottom {y1} must not intrude into the toolbar (> {})",

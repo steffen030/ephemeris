@@ -4,10 +4,10 @@
 //! returns them sorted highest-priority-first.
 //!
 //! Score components (all additive, higher = more urgent):
-//!   - `priority_score`: High=300, Medium=200, Low=100
-//!   - `due_score`: 500 if overdue, 400 if due today, 300 if due in 1 d,
-//!                  200 if due in 2 d, 100 if due in 3–7 d, 0 if >7 d or no due
-//!   - total = priority_score + due_score
+//! - `priority_score`: High=300, Medium=200, Low=100
+//! - `due_score`: 500 if overdue, 400 if due today, 300 if due in 1 d,
+//!   200 if due in 2 d, 100 if due in 3–7 d, 0 if >7 d or no due
+//! - total = priority_score + due_score
 
 use crate::{Task, TaskPriority};
 
@@ -52,7 +52,7 @@ pub fn rank_tasks<'a>(tasks: &'a [Task], now_secs: u64) -> Vec<&'a Task> {
         .map(|t| (t, task_score(t, now_secs)))
         .collect();
 
-    scored.sort_by(|a, b| b.1.cmp(&a.1));
+    scored.sort_by_key(|a| std::cmp::Reverse(a.1));
     scored.into_iter().map(|(t, _)| t).collect()
 }
 

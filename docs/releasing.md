@@ -68,6 +68,15 @@ scripts/build-deb.sh target/aarch64-unknown-linux-gnu/release/ephemeris 0.1.0 di
 
 ## One-time setup (human)
 
+### 0. Allow Actions to open Release PRs
+
+Settings → Actions → General → Workflow permissions:
+
+- **Read and write permissions**
+- **Allow GitHub Actions to create and approve pull requests**
+
+Without this, release-please cannot open the Release PR.
+
 ### 1. Apt signing key
 
 Generate a **dedicated** signing key (do not reuse a personal email key):

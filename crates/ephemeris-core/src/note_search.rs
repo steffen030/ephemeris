@@ -60,6 +60,11 @@ impl VaultFtsIndex {
         Ok(n as usize)
     }
 
+    /// Returns true when the index has no documents.
+    pub fn is_empty(&self) -> crate::Result<bool> {
+        Ok(self.len()? == 0)
+    }
+
     /// Clear and rebuild the index from every `.md` file under `vault_path`.
     ///
     /// If `vault_path` is missing or not a directory, the index is cleared and
@@ -79,10 +84,7 @@ impl VaultFtsIndex {
         let mut count = 0usize;
         for vault_path in vault_paths {
             if !vault_path.is_dir() {
-                tracing::warn!(
-                    "Vault path {:?} is not a directory; skipping",
-                    vault_path
-                );
+                tracing::warn!("Vault path {:?} is not a directory; skipping", vault_path);
                 continue;
             }
             let files = list_markdown_files(vault_path)?;
@@ -265,9 +267,7 @@ pub fn strip_inline_markdown(s: &str) -> String {
     let mut i = 0;
     while i < chars.len() {
         // **bold** or __bold__
-        if (chars[i] == '*' || chars[i] == '_')
-            && chars.get(i + 1) == Some(&chars[i])
-        {
+        if (chars[i] == '*' || chars[i] == '_') && chars.get(i + 1) == Some(&chars[i]) {
             let marker = chars[i];
             if let Some(end) = find_closing_pair(&chars, i + 2, marker, true) {
                 for &c in &chars[i + 2..end] {
@@ -638,7 +638,7 @@ where
 }
 
 /// Substring search over task titles.
-pub fn search_tasks<'a, I>(tasks: I, query: &str, limit: usize) -> Vec<SearchHit>
+pub fn search_tasks<I>(tasks: I, query: &str, limit: usize) -> Vec<SearchHit>
 where
     I: IntoIterator<Item = (String, String, bool)>, // id, title, done
 {
@@ -666,7 +666,7 @@ where
 }
 
 /// Substring search over calendar event titles.
-pub fn search_events<'a, I>(events: I, query: &str, limit: usize) -> Vec<SearchHit>
+pub fn search_events<I>(events: I, query: &str, limit: usize) -> Vec<SearchHit>
 where
     I: IntoIterator<Item = (String, String)>, // id, title
 {
@@ -784,7 +784,9 @@ mod tests {
         assert_eq!(blocks[0].text, "Title");
         assert_eq!(blocks[1].kind, MdBlockKind::Bullet);
         assert_eq!(blocks[1].text, "one");
-        assert!(blocks.iter().any(|b| b.kind == MdBlockKind::Paragraph && b.text.contains("bold") && !b.text.contains("**")));
+        assert!(blocks.iter().any(|b| b.kind == MdBlockKind::Paragraph
+            && b.text.contains("bold")
+            && !b.text.contains("**")));
     }
 
     #[test]

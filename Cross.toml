@@ -7,5 +7,5 @@
 pre-build = [
     "dpkg --add-architecture arm64",
     "apt-get update -q",
-    "apt-get install -y --no-install-recommends libxkbcommon-dev:arm64",
+    "apt-get install -y --no-install-recommends libxkbcommon-dev:arm64 libfontconfig1-dev:arm64 libasound2-dev:arm64",
 ]

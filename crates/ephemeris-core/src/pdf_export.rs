@@ -196,6 +196,7 @@ fn page_size_mm(width_px: u32, height_px: u32) -> (Mm, Mm) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_raster_page(
     doc: &PdfDocumentReference,
     page: PdfPageIndex,
@@ -251,6 +252,7 @@ fn write_raster_page(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_stroke_page(
     doc: &PdfDocumentReference,
     page: PdfPageIndex,
@@ -299,6 +301,7 @@ fn draw_stroke_page(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn embed_text_layer(
     doc: &PdfDocumentReference,
     layer: &PdfLayerReference,

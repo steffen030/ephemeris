@@ -26,9 +26,7 @@ impl TaskCache {
         let profile_id = task.profile_id;
 
         // Track profile index
-        if !self.by_profile.contains_key(&profile_id) {
-            self.by_profile.insert(profile_id, Vec::new());
-        }
+        self.by_profile.entry(profile_id).or_default();
 
         // If new task, track its ID in profile index
         if !self.tasks.contains_key(&task_id) {

@@ -6,9 +6,9 @@
 //! feature is off (CI-safe).
 
 use crate::model::{Point, Stroke, Tool};
-use std::path::PathBuf;
 #[cfg(feature = "ocr")]
 use std::path::Path;
+use std::path::PathBuf;
 #[cfg(feature = "ocr")]
 use std::process::Command;
 
@@ -164,7 +164,7 @@ impl Transcriber for RasterOcrTranscriber {
         #[cfg(not(feature = "ocr"))]
         {
             let _ = (width, height, gray8);
-            return Ok(Vec::new());
+            Ok(Vec::new())
         }
         #[cfg(feature = "ocr")]
         {
@@ -252,7 +252,7 @@ pub fn parse_tesseract_tsv(tsv: &str) -> Vec<TextSpan> {
             continue;
         }
         let conf: f32 = cols[10].parse().unwrap_or(-1.0);
-        if conf >= 0.0 && conf < 15.0 {
+        if (0.0..15.0).contains(&conf) {
             // Drop very low-confidence noise; -1 means conf missing.
             continue;
         }
@@ -349,6 +349,7 @@ fn rasterize_strokes(strokes: &[Stroke]) -> (u32, u32, Vec<u8>) {
     (w, h, gray)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_line_thick(
     buf: &mut [u8],
     w: u32,
@@ -435,10 +436,7 @@ level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theigh
         assert_eq!(spans[0].text, "Hello");
         assert_eq!(spans[0].x, 10.0);
         assert_eq!(spans[1].text, "World");
-        assert_eq!(
-            RasterOcrTranscriber::spans_to_text(&spans),
-            "Hello World"
-        );
+        assert_eq!(RasterOcrTranscriber::spans_to_text(&spans), "Hello World");
     }
 
     #[test]
