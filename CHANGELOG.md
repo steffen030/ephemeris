@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.2](https://github.com/steffen030/ephemeris/compare/v0.1.1...v0.1.2) (2026-10-08)
+
+
+### Bug Fixes
+
+* PineNote launcher entry, fullscreen, and touch/pen input ([e3d2a97](https://github.com/steffen030/ephemeris/commit/e3d2a97e7b3dd4f8f2555efac38e23852b90b7cb))
+* resolve apt-repo paths before scanning packages ([84a2263](https://github.com/steffen030/ephemeris/commit/84a2263779188b6c4ba18756970747d8fdd6b0a6))
+
 ## [0.1.1](https://github.com/steffen030/ephemeris/compare/v0.1.0...v0.1.1) (2026-10-08)
 
 
