@@ -102,26 +102,41 @@ Optional repository variable:
 |----------|--------|
 | `APT_GPG_NAME` | Key user-id (default `apt@ephemeris.local`) |
 
-### 2. GitHub Pages
+### 2. Host the apt tree (`gh-pages`)
 
-1. Settings → Pages → Build and deployment → Source: **Deploy from a branch**.
-2. Branch: **`gh-pages`** / `/ (root)`.
-3. The first successful release job creates/updates `gh-pages`.
+Each release pushes a signed apt repository to the **`gh-pages`** branch.
 
-Site URL (default project Pages):
+**GitHub Pages** (nice URL `https://steffen030.github.io/ephemeris/`) requires a
+**public** repository on the free plan, or GitHub Pro for private repos.
+Settings → Pages → Source: Deploy from branch → **`gh-pages`** / `/ (root)`.
 
-`https://steffen030.github.io/ephemeris/`
+If Pages is unavailable, serve the same tree via raw GitHub (public repo):
+
+`https://raw.githubusercontent.com/steffen030/ephemeris/gh-pages/`
+
+Private repos need either Pages (Pro), a public mirror, or an authenticated
+download path — apt cannot fetch private raw URLs without credentials.
+
+The public signing key is also checked into
+[`packaging/keys/ephemeris-archive-keyring.gpg`](../packaging/keys/ephemeris-archive-keyring.gpg).
 
 ## PineNote: install from the apt repo
 
-On the device (Debian/Mobian aarch64):
+On the device (Debian/Mobian aarch64). Prefer the Pages URL when enabled;
+otherwise use the raw `gh-pages` URL on a public repo.
 
 ```bash
+# Key (from Pages, raw gh-pages, or the repo copy)
 curl -fsSL https://steffen030.github.io/ephemeris/ephemeris-archive-keyring.gpg \
   | sudo tee /usr/share/keyrings/ephemeris-archive-keyring.gpg >/dev/null
 
+# Pages (when enabled):
 echo "deb [signed-by=/usr/share/keyrings/ephemeris-archive-keyring.gpg arch=arm64] https://steffen030.github.io/ephemeris stable main" \
   | sudo tee /etc/apt/sources.list.d/ephemeris.list
+
+# Fallback if the repo is public but Pages is off:
+# echo "deb [signed-by=/usr/share/keyrings/ephemeris-archive-keyring.gpg arch=arm64] https://raw.githubusercontent.com/steffen030/ephemeris/gh-pages stable main" \
+#   | sudo tee /etc/apt/sources.list.d/ephemeris.list
 
 sudo apt update
 sudo apt install ephemeris
