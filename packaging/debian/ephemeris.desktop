@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Ephemeris
+GenericName=Planner
+Comment=E-ink planner and note-taking
+Exec=ephemeris
+Icon=ephemeris
+Terminal=false
+Categories=Office;Utility;Graphics;
+StartupNotify=true
+StartupWMClass=ephemeris
+Keywords=notes;planner;eink;calendar;tasks;

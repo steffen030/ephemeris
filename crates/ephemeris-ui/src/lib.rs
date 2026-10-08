@@ -1881,6 +1881,11 @@ impl EphemerisUi {
         self.committed_layer.borrow().data.clone()
     }
 
+    /// Full UI / window size in logical pixels `(width, height)`.
+    pub fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
     /// Canvas size for the committed ink layer `(width, height)`.
     pub fn canvas_size(&self) -> (u32, u32) {
         (self.width, self.canvas_height())

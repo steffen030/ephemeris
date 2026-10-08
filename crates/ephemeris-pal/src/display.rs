@@ -161,10 +161,23 @@ impl DesktopWindow {
         use winit::dpi::LogicalSize;
         use winit::window::Window;
 
+        use winit::window::Fullscreen;
+
         let attrs = Window::default_attributes()
             .with_title("Ephemeris")
             .with_inner_size(LogicalSize::new(width, height))
-            .with_resizable(false);
+            // Borderless fullscreen is the right mode for e-ink shells (Phosh /
+            // GNOME on PineNote). Exclusive mode is unsupported on Wayland.
+            .with_fullscreen(Some(Fullscreen::Borderless(None)))
+            .with_resizable(true);
+
+        // Wayland app_id must match StartupWMClass in the .desktop file so the
+        // shell can associate the running window with the launcher entry.
+        #[cfg(target_os = "linux")]
+        let attrs = {
+            use winit::platform::wayland::WindowAttributesExtWayland;
+            attrs.with_name("ephemeris", "ephemeris")
+        };
 
         let window = Arc::new(
             event_loop
@@ -219,6 +232,17 @@ impl DesktopWindow {
     /// Returns the window's current scale factor (physical / logical pixels).
     pub fn scale_factor(&self) -> f64 {
         self.window.scale_factor()
+    }
+
+    /// Physical window size in pixels (for mapping touch → UI coordinates).
+    pub fn physical_size(&self) -> (u32, u32) {
+        let s = self.window.inner_size();
+        (s.width.max(1), s.height.max(1))
+    }
+
+    /// Logical buffer size the UI renders into.
+    pub fn logical_size(&self) -> (u32, u32) {
+        (self.width, self.height)
     }
 }
 

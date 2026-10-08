@@ -20,6 +20,8 @@ priority = "optional"
 depends = "libxkbcommon0, libwayland-client0"
 assets = [
     ["target/release/ephemeris", "usr/bin/ephemeris", "755"],
+    ["packaging/debian/ephemeris.desktop", "usr/share/applications/ephemeris.desktop", "644"],
+    ["packaging/debian/ephemeris.svg", "usr/share/icons/hicolor/scalable/apps/ephemeris.svg", "644"],
 ]
 
 [dev-dependencies]

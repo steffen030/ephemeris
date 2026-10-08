@@ -133,6 +133,13 @@ impl App {
     /// When `ics_paths` is set, calendar events are loaded from the listed `.ics`
     /// files and displayed in the agenda section.
     pub fn run_windowed(self) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let event_loop = EventLoop::new()?;
+        // Wayland cannot report the primary monitor before the window exists, so
+        // size from EPHEMERIS_SIZE=WxH or a PineNote-class default. Touch/pen
+        // coordinates are mapped to this UI size from the live window.
+        let (win_w, win_h) = probe_window_size();
+        tracing::info!("UI size (logical): {win_w}×{win_h}");
+
         // Load config — silently fall back to defaults if file is absent or malformed.
         let config = Config::load().unwrap_or_default();
         tracing::info!(
@@ -143,7 +150,7 @@ impl App {
             config.ics_urls.len()
         );
 
-        let ui = Rc::new(EphemerisUi::new(800, 600)?);
+        let ui = Rc::new(EphemerisUi::new(win_w, win_h)?);
         ui.set_page_title("Ephemeris");
         ui.apply_theme(&config.theme);
 
@@ -3652,9 +3659,25 @@ impl App {
             push_recordings,
         };
 
-        EventLoop::new()?.run_app(&mut handler)?;
+        event_loop.run_app(&mut handler)?;
         Ok(())
     }
+}
+
+/// Logical UI size: `EPHEMERIS_SIZE=WxH`, else PineNote portrait (1404×1872).
+fn probe_window_size() -> (u32, u32) {
+    if let Ok(raw) = std::env::var("EPHEMERIS_SIZE") {
+        if let Some((w, h)) = raw.split_once('x').or_else(|| raw.split_once('X')) {
+            if let (Ok(w), Ok(h)) = (w.trim().parse::<u32>(), h.trim().parse::<u32>()) {
+                if w >= 320 && h >= 320 {
+                    return (w, h);
+                }
+            }
+        }
+        tracing::warn!("Ignoring invalid EPHEMERIS_SIZE={raw:?} (expected e.g. 1404x1872)");
+    }
+    // PineNote panel is 1872×1404; portrait is the usual handheld orientation.
+    (1404, 1872)
 }
 
 // ── Winit ApplicationHandler ──────────────────────────────────────────────────
@@ -3695,6 +3718,136 @@ struct WinitHandler {
     download_active: Arc<AtomicBool>,
     /// Profile-filtered recording list refresh — called after transcription completes.
     push_recordings: Rc<dyn Fn()>,
+}
+
+impl WinitHandler {
+    /// Map a physical window position into UI logical coordinates.
+    ///
+    /// Normalises against the current physical window size so fullscreen /
+    /// letterboxed softbuffer present still lines up with Slint hit-testing.
+    fn map_to_ui(&self, physical: winit::dpi::PhysicalPosition<f64>) -> (f32, f32) {
+        let (ui_w, ui_h) = self.ui.size();
+        if let Some(d) = &self.display {
+            let (pw, ph) = d.physical_size();
+            let x = (physical.x / pw as f64) * ui_w as f64;
+            let y = (physical.y / ph as f64) * ui_h as f64;
+            (x as f32, y as f32)
+        } else {
+            (
+                (physical.x / self.scale) as f32,
+                (physical.y / self.scale) as f32,
+            )
+        }
+    }
+
+    fn handle_pointer_move(&mut self, lx: f32, ly: f32, pressure: f32) {
+        use ephemeris_ui::STATUS_BAR_H;
+        self.cursor_pos = (lx, ly);
+        self.ui.dispatch_pointer_moved(lx, ly);
+        if self.is_drawing && !self.ui.is_canvas_active() {
+            self.is_drawing = false;
+        }
+        if self.is_drawing {
+            let cy = ly - STATUS_BAR_H as f32;
+            if cy >= 0.0 {
+                self.ui.feed_input(
+                    &InputEvent::PenMove(PenSample {
+                        x: lx,
+                        y: cy,
+                        pressure,
+                        tilt: 0.0,
+                        in_range: true,
+                    }),
+                    now_ms(),
+                );
+            }
+        }
+        if let Some(d) = &self.display {
+            d.request_redraw();
+        }
+    }
+
+    fn handle_pointer_press(&mut self, lx: f32, ly: f32, pressure: f32) {
+        use ephemeris_ui::{STATUS_BAR_H, TOOLBAR_H};
+        let (_, ui_h) = self.ui.size();
+        self.cursor_pos = (lx, ly);
+        // Reset canvas-touch gate before dispatching so we can detect whether
+        // the canvas TouchArea (vs. chrome) got this press.
+        self.canvas_touch_down.set(false);
+        let canvas_was_active = self.ui.is_canvas_active();
+        self.ui.dispatch_pointer_pressed(lx, ly);
+        let in_canvas = ly > STATUS_BAR_H as f32 && ly < ui_h as f32 - TOOLBAR_H as f32;
+        if in_canvas
+            && !self.ctrl_held.get()
+            && canvas_was_active
+            && self.ui.is_canvas_active()
+            && self.canvas_touch_down.get()
+        {
+            self.is_drawing = true;
+            let cy = ly - STATUS_BAR_H as f32;
+            self.ui.feed_input(
+                &InputEvent::PenDown(PenSample {
+                    x: lx,
+                    y: cy,
+                    pressure,
+                    tilt: 0.0,
+                    in_range: true,
+                }),
+                now_ms(),
+            );
+        }
+        if let Some(d) = &self.display {
+            d.request_redraw();
+        }
+    }
+
+    fn handle_pointer_release(&mut self, lx: f32, ly: f32) {
+        use ephemeris_ui::STATUS_BAR_H;
+        self.cursor_pos = (lx, ly);
+        self.ui.dispatch_pointer_released(lx, ly);
+        if self.is_drawing {
+            self.is_drawing = false;
+            let cy = ly - STATUS_BAR_H as f32;
+            let update = self.ui.feed_input(
+                &InputEvent::PenUp(PenSample {
+                    x: lx,
+                    y: cy,
+                    pressure: 0.0,
+                    tilt: 0.0,
+                    in_range: true,
+                }),
+                now_ms(),
+            );
+            if matches!(update, InkUpdate::Finished { .. }) {
+                let page_idx = self.ui.current_page_idx();
+                let note_id = self
+                    .notes
+                    .borrow()
+                    .iter()
+                    .find(|n| n.page_index == page_idx)
+                    .map(|n| n.id);
+                if let Some(note_id) = note_id {
+                    let pixels = self.ui.get_committed_pixels();
+                    let (w, h) = self.ui.canvas_size();
+                    save_note_page(&self.data_dir, note_id, w, h, &pixels);
+                    if let Some(note) = self.notes.borrow_mut().iter_mut().find(|n| n.id == note_id)
+                    {
+                        note.updated_at = now_secs();
+                    }
+                    export_single_note_to_vault(
+                        &self.config.borrow(),
+                        &self.notes.borrow(),
+                        &self.notebooks.borrow(),
+                        &self.data_dir,
+                        note_id,
+                    );
+                }
+            }
+        }
+        if let Some(d) = &self.display {
+            d.request_redraw();
+        }
+    }
 }
 
 impl ApplicationHandler for WinitHandler {
@@ -3780,7 +3933,8 @@ impl ApplicationHandler for WinitHandler {
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        match DesktopWindow::new(event_loop, 800, 600) {
+        let (w, h) = self.ui.size();
+        match DesktopWindow::new(event_loop, w, h) {
             Ok(d) => {
                 self.scale = d.scale_factor();
                 d.request_redraw();
@@ -3794,9 +3948,6 @@ impl ApplicationHandler for WinitHandler {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        use ephemeris_ui::{STATUS_BAR_H, TOOLBAR_H};
-        const WINDOW_H: f32 = 600.0;
-
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
 
@@ -3823,32 +3974,8 @@ impl ApplicationHandler for WinitHandler {
             }
 
             WindowEvent::CursorMoved { position, .. } => {
-                let lx = (position.x / self.scale) as f32;
-                let ly = (position.y / self.scale) as f32;
-                self.cursor_pos = (lx, ly);
-                self.ui.dispatch_pointer_moved(lx, ly);
-                // Abort in-progress ink if an overlay took over mid-stroke.
-                if self.is_drawing && !self.ui.is_canvas_active() {
-                    self.is_drawing = false;
-                }
-                if self.is_drawing {
-                    let cy = ly - STATUS_BAR_H as f32;
-                    if cy >= 0.0 {
-                        self.ui.feed_input(
-                            &InputEvent::PenMove(PenSample {
-                                x: lx,
-                                y: cy,
-                                pressure: 0.6,
-                                tilt: 0.0,
-                                in_range: true,
-                            }),
-                            now_ms(),
-                        );
-                    }
-                }
-                if let Some(d) = &self.display {
-                    d.request_redraw();
-                }
+                let (lx, ly) = self.map_to_ui(position);
+                self.handle_pointer_move(lx, ly, 0.6);
             }
 
             WindowEvent::MouseInput {
@@ -3859,88 +3986,30 @@ impl ApplicationHandler for WinitHandler {
                 let (lx, ly) = self.cursor_pos;
                 match state {
                     winit::event::ElementState::Pressed => {
-                        // Reset canvas-touch gate before dispatching so we can
-                        // detect whether the canvas TouchArea (vs. a chrome
-                        // element like the burger button) got this press.  Slint
-                        // only routes PointerPressed to the topmost element at
-                        // the click position, so if the burger, ring, or nav
-                        // rail consumed the press, canvas_touch fires will stay
-                        // false and we skip the ink PenDown entirely.
-                        self.canvas_touch_down.set(false);
-                        // Snapshot canvas state before dispatch: an overlay
-                        // dismissed synchronously inside dispatch_pointer_pressed
-                        // would flip is_canvas_active() to true before we check,
-                        // causing a spurious dot when tapping to close an overlay.
-                        let canvas_was_active = self.ui.is_canvas_active();
-                        self.ui.dispatch_pointer_pressed(lx, ly);
-                        let in_canvas =
-                            ly > STATUS_BAR_H as f32 && ly < WINDOW_H - TOOLBAR_H as f32;
-                        if in_canvas
-                            && !self.ctrl_held.get()
-                            && canvas_was_active
-                            && self.ui.is_canvas_active()
-                            && self.canvas_touch_down.get()
-                        {
-                            self.is_drawing = true;
-                            let cy = ly - STATUS_BAR_H as f32;
-                            self.ui.feed_input(
-                                &InputEvent::PenDown(PenSample {
-                                    x: lx,
-                                    y: cy,
-                                    pressure: 0.8,
-                                    tilt: 0.0,
-                                    in_range: true,
-                                }),
-                                now_ms(),
-                            );
-                        }
+                        self.handle_pointer_press(lx, ly, 0.8);
                     }
                     winit::event::ElementState::Released => {
-                        self.ui.dispatch_pointer_released(lx, ly);
-                        if self.is_drawing {
-                            self.is_drawing = false;
-                            let cy = ly - STATUS_BAR_H as f32;
-                            let update = self.ui.feed_input(
-                                &InputEvent::PenUp(PenSample {
-                                    x: lx,
-                                    y: cy,
-                                    pressure: 0.0,
-                                    tilt: 0.0,
-                                    in_range: true,
-                                }),
-                                now_ms(),
-                            );
-                            if matches!(update, InkUpdate::Finished { .. }) {
-                                let page_idx = self.ui.current_page_idx();
-                                let note_id = self
-                                    .notes
-                                    .borrow()
-                                    .iter()
-                                    .find(|n| n.page_index == page_idx)
-                                    .map(|n| n.id);
-                                if let Some(note_id) = note_id {
-                                    let pixels = self.ui.get_committed_pixels();
-                                    let (w, h) = self.ui.canvas_size();
-                                    save_note_page(&self.data_dir, note_id, w, h, &pixels);
-                                    if let Some(note) =
-                                        self.notes.borrow_mut().iter_mut().find(|n| n.id == note_id)
-                                    {
-                                        note.updated_at = now_secs();
-                                    }
-                                    export_single_note_to_vault(
-                                        &self.config.borrow(),
-                                        &self.notes.borrow(),
-                                        &self.notebooks.borrow(),
-                                        &self.data_dir,
-                                        note_id,
-                                    );
-                                }
-                            }
-                        }
+                        self.handle_pointer_release(lx, ly);
                     }
                 }
-                if let Some(d) = &self.display {
-                    d.request_redraw();
+            }
+
+            // PineNote / Wayland: stylus and finger contacts arrive as Touch,
+            // not MouseInput. Without this the UI never sees pen or touch.
+            WindowEvent::Touch(touch) => {
+                use winit::event::TouchPhase;
+                let (lx, ly) = self.map_to_ui(touch.location);
+                let pressure = touch
+                    .force
+                    .map(|f| f.normalized() as f32)
+                    .unwrap_or(0.8)
+                    .clamp(0.05, 1.0);
+                match touch.phase {
+                    TouchPhase::Started => self.handle_pointer_press(lx, ly, pressure),
+                    TouchPhase::Moved => self.handle_pointer_move(lx, ly, pressure),
+                    TouchPhase::Ended | TouchPhase::Cancelled => {
+                        self.handle_pointer_release(lx, ly);
+                    }
                 }
             }
 

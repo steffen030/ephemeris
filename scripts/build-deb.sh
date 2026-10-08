@@ -25,9 +25,19 @@ if [[ ! -f "$BINARY" ]]; then
 fi
 
 DEB_ROOT="$STAGE/${PKG_NAME}_${VERSION}_${ARCH}"
-mkdir -p "$DEB_ROOT/DEBIAN" "$DEB_ROOT/usr/bin"
+mkdir -p "$DEB_ROOT/DEBIAN" \
+         "$DEB_ROOT/usr/bin" \
+         "$DEB_ROOT/usr/share/applications" \
+         "$DEB_ROOT/usr/share/icons/hicolor/scalable/apps"
 
 install -m 0755 "$BINARY" "$DEB_ROOT/usr/bin/ephemeris"
+install -m 0644 "$ROOT/packaging/debian/ephemeris.desktop" \
+  "$DEB_ROOT/usr/share/applications/ephemeris.desktop"
+
+if [[ -f "$ROOT/packaging/debian/ephemeris.svg" ]]; then
+  install -m 0644 "$ROOT/packaging/debian/ephemeris.svg" \
+    "$DEB_ROOT/usr/share/icons/hicolor/scalable/apps/ephemeris.svg"
+fi
 
 sed "s/@VERSION@/${VERSION}/g" "$ROOT/packaging/debian/control.in" \
   > "$DEB_ROOT/DEBIAN/control"

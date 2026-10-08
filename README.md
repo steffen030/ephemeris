@@ -18,8 +18,8 @@ APIs, UI, and on-disk formats will still change.
 | Agenda | Day / week / month views fed by ICS HTTPS / local calendar feeds |
 | Tasks | Local tasks + Obsidian markdown task extract / write-back |
 | Obsidian | Vault browse, FTS note search, export notes as PDF + markdown into the vault |
-| Desktop | Runs on Linux/macOS via winit + Slint software renderer (dev / smoke testing) |
-| Device packaging | `arm64` `.deb` built in CI; signed apt tree published on the `gh-pages` branch |
+| Desktop / device shell | Fullscreen Wayland window (winit + softbuffer); touch and pen via `WindowEvent::Touch` |
+| Device packaging | `arm64` `.deb` with `.desktop` launcher entry; signed apt repo on GitHub Pages |
 
 ## Not there yet
 
