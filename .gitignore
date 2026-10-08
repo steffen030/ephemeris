@@ -12,3 +12,6 @@
 # Git worktrees (local development branches)
 .worktree/
 
+
+# Local packaging output
+/dist/

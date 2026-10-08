@@ -1,0 +1,169 @@
+name: Release
+
+on:
+  workflow_call:
+    inputs:
+      tag_name:
+        description: Git tag created by release-please (e.g. v0.2.0)
+        required: true
+        type: string
+      version:
+        description: Semver without leading v
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: Git tag (e.g. v0.2.0)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-publish
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build-deb:
+    name: Build aarch64 .deb
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      deb_name: ${{ steps.meta.outputs.deb_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag_name }}
+
+      - name: Resolve version
+        id: meta
+        run: |
+          TAG='${{ inputs.tag_name }}'
+          VERSION='${{ inputs.version }}'
+          if [ -z "$VERSION" ] || [ "$VERSION" = '' ]; then
+            VERSION="${TAG#v}"
+          fi
+          # Guard against empty major.minor.patch from a partial release-please output
+          if [ -z "$VERSION" ] || [ "$VERSION" = '..' ]; then
+            VERSION="${TAG#v}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "deb_name=ephemeris_${VERSION}_arm64.deb" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-aarch64
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Cross-build release binary
+        run: cross build --target aarch64-unknown-linux-gnu -p ephemeris-app --release
+
+      - name: Install dpkg tools
+        run: sudo apt-get update -q && sudo apt-get install -y dpkg-dev
+
+      - name: Build .deb
+        run: |
+          chmod +x scripts/build-deb.sh
+          scripts/build-deb.sh \
+            target/aarch64-unknown-linux-gnu/release/ephemeris \
+            "${{ steps.meta.outputs.version }}" \
+            dist
+
+      - name: Upload release assets to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag_name }}
+          files: |
+            target/aarch64-unknown-linux-gnu/release/ephemeris
+            dist/${{ steps.meta.outputs.deb_name }}
+          fail_on_unmatched_files: true
+
+      - name: Upload deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ephemeris-deb
+          path: dist/${{ steps.meta.outputs.deb_name }}
+          if-no-files-found: error
+
+  apt-repo:
+    name: Publish signed apt repo
+    needs: build-deb
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download deb artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ephemeris-deb
+          path: dist
+
+      - name: Install apt tooling
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y dpkg-dev gnupg
+
+      - name: Checkout existing gh-pages tree
+        id: pages
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: apt-site
+
+      - name: Prepare apt-site
+        run: |
+          set -euo pipefail
+          if [ ! -d apt-site ]; then
+            mkdir -p apt-site
+          fi
+          rm -rf apt-site/.git
+          cat > apt-site/index.html <<'HTML'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head><meta charset="utf-8"><title>Ephemeris apt repository</title></head>
+          <body>
+          <h1>Ephemeris apt repository</h1>
+          <p>See <a href="https://github.com/steffen030/ephemeris/blob/main/docs/releasing.md">docs/releasing.md</a> for PineNote setup.</p>
+          </body>
+          </html>
+          HTML
+
+      - name: Rebuild and sign apt repo
+        env:
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+          APT_GPG_NAME: ${{ vars.APT_GPG_NAME }}
+        run: |
+          set -euo pipefail
+          if [ -z "${APT_GPG_PRIVATE_KEY:-}" ]; then
+            echo "::error::APT_GPG_PRIVATE_KEY secret is not configured"
+            exit 1
+          fi
+          export APT_GPG_NAME="${APT_GPG_NAME:-apt@ephemeris.local}"
+          chmod +x scripts/publish-apt-repo.sh
+          scripts/publish-apt-repo.sh \
+            apt-site \
+            "dist/${{ needs.build-deb.outputs.deb_name }}" \
+            stable
+
+      - name: Publish to GitHub Pages (gh-pages)
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./apt-site
+          force_orphan: false

@@ -1,7 +1,8 @@
 .PHONY: help run dev build release check test clippy fmt fmt-check clean doc doc-open \
         build-all build-core build-pal build-ui build-app deps cargo-update \
         test-all test-core test-pal test-ui test-app \
-        run-release run-dev-trace get-size coverage profile lint-all
+        run-release run-dev-trace get-size coverage profile lint-all \
+        build-aarch64 deb-aarch64
 
 CARGO := cargo
 CORE_FEATURES := fs,sqlite,ics
@@ -51,6 +52,10 @@ help:
 	@echo "Documentation:"
 	@echo "  doc             - Build documentation (no deps)"
 	@echo "  doc-open        - Build and open documentation in browser"
+	@echo ""
+	@echo "Packaging (PineNote / aarch64):"
+	@echo "  build-aarch64   - Cross-build release binary for aarch64-linux"
+	@echo "  deb-aarch64     - Build arm64 .deb from aarch64 release binary"
 	@echo ""
 	@echo "Maintenance:"
 	@echo "  clean           - Remove build artifacts"
@@ -195,3 +200,19 @@ profile:
 
 # Aliases
 .PHONY: build-release _fmt
+
+# Packaging for PineNote (aarch64 / arm64 .deb)
+AARCH64_TARGET := aarch64-unknown-linux-gnu
+AARCH64_BIN := $(TARGET_DIR)/$(AARCH64_TARGET)/release/ephemeris
+VERSION ?= $(shell sed -n '/\[workspace.package\]/,/^\[/ s/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+DIST_DIR := dist
+
+build-aarch64:
+	@echo "🔨 Cross-building ephemeris for $(AARCH64_TARGET)..."
+	@cross build --target $(AARCH64_TARGET) -p ephemeris-app --release
+
+deb-aarch64: build-aarch64
+	@echo "📦 Building arm64 .deb (version $(VERSION))..."
+	@mkdir -p $(DIST_DIR)
+	@chmod +x scripts/build-deb.sh
+	@scripts/build-deb.sh $(AARCH64_BIN) $(VERSION) $(DIST_DIR)
