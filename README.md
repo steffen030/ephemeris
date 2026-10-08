@@ -18,7 +18,7 @@ APIs, UI, and on-disk formats will still change.
 | Agenda | Day / week / month views fed by ICS HTTPS / local calendar feeds |
 | Tasks | Local tasks + Obsidian markdown task extract / write-back |
 | Obsidian | Vault browse, FTS note search, export notes as PDF + markdown into the vault |
-| Desktop / device shell | Fullscreen Wayland window (winit + softbuffer); touch and pen via `WindowEvent::Touch` |
+| Desktop / device shell | Maximized Wayland window (winit + softbuffer); design-scaled UI; finger via `Touch`, pen via Linux evdev |
 | Device packaging | `arm64` `.deb` with `.desktop` launcher entry; signed apt repo on GitHub Pages |
 
 ## Not there yet
@@ -82,6 +82,18 @@ echo "deb [signed-by=/usr/share/keyrings/ephemeris-archive-keyring.gpg arch=arm6
 
 sudo apt update && sudo apt install ephemeris
 ```
+
+**PineNote pen access:** the stylus is read from `/dev/input/event*`. Your user
+must be able to open those nodes (usually membership in the `input` group):
+
+```bash
+sudo usermod -aG input "$USER"
+# log out and back in, then relaunch Ephemeris
+```
+
+Optional: `EPHEMERIS_SIZE=WxH` overrides the design UI resolution (default
+`800x1067`, upscaled to the panel). `EPHEMERIS_GRAB_PEN=1` takes exclusive
+evdev grab of the digitiser.
 
 The public keyring also lives in-tree at
 [`packaging/keys/`](packaging/keys/). Full release and packaging notes:

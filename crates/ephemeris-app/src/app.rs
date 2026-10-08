@@ -11,6 +11,8 @@ use ephemeris_core::{
     ProfileId, RasterOcrTranscriber, RasterPage, SearchHit, Task, TaskPriority, TaskProvider,
     Transcriber, VaultFtsIndex, VaultNoteExport,
 };
+#[cfg(target_os = "linux")]
+use ephemeris_pal::input::{EvdevPenSource, PenTarget};
 use ephemeris_pal::input::{InputEvent, PenSample};
 use slint::{Global, Model};
 use std::cell::{Cell, RefCell};
@@ -32,6 +34,13 @@ use winit::window::WindowId;
 
 use ephemeris_pal::display::DesktopWindow;
 use ephemeris_ui::EphemerisUi;
+
+/// Wakes the event loop when the Linux evdev pen thread has samples ready.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // constructed only on Linux via evdev pen wake
+enum AppUserEvent {
+    PenReady,
+}
 
 /// Commands from UI to async core.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,12 +142,12 @@ impl App {
     /// When `ics_paths` is set, calendar events are loaded from the listed `.ics`
     /// files and displayed in the agenda section.
     pub fn run_windowed(self) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let event_loop = EventLoop::new()?;
-        // Wayland cannot report the primary monitor before the window exists, so
-        // size from EPHEMERIS_SIZE=WxH or a PineNote-class default. Touch/pen
-        // coordinates are mapped to this UI size from the live window.
+        let event_loop = EventLoop::<AppUserEvent>::with_user_event().build()?;
+        // Design-resolution UI (not native panel pixels). Softbuffer upscales to
+        // the maximized physical window so chrome/icons stay usable on PineNote.
+        // Override with EPHEMERIS_SIZE=WxH when needed.
         let (win_w, win_h) = probe_window_size();
-        tracing::info!("UI size (logical): {win_w}×{win_h}");
+        tracing::info!("UI size (design): {win_w}×{win_h}");
 
         // Load config — silently fall back to defaults if file is absent or malformed.
         let config = Config::load().unwrap_or_default();
@@ -3635,6 +3644,25 @@ impl App {
             });
         }
 
+        #[cfg(target_os = "linux")]
+        let pen_source = {
+            let proxy = event_loop.create_proxy();
+            let wake: ephemeris_pal::input::PenWake = Arc::new(move || {
+                let _ = proxy.send_event(AppUserEvent::PenReady);
+            });
+            let target = PenTarget::new(win_w, win_h);
+            match EvdevPenSource::spawn(target, Some(wake)) {
+                Some(src) => {
+                    tracing::info!("evdev pen source active");
+                    Some(src)
+                }
+                None => {
+                    tracing::info!("no evdev pen device found; finger/mouse only");
+                    None
+                }
+            }
+        };
+
         let mut handler = WinitHandler {
             _rt: self.rt,
             ui,
@@ -3657,6 +3685,8 @@ impl App {
             download_result,
             download_active,
             push_recordings,
+            #[cfg(target_os = "linux")]
+            pen_source,
         };
 
         event_loop.run_app(&mut handler)?;
@@ -3664,7 +3694,8 @@ impl App {
     }
 }
 
-/// Logical UI size: `EPHEMERIS_SIZE=WxH`, else PineNote portrait (1404×1872).
+/// Design UI size: `EPHEMERIS_SIZE=WxH`, else ~½ PineNote portrait so chrome
+/// upscales to ~1.75× on a 1404×1872 panel (icons/text readable on e-ink).
 fn probe_window_size() -> (u32, u32) {
     if let Ok(raw) = std::env::var("EPHEMERIS_SIZE") {
         if let Some((w, h)) = raw.split_once('x').or_else(|| raw.split_once('X')) {
@@ -3674,10 +3705,10 @@ fn probe_window_size() -> (u32, u32) {
                 }
             }
         }
-        tracing::warn!("Ignoring invalid EPHEMERIS_SIZE={raw:?} (expected e.g. 1404x1872)");
+        tracing::warn!("Ignoring invalid EPHEMERIS_SIZE={raw:?} (expected e.g. 800x1067)");
     }
-    // PineNote panel is 1872×1404; portrait is the usual handheld orientation.
-    (1404, 1872)
+    // Keep PineNote portrait aspect (1404∶1872 ≈ 3∶4).
+    (800, 1067)
 }
 
 // ── Winit ApplicationHandler ──────────────────────────────────────────────────
@@ -3718,12 +3749,15 @@ struct WinitHandler {
     download_active: Arc<AtomicBool>,
     /// Profile-filtered recording list refresh — called after transcription completes.
     push_recordings: Rc<dyn Fn()>,
+    /// Linux: separate digitiser (PineNote pen) via `/dev/input` — not wl_touch.
+    #[cfg(target_os = "linux")]
+    pen_source: Option<EvdevPenSource>,
 }
 
 impl WinitHandler {
     /// Map a physical window position into UI logical coordinates.
     ///
-    /// Normalises against the current physical window size so fullscreen /
+    /// Normalises against the current physical window size so maximized /
     /// letterboxed softbuffer present still lines up with Slint hit-testing.
     fn map_to_ui(&self, physical: winit::dpi::PhysicalPosition<f64>) -> (f32, f32) {
         let (ui_w, ui_h) = self.ui.size();
@@ -3771,6 +3805,10 @@ impl WinitHandler {
         use ephemeris_ui::{STATUS_BAR_H, TOOLBAR_H};
         let (_, ui_h) = self.ui.size();
         self.cursor_pos = (lx, ly);
+        // Bring the window forward so GNOME/Phosh dismisses the swipe-down panel.
+        if let Some(d) = &self.display {
+            d.focus();
+        }
         // Reset canvas-touch gate before dispatching so we can detect whether
         // the canvas TouchArea (vs. chrome) got this press.
         self.canvas_touch_down.set(false);
@@ -3848,10 +3886,46 @@ impl WinitHandler {
             d.request_redraw();
         }
     }
+
+    /// Drain Linux evdev pen samples into the same pointer/ink paths as touch.
+    #[cfg(target_os = "linux")]
+    fn drain_pen_events(&mut self) {
+        let Some(src) = &self.pen_source else {
+            return;
+        };
+        let events: Vec<InputEvent> = src.try_iter().collect();
+        for ev in events {
+            match ev {
+                InputEvent::PenDown(s) => self.handle_pointer_press(s.x, s.y, s.pressure),
+                InputEvent::PenMove(s) => self.handle_pointer_move(s.x, s.y, s.pressure),
+                InputEvent::PenUp(s) => self.handle_pointer_release(s.x, s.y),
+                InputEvent::PenButton { pressed } => {
+                    // Side button ≈ Ctrl (opens tool ring / modifier paths).
+                    self.ctrl_held.set(pressed);
+                }
+                InputEvent::Hover { x, y } => {
+                    self.cursor_pos = (x, y);
+                    self.ui.dispatch_pointer_moved(x, y);
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
-impl ApplicationHandler for WinitHandler {
+impl ApplicationHandler<AppUserEvent> for WinitHandler {
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: AppUserEvent) {
+        match event {
+            AppUserEvent::PenReady => {
+                #[cfg(target_os = "linux")]
+                self.drain_pen_events();
+            }
+        }
+    }
+
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(target_os = "linux")]
+        self.drain_pen_events();
         // --- Drain whisper download result ---
         if let Ok(mut guard) = self.download_result.lock() {
             if let Some(result) = guard.take() {

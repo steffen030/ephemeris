@@ -27,6 +27,7 @@ softbuffer = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 wayland-client = { version = "0.31", optional = true }
 wayland-protocols = { version = "0.32", features = ["client", "unstable"], optional = true }
+evdev = { workspace = true }
 
 [dev-dependencies]
 # nothing extra needed; mock backend is in src/input/mock.rs behind #[cfg(feature="mock")]

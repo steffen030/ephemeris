@@ -26,8 +26,14 @@ pub mod mock;
 pub mod palm;
 pub mod wayland;
 
+#[cfg(target_os = "linux")]
+pub mod evdev_pen;
+
 pub use palm::{PalmRejector, PalmRejectorConfig};
 pub use wayland::WaylandInput;
+
+#[cfg(target_os = "linux")]
+pub use evdev_pen::{EvdevPenSource, PenTarget, PenWake};
 
 use crossbeam_channel::Receiver;
 use thiserror::Error;

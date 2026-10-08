@@ -56,5 +56,8 @@ chrono-tz = "0.10"
 cpal = "0.15"
 hound = "3.5"
 
+# Linux stylus / digitiser access (PineNote pen via /dev/input)
+evdev = "0.13"
+
 # HTTP client (opt-in; used by the `ics` feature for HTTPS feed fetch)
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }

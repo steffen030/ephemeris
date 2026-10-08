@@ -161,14 +161,13 @@ impl DesktopWindow {
         use winit::dpi::LogicalSize;
         use winit::window::Window;
 
-        use winit::window::Fullscreen;
-
         let attrs = Window::default_attributes()
             .with_title("Ephemeris")
             .with_inner_size(LogicalSize::new(width, height))
-            // Borderless fullscreen is the right mode for e-ink shells (Phosh /
-            // GNOME on PineNote). Exclusive mode is unsupported on Wayland.
-            .with_fullscreen(Some(Fullscreen::Borderless(None)))
+            // Maximized (not borderless-fullscreen) so GNOME/Phosh can dismiss
+            // the top panel when the user taps back into the app. Softbuffer
+            // still fills the physical surface via nearest-neighbour upscale.
+            .with_maximized(true)
             .with_resizable(true);
 
         // Wayland app_id must match StartupWMClass in the .desktop file so the
@@ -227,6 +226,11 @@ impl DesktopWindow {
     /// Ask the OS to schedule a redraw (triggers `WindowEvent::RedrawRequested`).
     pub fn request_redraw(&self) {
         self.window.request_redraw();
+    }
+
+    /// Request keyboard/pointer focus so the shell dismisses the top panel.
+    pub fn focus(&self) {
+        self.window.focus_window();
     }
 
     /// Returns the window's current scale factor (physical / logical pixels).
