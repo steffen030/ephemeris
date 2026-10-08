@@ -69,19 +69,17 @@ make deb-aarch64
 
 Release artifacts are attached to [GitHub Releases](https://github.com/steffen030/ephemeris/releases)
 (`ephemeris` binary + `ephemeris_*_arm64.deb`). A GPG-signed apt repository is
-published on the `gh-pages` branch after each release.
+published to GitHub Pages after each release:
 
-**Hosting caveat:** GitHub Pages (`*.github.io`) is only available for this
-project if the repository is public (or you have a plan that includes private
-Pages). Until then, install the `.deb` from the release assets, or point apt at
-another host of the `gh-pages` tree.
+**https://steffen030.github.io/ephemeris/**
 
 ```bash
-# Example once a public HTTPS apt root is available (Pages or mirror):
-curl -fsSL https://<apt-host>/ephemeris-archive-keyring.gpg \
+curl -fsSL https://steffen030.github.io/ephemeris/ephemeris-archive-keyring.gpg \
   | sudo tee /usr/share/keyrings/ephemeris-archive-keyring.gpg >/dev/null
-echo "deb [signed-by=/usr/share/keyrings/ephemeris-archive-keyring.gpg arch=arm64] https://<apt-host> stable main" \
+
+echo "deb [signed-by=/usr/share/keyrings/ephemeris-archive-keyring.gpg arch=arm64] https://steffen030.github.io/ephemeris stable main" \
   | sudo tee /etc/apt/sources.list.d/ephemeris.list
+
 sudo apt update && sudo apt install ephemeris
 ```
 
