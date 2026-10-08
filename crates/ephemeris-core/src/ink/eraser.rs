@@ -204,7 +204,10 @@ mod tests {
     fn pen_down_on_stroke_emits_hit() {
         let mut e = engine();
         let stroke = stroke_at(10.0, 10.0, 20.0, 20.0);
-        let out = e.update(&InputEvent::PenDown(pen(15.0, 15.0)), std::slice::from_ref(&stroke));
+        let out = e.update(
+            &InputEvent::PenDown(pen(15.0, 15.0)),
+            std::slice::from_ref(&stroke),
+        );
         match out {
             EraserUpdate::Hit { ids, damage } => {
                 assert_eq!(ids, vec![stroke.id]);
@@ -218,8 +221,14 @@ mod tests {
     fn pen_move_erases_nearby_stroke() {
         let mut e = engine();
         let stroke = stroke_at(50.0, 50.0, 60.0, 60.0);
-        e.update(&InputEvent::PenDown(pen(0.0, 0.0)), std::slice::from_ref(&stroke));
-        let out = e.update(&InputEvent::PenMove(pen(55.0, 55.0)), std::slice::from_ref(&stroke));
+        e.update(
+            &InputEvent::PenDown(pen(0.0, 0.0)),
+            std::slice::from_ref(&stroke),
+        );
+        let out = e.update(
+            &InputEvent::PenMove(pen(55.0, 55.0)),
+            std::slice::from_ref(&stroke),
+        );
         match out {
             EraserUpdate::Hit { ids, .. } => assert_eq!(ids, vec![stroke.id]),
             other => panic!("expected Hit, got {other:?}"),
@@ -231,9 +240,15 @@ mod tests {
         let mut e = engine();
         let stroke = stroke_at(10.0, 10.0, 20.0, 20.0);
         // First hit at PenDown.
-        e.update(&InputEvent::PenDown(pen(15.0, 15.0)), std::slice::from_ref(&stroke));
+        e.update(
+            &InputEvent::PenDown(pen(15.0, 15.0)),
+            std::slice::from_ref(&stroke),
+        );
         // Second hit at same position: stroke already erased this gesture.
-        let out = e.update(&InputEvent::PenMove(pen(15.0, 15.0)), std::slice::from_ref(&stroke));
+        let out = e.update(
+            &InputEvent::PenMove(pen(15.0, 15.0)),
+            std::slice::from_ref(&stroke),
+        );
         assert_eq!(out, EraserUpdate::Idle);
     }
 
@@ -287,8 +302,14 @@ mod tests {
     fn stroke_far_away_not_hit() {
         let mut e = engine();
         let stroke = stroke_at(200.0, 200.0, 210.0, 210.0);
-        e.update(&InputEvent::PenDown(pen(0.0, 0.0)), std::slice::from_ref(&stroke));
-        let out = e.update(&InputEvent::PenUp(pen(0.0, 0.0)), std::slice::from_ref(&stroke));
+        e.update(
+            &InputEvent::PenDown(pen(0.0, 0.0)),
+            std::slice::from_ref(&stroke),
+        );
+        let out = e.update(
+            &InputEvent::PenUp(pen(0.0, 0.0)),
+            std::slice::from_ref(&stroke),
+        );
         match out {
             EraserUpdate::Finished { ids, .. } => assert!(ids.is_empty()),
             other => panic!("expected Finished, got {other:?}"),
@@ -300,8 +321,14 @@ mod tests {
         let mut e = engine();
         let stroke = stroke_at(10.0, 10.0, 30.0, 30.0);
         let id = stroke.id;
-        e.update(&InputEvent::PenDown(pen(20.0, 20.0)), std::slice::from_ref(&stroke));
-        let out = e.update(&InputEvent::PenUp(pen(20.0, 20.0)), std::slice::from_ref(&stroke));
+        e.update(
+            &InputEvent::PenDown(pen(20.0, 20.0)),
+            std::slice::from_ref(&stroke),
+        );
+        let out = e.update(
+            &InputEvent::PenUp(pen(20.0, 20.0)),
+            std::slice::from_ref(&stroke),
+        );
         match out {
             EraserUpdate::Finished { ids, damage } => {
                 assert_eq!(ids, vec![id]);

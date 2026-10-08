@@ -41,12 +41,7 @@ impl TaskCache {
     }
 
     /// Load all tasks from a source (replaces previous tasks from that source).
-    pub fn load_from_source(
-        &mut self,
-        source: &str,
-        profile_id: ProfileId,
-        tasks: Vec<Task>,
-    ) {
+    pub fn load_from_source(&mut self, source: &str, profile_id: ProfileId, tasks: Vec<Task>) {
         // Remove old tasks from this source/profile
         let ids_to_remove: Vec<_> = self
             .tasks
@@ -91,17 +86,14 @@ impl TaskCache {
     /// Get all tasks for a profile.
     pub fn list_for_profile(&self, profile_id: ProfileId) -> Vec<Task> {
         let all = self.list_all();
-        all.into_iter().filter(|t| t.profile_id == profile_id).collect()
+        all.into_iter()
+            .filter(|t| t.profile_id == profile_id)
+            .collect()
     }
 
     /// Get all open (not done) tasks.
     pub fn list_open(&self) -> Vec<Task> {
-        let mut tasks: Vec<_> = self
-            .tasks
-            .values()
-            .filter(|t| !t.done)
-            .cloned()
-            .collect();
+        let mut tasks: Vec<_> = self.tasks.values().filter(|t| !t.done).cloned().collect();
         tasks.sort_by(|a, b| {
             use crate::TaskPriority::*;
             let a_pri = match a.priority {

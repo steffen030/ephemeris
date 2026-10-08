@@ -20,7 +20,7 @@
 //! caller is responsible for adding the canvas Y-offset before calling.
 
 use ephemeris_core::ink::WidthConfig;
-use ephemeris_core::model::{Point, Stroke};
+use ephemeris_core::model::{Point, Stroke, Tool};
 use ephemeris_pal::display::PixelBuf;
 
 // ── Canvas bounds helper ──────────────────────────────────────────────────────
@@ -51,6 +51,11 @@ struct CanvasBounds {
 /// a full-width canvas).  Points in the stroke are canvas-relative; they are
 /// offset before stamping so they land in the correct buffer rows.
 ///
+/// The stroke's [`Tool`] determines rendering:
+/// * [`Tool::Pen`]         — black (0), min-blend (only darkens)
+/// * [`Tool::Highlighter`] — mid-gray (160), min-blend (dark ink preserved)
+/// * [`Tool::Eraser`]      — white (255), overwrite-blend (lightens ink)
+///
 /// Strokes outside the canvas clip region are silently clipped.
 pub fn rasterize_stroke(
     buf: &mut PixelBuf,
@@ -68,13 +73,15 @@ pub fn rasterize_stroke(
         canvas_y0,
         canvas_w,
         canvas_h,
+        stroke.tool,
     );
 }
 
 /// Rasterize an in-progress (uncommitted) list of [`Point`]s into `buf`.
 ///
 /// Used during live drawing before the stroke is finalised.  Parameters are
-/// the same as [`rasterize_stroke`].
+/// the same as [`rasterize_stroke`].  `tool` controls how pixels are blended
+/// (see [`rasterize_stroke`] for per-tool semantics).
 pub fn rasterize_points(
     buf: &mut PixelBuf,
     points: &[Point],
@@ -83,6 +90,7 @@ pub fn rasterize_points(
     canvas_y0: u32,
     canvas_w: u32,
     canvas_h: u32,
+    tool: Tool,
 ) {
     let bounds = CanvasBounds {
         x0: canvas_x0,
@@ -95,7 +103,7 @@ pub fn rasterize_points(
         // Single-point tap: stamp a dot at the point location.
         if let Some(p) = points.first() {
             let hw = WIDTHS.width_for(base_width, p.pressure) * 0.5;
-            stamp_dot(buf, p.x, p.y, hw, bounds);
+            stamp_dot(buf, p.x, p.y, hw, bounds, tool);
         }
         return;
     }
@@ -110,7 +118,7 @@ pub fn rasterize_points(
             by: b.y,
             hw_b: WIDTHS.width_for(base_width, b.pressure) * 0.5,
         };
-        draw_segment(buf, &seg, bounds);
+        draw_segment(buf, &seg, bounds, tool);
     }
 }
 
@@ -142,11 +150,11 @@ struct Segment {
 ///
 /// Iterates over every pixel in the segment's bounding box (clamped to the
 /// canvas).  For each pixel centre `(px, py)` it computes the closest point
-/// on the segment, interpolates the half-width at that point, and writes black
-/// (0) if the pixel is within the interpolated radius.
+/// on the segment, interpolates the half-width at that point, and stamps the
+/// pixel according to `tool`.
 ///
 /// All coordinates are canvas-relative.
-fn draw_segment(buf: &mut PixelBuf, seg: &Segment, bounds: CanvasBounds) {
+fn draw_segment(buf: &mut PixelBuf, seg: &Segment, bounds: CanvasBounds, tool: Tool) {
     let Segment {
         ax,
         ay,
@@ -210,6 +218,7 @@ fn draw_segment(buf: &mut PixelBuf, seg: &Segment, bounds: CanvasBounds) {
                     coverage,
                     buf.width,
                     buf.height,
+                    tool,
                 );
             }
         }
@@ -217,7 +226,7 @@ fn draw_segment(buf: &mut PixelBuf, seg: &Segment, bounds: CanvasBounds) {
 }
 
 /// Stamp a filled circle (dot) at a canvas-relative `(cx, cy)` with radius `r`.
-fn stamp_dot(buf: &mut PixelBuf, cx: f32, cy: f32, r: f32, bounds: CanvasBounds) {
+fn stamp_dot(buf: &mut PixelBuf, cx: f32, cy: f32, r: f32, bounds: CanvasBounds, tool: Tool) {
     let min_x = (cx - r - 1.0).max(0.0).floor() as u32;
     let min_y = (cy - r - 1.0).max(0.0).floor() as u32;
     let max_x = (cx + r + 1.0).min(bounds.w as f32 - 1.0).ceil() as u32;
@@ -239,23 +248,47 @@ fn stamp_dot(buf: &mut PixelBuf, cx: f32, cy: f32, r: f32, bounds: CanvasBounds)
                     coverage,
                     buf.width,
                     buf.height,
+                    tool,
                 );
             }
         }
     }
 }
 
-/// Write a single pixel with anti-aliased `coverage` (1.0 = fully black).
-///
-/// Uses `min()` blend so dark ink always wins over a white background.
+/// Write a single pixel with anti-aliased `coverage`, tool-specific blend:
+/// * [`Tool::Pen`]         — lerp toward 0 (black), min-blend (never lightens)
+/// * [`Tool::Highlighter`] — lerp toward 160 (gray), min-blend (preserves dark ink)
+/// * [`Tool::Eraser`]      — lerp toward 255 (white), overwrite (lightens ink)
 #[inline]
-fn stamp_pixel(buf: &mut PixelBuf, bx: u32, by: u32, coverage: f32, buf_w: u32, buf_h: u32) {
+fn stamp_pixel(
+    buf: &mut PixelBuf,
+    bx: u32,
+    by: u32,
+    coverage: f32,
+    buf_w: u32,
+    buf_h: u32,
+    tool: Tool,
+) {
     if bx < buf_w && by < buf_h {
         let idx = (by * buf.stride + bx) as usize;
         let existing = buf.data[idx] as f32;
-        // Linear interpolation toward black (0) at the given coverage.
-        let new_val = existing * (1.0 - coverage);
-        buf.data[idx] = new_val.round() as u8;
+        match tool {
+            Tool::Pen => {
+                let new_val = existing * (1.0 - coverage); // lerp toward 0
+                buf.data[idx] = buf.data[idx].min(new_val.round() as u8);
+            }
+            Tool::Highlighter => {
+                const HIGHLIGHT_GRAY: f32 = 160.0;
+                let new_val = existing + (HIGHLIGHT_GRAY - existing) * coverage;
+                // min-blend: never lighten existing dark ink from pen strokes
+                buf.data[idx] = buf.data[idx].min(new_val.round() as u8);
+            }
+            Tool::Eraser => {
+                // Lerp toward white (255); overwrite so ink can be removed.
+                let new_val = existing + (255.0 - existing) * coverage;
+                buf.data[idx] = new_val.round() as u8;
+            }
+        }
     }
 }
 

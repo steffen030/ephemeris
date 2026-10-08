@@ -15,10 +15,38 @@ impl ProfileManager {
         }
     }
 
+    /// Insert a pre-built profile (used when restoring from disk).
+    pub fn load_profile(&self, profile: Profile) {
+        self.profiles.lock().unwrap().push(profile);
+    }
+
     pub fn create_profile(&self, name: impl Into<String>) -> crate::Result<Profile> {
         let profile = Profile::new(name);
         self.profiles.lock().unwrap().push(profile.clone());
         Ok(profile)
+    }
+
+    pub fn create_profile_with_icon(
+        &self,
+        name: impl Into<String>,
+        icon: impl Into<String>,
+    ) -> crate::Result<Profile> {
+        let profile = Profile::new(name).with_icon(icon);
+        self.profiles.lock().unwrap().push(profile.clone());
+        Ok(profile)
+    }
+
+    /// Update icon for an existing profile.  Returns `false` if not found.
+    pub fn set_profile_icon(&self, id: ProfileId, icon: impl Into<String>) -> crate::Result<bool> {
+        let icon = icon.into();
+        let mut profiles = self.profiles.lock().unwrap();
+        match profiles.iter_mut().find(|p| p.id == id) {
+            Some(p) => {
+                p.icon = icon;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     pub fn list_profiles(&self) -> crate::Result<Vec<Profile>> {
@@ -66,6 +94,78 @@ impl ProfileManager {
 
     pub fn active_profile(&self) -> crate::Result<Option<ProfileId>> {
         Ok(*self.active_profile_id.lock().unwrap())
+    }
+
+    /// Rename a profile identified by its UUID string representation.
+    pub fn rename_profile_by_str(&self, id_str: &str, new_name: &str) -> crate::Result<bool> {
+        match uuid::Uuid::parse_str(id_str) {
+            Ok(u) => self.rename_profile(ProfileId(u), new_name),
+            Err(_) => Ok(false),
+        }
+    }
+
+    /// Update icon for a profile identified by its UUID string.
+    pub fn set_profile_icon_by_str(&self, id_str: &str, icon: &str) -> crate::Result<bool> {
+        match uuid::Uuid::parse_str(id_str) {
+            Ok(u) => self.set_profile_icon(ProfileId(u), icon),
+            Err(_) => Ok(false),
+        }
+    }
+
+    /// Delete a profile identified by its UUID string.
+    pub fn delete_profile_by_str(&self, id_str: &str) -> crate::Result<bool> {
+        match uuid::Uuid::parse_str(id_str) {
+            Ok(u) => self.delete_profile(ProfileId(u)),
+            Err(_) => Ok(false),
+        }
+    }
+
+    /// Set `notes_in_all` on a profile.  Returns `false` if not found.
+    pub fn set_profile_notes_in_all(&self, id: ProfileId, value: bool) -> crate::Result<bool> {
+        let mut profiles = self.profiles.lock().unwrap();
+        match profiles.iter_mut().find(|p| p.id == id) {
+            Some(p) => {
+                p.notes_in_all = value;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Set `notes_in_all` by UUID string.  Returns `false` if not found or id is invalid.
+    pub fn set_profile_notes_in_all_by_str(
+        &self,
+        id_str: &str,
+        value: bool,
+    ) -> crate::Result<bool> {
+        match uuid::Uuid::parse_str(id_str) {
+            Ok(u) => self.set_profile_notes_in_all(ProfileId(u), value),
+            Err(_) => Ok(false),
+        }
+    }
+
+    /// Set `recordings_in_all` on a profile.  Returns `false` if not found.
+    pub fn set_profile_recordings_in_all(&self, id: ProfileId, value: bool) -> crate::Result<bool> {
+        let mut profiles = self.profiles.lock().unwrap();
+        match profiles.iter_mut().find(|p| p.id == id) {
+            Some(p) => {
+                p.recordings_in_all = value;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Set `recordings_in_all` by UUID string.  Returns `false` if not found or id is invalid.
+    pub fn set_profile_recordings_in_all_by_str(
+        &self,
+        id_str: &str,
+        value: bool,
+    ) -> crate::Result<bool> {
+        match uuid::Uuid::parse_str(id_str) {
+            Ok(u) => self.set_profile_recordings_in_all(ProfileId(u), value),
+            Err(_) => Ok(false),
+        }
     }
 }
 

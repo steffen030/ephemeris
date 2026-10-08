@@ -135,6 +135,21 @@ impl Default for StrokeId {
 pub struct Profile {
     pub id: ProfileId,
     pub name: String,
+    /// Icon key for the profile. Life-scenario presets (`work`, `home`,
+    /// `private`, `kids`, `party`, …) or `custom:/abs/path` for an image.
+    /// Defaults to `"person"`.
+    #[serde(default = "default_profile_icon")]
+    pub icon: String,
+    /// When true, notes in this profile appear in the "All profiles" aggregator view.
+    #[serde(default)]
+    pub notes_in_all: bool,
+    /// When true, recordings in this profile appear in the "All profiles" aggregator view.
+    #[serde(default)]
+    pub recordings_in_all: bool,
+}
+
+fn default_profile_icon() -> String {
+    "person".to_string()
 }
 
 impl Profile {
@@ -142,7 +157,15 @@ impl Profile {
         Profile {
             id: ProfileId::new(),
             name: name.into(),
+            icon: default_profile_icon(),
+            notes_in_all: false,
+            recordings_in_all: false,
         }
+    }
+
+    pub fn with_icon(mut self, icon: impl Into<String>) -> Self {
+        self.icon = icon.into();
+        self
     }
 }
 
@@ -229,6 +252,10 @@ impl Page {
 }
 
 /// Task priority level.
+///
+/// Covers Obsidian Tasks (highest→lowest) and Todoist (p1–p4) via mapping:
+/// Highest/P1 → High, High/P2 → High, Medium/P3 → Medium, Low/P4 → Low,
+/// Lowest → Low.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum TaskPriority {
@@ -238,7 +265,18 @@ pub enum TaskPriority {
     High = 2,
 }
 
-/// A task from any source (local, CalDAV VTODO, Obsidian checkbox, etc.).
+/// Workflow status shared by Obsidian Tasks (`[ ]`/`[/]`/`[x]`/`[-]`) and Todoist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    #[default]
+    Todo,
+    InProgress,
+    Done,
+    Cancelled,
+}
+
+/// A task from any source (local, CalDAV VTODO, Obsidian checkbox, Todoist, etc.).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Task {
     pub id: TaskId,
@@ -249,6 +287,42 @@ pub struct Task {
     pub source: String,
     pub profile_id: ProfileId,
     pub done: bool,
+    /// Provider-specific origin, e.g. vault-relative `"Notes/foo.md:12"` for Obsidian.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_ref: Option<String>,
+    /// Longer notes / Todoist description / Obsidian block below the checkbox.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Explicit status; kept in sync with [`Self::done`] for providers that only have a checkbox.
+    #[serde(default)]
+    pub status: TaskStatus,
+    /// Obsidian Tasks `⏳` / Todoist “deadline” companion — when work is planned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduled: Option<u64>,
+    /// Obsidian Tasks `🛫` start date.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<u64>,
+    /// When the task was completed (`✅` / Todoist completed_at).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<u64>,
+    /// When the task was created (`➕`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<u64>,
+    /// Recurrence rule text (Obsidian `🔁 every week`, Todoist RRULE/string).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recurrence: Option<String>,
+    /// Project / notebook / Todoist project name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// Todoist section or Obsidian heading context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section: Option<String>,
+    /// Parent task for subtasks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<TaskId>,
+    /// Deep link back to the provider (Todoist URL, Obsidian URI, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 impl Task {
@@ -262,6 +336,41 @@ impl Task {
             source: "local".to_string(),
             profile_id,
             done: false,
+            source_ref: None,
+            description: None,
+            status: TaskStatus::Todo,
+            scheduled: None,
+            start: None,
+            completed_at: None,
+            created_at: None,
+            recurrence: None,
+            project: None,
+            section: None,
+            parent_id: None,
+            url: None,
+        }
+    }
+
+    /// Keep [`Self::done`] and [`Self::status`] consistent after a mutation.
+    pub fn set_done(&mut self, done: bool) {
+        self.done = done;
+        self.status = if done {
+            TaskStatus::Done
+        } else if self.status == TaskStatus::Done {
+            TaskStatus::Todo
+        } else {
+            self.status
+        };
+        if done && self.completed_at.is_none() {
+            self.completed_at = Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            );
+        }
+        if !done {
+            self.completed_at = None;
         }
     }
 }

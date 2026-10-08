@@ -140,7 +140,9 @@ mod tests {
         file1.write_all(b"# Note 1\nContent").expect("write note1");
 
         let mut file2 = fs::File::create(vault_path.join("note2.md")).expect("create note2");
-        file2.write_all(b"# Note 2\nOther content").expect("write note2");
+        file2
+            .write_all(b"# Note 2\nOther content")
+            .expect("write note2");
 
         let vault = ObsidianVault::new(vault_path);
         let files = vault.list_files().expect("should list files");

@@ -10,16 +10,35 @@ license.workspace = true
 name = "ephemeris"
 path = "src/main.rs"
 
+# Metadata for cargo-deb / packaging docs. CI builds the .deb via
+# scripts/build-deb.sh from a cross-compiled binary (see docs/releasing.md).
+[package.metadata.deb]
+name = "ephemeris"
+maintainer = "Steffen Galan <steffen.galan@gmail.com>"
+section = "utils"
+priority = "optional"
+depends = "libxkbcommon0, libwayland-client0"
+assets = [
+    ["target/release/ephemeris", "usr/bin/ephemeris", "755"],
+]
+
 [dev-dependencies]
 tempfile = "3"
 
 [dependencies]
-ephemeris-core = { workspace = true, features = ["ics"] }
+chrono = { workspace = true }
+ephemeris-core = { workspace = true, features = ["ics", "ocr"] }
 ephemeris-pal  = { workspace = true }
 ephemeris-ui   = { workspace = true }
 log = { workspace = true }
 slint = { workspace = true }
+image = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
 winit = { workspace = true }
+cpal    = { workspace = true }
+hound   = { workspace = true }
+reqwest = { workspace = true }

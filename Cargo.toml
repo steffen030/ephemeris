@@ -32,21 +32,29 @@ toml = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 winit = { version = "0.30", features = ["rwh_06"] }
 
 # Slint UI framework (software renderer — headless/CI-safe, no GPU required)
 slint = { version = "1.18", default-features = false, features = ["renderer-software", "std", "compat-1-18"] }
 slint-build = "1.18"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 
 # WebDAV client (opt-in; pulled in only when the `webdav` feature is active)
 reqwest_dav = { version = "0.3", default-features = false, features = ["rustls-tls"] }
 bytes = "1"
 
+# PDF export (note pages → searchable PDF)
+printpdf = "0.7"
+
 # ICS calendar parsing
 icalendar = "0.16"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
+
+# Audio recording (mic capture + WAV writing)
+cpal = "0.15"
+hound = "3.5"
 
 # HTTP client (opt-in; used by the `ics` feature for HTTPS feed fetch)
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }

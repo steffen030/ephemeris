@@ -21,6 +21,9 @@
 //! | `EPHEMERIS_THEME`          | `theme`               |
 //! | `EPHEMERIS_SYNC_INTERVAL`  | `sync_interval_secs`  |
 //! | `EPHEMERIS_LOG_LEVEL`      | `logging_level`       |
+//!
+//! Optional TOML: `vault_tasks_inbox` (default `Ephemeris/Tasks.md`) — vault-relative
+//! file where new Ephemeris tasks are appended.
 
 use crate::AppError;
 use serde::{Deserialize, Serialize};
@@ -54,6 +57,19 @@ pub struct Config {
     #[serde(default)]
     pub vault_path: Option<PathBuf>,
 
+    /// Vault-relative markdown file where new Ephemeris tasks are appended.
+    ///
+    /// Example TOML: `vault_tasks_inbox = "Ephemeris/Tasks.md"`
+    #[serde(default = "default_vault_tasks_inbox")]
+    pub vault_tasks_inbox: PathBuf,
+
+    /// Vault-relative folder where exported notes are mirrored
+    /// (`{subdir}/{Notebook}/{Note}.md`).
+    ///
+    /// Example TOML: `vault_export_subdir = "Ephemeris"`
+    #[serde(default = "default_vault_export_subdir")]
+    pub vault_export_subdir: PathBuf,
+
     /// Local `.ics` file paths to load calendar events from.
     /// Each path should point to a valid iCalendar file on disk.
     ///
@@ -74,6 +90,20 @@ pub struct Config {
     #[serde(default)]
     pub ics_urls: Vec<String>,
 
+    /// When true, PDF export runs [`crate::RasterOcrTranscriber`] on note
+    /// rasters (requires the `ocr` Cargo feature + system Tesseract).
+    #[serde(default = "default_ocr_enabled")]
+    pub ocr_enabled: bool,
+
+    /// Tesseract language packs, e.g. `"eng"` or `"eng+deu"`.
+    #[serde(default = "default_ocr_languages")]
+    pub ocr_languages: String,
+
+    /// Optional tessdata directory (`TESSDATA_PREFIX`). When unset, Tesseract's
+    /// default search path is used.
+    #[serde(default)]
+    pub ocr_tessdata: Option<PathBuf>,
+
     /// Arbitrary key-value overrides for experimental / future settings.
     #[serde(default)]
     pub custom: HashMap<String, String>,
@@ -91,6 +121,22 @@ fn default_logging_level() -> String {
     "info".to_string()
 }
 
+fn default_vault_tasks_inbox() -> PathBuf {
+    PathBuf::from("Ephemeris/Tasks.md")
+}
+
+fn default_vault_export_subdir() -> PathBuf {
+    PathBuf::from(crate::DEFAULT_EXPORT_SUBDIR)
+}
+
+fn default_ocr_enabled() -> bool {
+    true
+}
+
+fn default_ocr_languages() -> String {
+    "eng".to_string()
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -98,8 +144,13 @@ impl Default for Config {
             sync_interval_secs: default_sync_interval(),
             logging_level: default_logging_level(),
             vault_path: None,
+            vault_tasks_inbox: default_vault_tasks_inbox(),
+            vault_export_subdir: default_vault_export_subdir(),
             ics_paths: Vec::new(),
             ics_urls: Vec::new(),
+            ocr_enabled: default_ocr_enabled(),
+            ocr_languages: default_ocr_languages(),
+            ocr_tessdata: None,
             custom: HashMap::new(),
         }
     }
@@ -215,6 +266,18 @@ fn apply_env_overrides(config: &mut Config) {
     if let Ok(v) = std::env::var("EPHEMERIS_LOG_LEVEL") {
         config.logging_level = v;
     }
+    if let Ok(v) = std::env::var("EPHEMERIS_OCR") {
+        match v.to_lowercase().as_str() {
+            "0" | "false" | "off" | "no" => config.ocr_enabled = false,
+            "1" | "true" | "on" | "yes" => config.ocr_enabled = true,
+            _ => tracing::warn!("EPHEMERIS_OCR={v:?} not recognised; ignoring"),
+        }
+    }
+    if let Ok(v) = std::env::var("EPHEMERIS_OCR_LANGS") {
+        if !v.trim().is_empty() {
+            config.ocr_languages = v;
+        }
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -255,6 +318,9 @@ mod tests {
         assert_eq!(cfg.theme, "light");
         assert_eq!(cfg.sync_interval_secs, 60);
         assert_eq!(cfg.logging_level, "info");
+        assert!(cfg.ocr_enabled);
+        assert_eq!(cfg.ocr_languages, "eng");
+        assert!(cfg.ocr_tessdata.is_none());
         assert!(cfg.custom.is_empty());
     }
 

@@ -89,7 +89,7 @@ use slint::platform::{Platform, WindowAdapter};
 use slint::{Model, PhysicalSize, SharedString};
 
 use ephemeris_core::ink::{InkConfig, InkEngine, InkUpdate};
-use ephemeris_core::model::Point;
+use ephemeris_core::model::{Point, Tool};
 use ephemeris_core::refresh::{DamageSource, RefreshConfig, RefreshScheduler};
 use ephemeris_pal::display::{Display, PixelBuf, Rect};
 use ephemeris_pal::input::InputEvent;
@@ -218,15 +218,111 @@ impl PageBook {
 // Include the generated Slint bindings (produced by build.rs → slint-build).
 slint::include_modules!();
 
+/// One row for the notes browser (list or gallery).
+#[derive(Clone)]
+pub struct NoteListItem {
+    pub id: String,
+    pub title: String,
+    pub date_label: String,
+    pub has_preview: bool,
+    pub preview: slint::Image,
+    pub show_profile: bool,
+    pub profile_icon_char: String,
+    pub has_custom_profile_icon: bool,
+    pub custom_profile_icon: slint::Image,
+}
+
+/// One folder row for the notes browser / move dialog.
+#[derive(Clone)]
+pub struct FolderListItem {
+    pub id: String,
+    pub title: String,
+    pub note_count: i32,
+    pub folder_count: i32,
+    pub show_profile: bool,
+    pub profile_icon_char: String,
+    pub has_custom_profile_icon: bool,
+    pub custom_profile_icon: slint::Image,
+}
+
+fn folder_list_item_to_entry(e: &FolderListItem) -> NotebookEntry {
+    NotebookEntry {
+        id: slint::SharedString::from(e.id.as_str()),
+        title: slint::SharedString::from(e.title.as_str()),
+        note_count: e.note_count,
+        folder_count: e.folder_count,
+        show_profile: e.show_profile,
+        profile_icon_char: slint::SharedString::from(e.profile_icon_char.as_str()),
+        has_custom_profile_icon: e.has_custom_profile_icon,
+        custom_profile_icon: e.custom_profile_icon.clone(),
+    }
+}
+
 // ── Chrome geometry constants ──────────────────────────────────────────────────
 
-/// Height of the status bar in logical / physical pixels.
-/// Must match `status-bar.height` in `main.slint`.
-pub const STATUS_BAR_H: u32 = 24;
+/// Status bar removed — kept at 0 so the canvas fills the full screen.
+pub const STATUS_BAR_H: u32 = 0;
 
-/// Height of the toolbar in logical / physical pixels.
-/// Must match `toolbar.height` in `main.slint`.
-pub const TOOLBAR_H: u32 = 48;
+/// Toolbar removed — kept at 0 so the canvas fills the full screen.
+pub const TOOLBAR_H: u32 = 0;
+
+/// Left nav rail width — must match `nav-w` in `main.slint`.
+pub const NAV_W: u32 = 80;
+
+/// Burger dropdown panel (`drawing-dropdown` in `main.slint`):
+/// `x = parent.width - 192`, `y = 60`, `width = 184`, `height = 200`.
+const DRAWING_MENU_W: u32 = 184;
+const DRAWING_MENU_H: u32 = 200;
+const DRAWING_MENU_RIGHT_PAD: u32 = 8; // 192 - 184
+const DRAWING_MENU_Y: u32 = 60;
+
+/// Top-right burger / close button (`drawing-burger` in `main.slint`).
+const BURGER_W: u32 = 44;
+const BURGER_H: u32 = 44;
+const BURGER_RIGHT_PAD: u32 = 8; // parent.width - 52
+const BURGER_Y: u32 = 8;
+
+/// Copy pre-ink Slint luma back over opaque chrome so `min()` ink blend does
+/// not bleed through the nav rail, drawing menu, or burger button.
+fn restore_chrome_rects(buf: &mut PixelBuf, pre_ink: &[u8], width: u32, height: u32) {
+    let stride = width as usize;
+    let menu_x = width.saturating_sub(DRAWING_MENU_W + DRAWING_MENU_RIGHT_PAD);
+    let burger_x = width.saturating_sub(BURGER_W + BURGER_RIGHT_PAD);
+
+    let rects = [
+        // Nav rail (full height).
+        (0u32, 0u32, NAV_W.min(width), height),
+        // Floating drawing menu panel.
+        (
+            menu_x,
+            DRAWING_MENU_Y.min(height),
+            DRAWING_MENU_W.min(width.saturating_sub(menu_x)),
+            DRAWING_MENU_H.min(height.saturating_sub(DRAWING_MENU_Y)),
+        ),
+        // Burger / close button.
+        (
+            burger_x,
+            BURGER_Y.min(height),
+            BURGER_W.min(width.saturating_sub(burger_x)),
+            BURGER_H.min(height.saturating_sub(BURGER_Y)),
+        ),
+    ];
+
+    for (x0, y0, w, h) in rects {
+        if w == 0 || h == 0 {
+            continue;
+        }
+        for y in y0..y0.saturating_add(h).min(height) {
+            let row = y as usize * stride;
+            for x in x0..x0.saturating_add(w).min(width) {
+                let idx = row + x as usize;
+                if idx < pre_ink.len() && idx < buf.data.len() {
+                    buf.data[idx] = pre_ink[idx];
+                }
+            }
+        }
+    }
+}
 
 // ── Headless platform ─────────────────────────────────────────────────────────
 
@@ -436,6 +532,23 @@ impl EphemerisUi {
         t.set_danger_fg(fg);
     }
 
+    /// Switch the active drawing tool on the ink engine.
+    ///
+    /// Sets the appropriate base stroke width alongside the tool:
+    /// * [`Tool::Pen`]         → 3 px  (standard fine writing)
+    /// * [`Tool::Highlighter`] → 12 px (wide semi-transparent gray mark)
+    /// * [`Tool::Eraser`]      → 10 px (eraser circle radius)
+    pub fn set_tool(&self, tool: Tool) {
+        let base_width = match tool {
+            Tool::Pen => 3.0,
+            Tool::Highlighter => 12.0,
+            Tool::Eraser => 10.0,
+        };
+        let mut engine = self.engine.borrow_mut();
+        engine.set_tool(tool);
+        engine.set_base_width(base_width);
+    }
+
     /// Switch between start page (task list) and canvas (ink) view.
     pub fn set_show_start_page(&self, show: bool) {
         self.component.set_show_start_page(show);
@@ -443,16 +556,19 @@ impl EphemerisUi {
 
     /// Push a ranked task list to the start page.
     ///
-    /// `tasks` is a slice of `(title, priority_label, due_label, overdue)` tuples.
-    pub fn set_task_list(&self, tasks: &[(String, String, String, bool)]) {
+    /// `tasks` is a slice of `(id, title, priority_label, due_label, overdue)` tuples.
+    pub fn set_task_list(&self, tasks: &[(String, String, String, String, bool)]) {
         let entries: Vec<TaskEntry> = tasks
             .iter()
-            .map(|(title, priority_label, due_label, overdue)| TaskEntry {
-                title: slint::SharedString::from(title.as_str()),
-                priority_label: slint::SharedString::from(priority_label.as_str()),
-                due_label: slint::SharedString::from(due_label.as_str()),
-                overdue: *overdue,
-            })
+            .map(
+                |(id, title, priority_label, due_label, overdue)| TaskEntry {
+                    id: slint::SharedString::from(id.as_str()),
+                    title: slint::SharedString::from(title.as_str()),
+                    priority_label: slint::SharedString::from(priority_label.as_str()),
+                    due_label: slint::SharedString::from(due_label.as_str()),
+                    overdue: *overdue,
+                },
+            )
             .collect();
         let model = std::rc::Rc::new(slint::VecModel::from(entries));
         self.component.set_task_list(model.into());
@@ -484,8 +600,7 @@ impl EphemerisUi {
     where
         F: FnMut(i32) + 'static,
     {
-        self.component
-            .on_agenda_range_changed(move |r| handler(r));
+        self.component.on_agenda_range_changed(move |r| handler(r));
     }
 
     // ── Callback registration ─────────────────────────────────────────────
@@ -564,20 +679,107 @@ impl EphemerisUi {
         self.component.get_ring_visible()
     }
 
-    /// `true` when the ink canvas is the active view (no overlay is on top).
+    /// `true` when the note canvas page is showing (no full-screen overlay).
     ///
-    /// Used by the input layer to decide whether pointer events should feed
-    /// into the ink engine rather than being passed through to the UI.
-    pub fn is_canvas_active(&self) -> bool {
+    /// The floating drawing menu and see-text overlay may still be open on top;
+    /// use [`Self::is_canvas_active`] for ink input and
+    /// [`Self::should_composite_ink`] for compositing.
+    ///
+    /// Keep the overlay list in sync with `is-canvas-context` in `main.slint`.
+    pub fn is_note_canvas_page(&self) -> bool {
         let c = &self.component;
         !c.get_show_start_page()
             && !c.get_show_task_view()
             && !c.get_show_settings()
             && !c.get_show_filebrowser()
             && !c.get_show_note_list()
+            && !c.get_show_notebook_list()
+            && !c.get_show_calendar()
+            && !c.get_show_recording_list()
+            && !c.get_show_search()
+            && !c.get_show_md_viewer()
+            && !c.get_show_profile_switcher()
+            && !c.get_show_create_profile_picker()
             && !c.get_task_dialog_visible()
             && !c.get_note_rename_visible()
+            && !c.get_note_move_visible()
+            && !c.get_notebook_rename_visible()
+            && !c.get_rec_rename_visible()
+            && !c.get_rec_transcription_visible()
+            && !c.get_profile_edit_dialog_visible()
+            && !c.get_connect_setup_visible()
+            && !c.get_connect_soon_visible()
             && !c.get_ring_visible()
+    }
+
+    /// `true` when pointer events should feed the ink engine.
+    ///
+    /// False while the drawing menu or see-text overlay is open (those views
+    /// own input). Ink may still be composited under the drawing menu — see
+    /// [`Self::should_composite_ink`].
+    pub fn is_canvas_active(&self) -> bool {
+        let c = &self.component;
+        self.is_note_canvas_page() && !c.get_drawing_menu_open() && !c.get_note_see_text()
+    }
+
+    /// `true` when committed/in-progress ink should be blended into the frame.
+    ///
+    /// Remains true while the floating drawing menu is open so the page stays
+    /// visible behind chrome. False for see-text and full-screen overlays so
+    /// dark ink cannot bleed through white Slint backgrounds via `min()`.
+    pub fn should_composite_ink(&self) -> bool {
+        let c = &self.component;
+        self.is_note_canvas_page() && !c.get_note_see_text()
+    }
+
+    /// Force a full-screen refresh on the next present (clears eink ghosting /
+    /// leftover ink when switching to an overlay view).
+    pub fn request_screen_change(&self) {
+        self.screen_change.set(true);
+    }
+
+    pub fn get_drawing_menu_open(&self) -> bool {
+        self.component.get_drawing_menu_open()
+    }
+
+    pub fn set_drawing_menu_open(&self, open: bool) {
+        self.component.set_drawing_menu_open(open);
+    }
+
+    pub fn on_notebook_quick_new_note<F>(&self, mut handler: F)
+    where
+        F: FnMut(String) + 'static,
+    {
+        self.component
+            .on_notebook_quick_new_note(move |id| handler(id.to_string()));
+    }
+
+    pub fn on_paper_type_tapped<F>(&self, mut handler: F)
+    where
+        F: FnMut(String) + 'static,
+    {
+        self.component
+            .on_paper_type_tapped(move |paper| handler(paper.to_string()));
+    }
+
+    /// Show or hide the see-text (OCR / transcript) overlay on the note canvas.
+    pub fn set_note_see_text(&self, show: bool) {
+        self.component.set_note_see_text(show);
+    }
+
+    /// Set the machine-readable text shown in the see-text overlay.
+    pub fn set_note_text_content(&self, text: &str) {
+        self.component
+            .set_note_text_content(slint::SharedString::from(text));
+    }
+
+    /// Register a closure called when the see-text toggle changes.
+    pub fn on_note_see_text_toggled<F: FnMut(bool) + 'static>(&self, handler: F) {
+        self.component.on_note_see_text_toggled(handler);
+    }
+
+    pub fn on_rename_canvas_note<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_rename_canvas_note(handler);
     }
 
     /// Register a closure called when the "Note" slice is tapped.
@@ -615,28 +817,47 @@ impl EphemerisUi {
     /// Push the full task list to the CRUD view.
     ///
     /// Each tuple is `(id, title, priority_label, due_label, overdue, done)`.
-    pub fn set_full_task_list(&self, tasks: &[(String, String, String, String, bool, bool)]) {
+    pub fn set_full_task_list(&self, tasks: &[(String, String, String, i32, String, bool, bool)]) {
         let entries: Vec<TaskViewEntry> = tasks
             .iter()
-            .map(|(id, title, priority_label, due_label, overdue, done)| TaskViewEntry {
-                id: slint::SharedString::from(id.as_str()),
-                title: slint::SharedString::from(title.as_str()),
-                priority_label: slint::SharedString::from(priority_label.as_str()),
-                due_label: slint::SharedString::from(due_label.as_str()),
-                overdue: *overdue,
-                done: *done,
-            })
+            .map(
+                |(id, title, priority_label, priority_int, due_label, overdue, done)| {
+                    TaskViewEntry {
+                        id: slint::SharedString::from(id.as_str()),
+                        title: slint::SharedString::from(title.as_str()),
+                        priority_label: slint::SharedString::from(priority_label.as_str()),
+                        priority_int: *priority_int,
+                        due_label: slint::SharedString::from(due_label.as_str()),
+                        overdue: *overdue,
+                        done: *done,
+                    }
+                },
+            )
             .collect();
         let model = std::rc::Rc::new(slint::VecModel::from(entries));
         self.component.set_full_task_list(model.into());
     }
 
     /// Open the task add/edit dialog.
-    pub fn open_task_dialog(&self, is_edit: bool, id: &str, title: &str, priority: i32) {
+    pub fn open_task_dialog(
+        &self,
+        is_edit: bool,
+        id: &str,
+        title: &str,
+        priority: i32,
+        due: &str,
+        tags: &str,
+    ) {
         self.component.set_task_dialog_is_edit(is_edit);
-        self.component.set_task_dialog_id(slint::SharedString::from(id));
-        self.component.set_task_dialog_title(slint::SharedString::from(title));
+        self.component
+            .set_task_dialog_id(slint::SharedString::from(id));
+        self.component
+            .set_task_dialog_title(slint::SharedString::from(title));
         self.component.set_task_dialog_priority(priority);
+        self.component
+            .set_task_dialog_due(slint::SharedString::from(due));
+        self.component
+            .set_task_dialog_tags(slint::SharedString::from(tags));
         self.component.set_task_dialog_visible(true);
     }
 
@@ -684,22 +905,38 @@ impl EphemerisUi {
     }
 
     /// Register a closure called when "Save" is tapped in the add dialog.
+    /// Handler args: title, priority, due (YYYY-MM-DD), tags (space-separated).
     pub fn on_task_confirm_add<F>(&self, mut handler: F)
     where
-        F: FnMut(String, i32) + 'static,
+        F: FnMut(String, i32, String, String) + 'static,
     {
         self.component
-            .on_task_confirm_add(move |title, priority| handler(title.to_string(), priority));
+            .on_task_confirm_add(move |title, priority, due, tags| {
+                handler(
+                    title.to_string(),
+                    priority,
+                    due.to_string(),
+                    tags.to_string(),
+                )
+            });
     }
 
     /// Register a closure called when "Save" is tapped in the edit dialog.
+    /// Handler args: id, title, priority, due (YYYY-MM-DD), tags (space-separated).
     pub fn on_task_confirm_edit<F>(&self, mut handler: F)
     where
-        F: FnMut(String, String, i32) + 'static,
+        F: FnMut(String, String, i32, String, String) + 'static,
     {
-        self.component.on_task_confirm_edit(move |id, title, priority| {
-            handler(id.to_string(), title.to_string(), priority)
-        });
+        self.component
+            .on_task_confirm_edit(move |id, title, priority, due, tags| {
+                handler(
+                    id.to_string(),
+                    title.to_string(),
+                    priority,
+                    due.to_string(),
+                    tags.to_string(),
+                )
+            });
     }
 
     /// Register a closure called when "Cancel" is tapped in the task dialog.
@@ -707,11 +944,174 @@ impl EphemerisUi {
         self.component.on_task_dialog_cancel(handler);
     }
 
+    pub fn on_task_filter_changed<F>(&self, mut handler: F)
+    where
+        F: FnMut(String) + 'static,
+    {
+        self.component
+            .on_task_filter_changed(move |f| handler(f.to_string()));
+    }
+
+    pub fn on_task_sort_changed<F>(&self, mut handler: F)
+    where
+        F: FnMut(String) + 'static,
+    {
+        self.component
+            .on_task_sort_changed(move |s| handler(s.to_string()));
+    }
+
+    pub fn on_task_priority_cycle<F>(&self, mut handler: F)
+    where
+        F: FnMut(String) + 'static,
+    {
+        self.component
+            .on_task_priority_cycle(move |id| handler(id.to_string()));
+    }
+
+    /// Local profile chip filter in task view (All aggregator only).
+    pub fn on_task_profile_filter_changed<F>(&self, mut handler: F)
+    where
+        F: FnMut(String) + 'static,
+    {
+        self.component
+            .on_task_profile_filter_changed(move |id| handler(id.to_string()));
+    }
+
+    /// Task-view search query changed (tasks only).
+    pub fn on_task_search_changed<F>(&self, mut handler: F)
+    where
+        F: FnMut(String) + 'static,
+    {
+        self.component
+            .on_task_search_changed(move |q| handler(q.to_string()));
+    }
+
+    // ── Profile switcher API ──────────────────────────────────────────────
+
+    pub fn set_profile_list(&self, list: slint::ModelRc<ProfileEntry>) {
+        self.component.set_profile_list(list);
+    }
+
+    pub fn on_profile_changed<F>(&self, mut handler: F)
+    where
+        F: FnMut(slint::SharedString) + 'static,
+    {
+        self.component.on_profile_changed(move |id| handler(id));
+    }
+
     // ── Settings view API ─────────────────────────────────────────────────
 
     /// Show or hide the settings view.
     pub fn set_show_settings(&self, show: bool) {
         self.component.set_show_settings(show);
+    }
+
+    /// Show or hide the unified search view.
+    pub fn set_show_search(&self, show: bool) {
+        self.component.set_show_search(show);
+    }
+
+    /// Show or hide the markdown note viewer.
+    pub fn set_show_md_viewer(&self, show: bool) {
+        self.component.set_show_md_viewer(show);
+    }
+
+    /// Set the search query string shown in the search field.
+    pub fn set_search_query(&self, query: &str) {
+        self.component
+            .set_search_query(slint::SharedString::from(query));
+    }
+
+    /// Read the current search query.
+    pub fn get_search_query(&self) -> String {
+        self.component.get_search_query().to_string()
+    }
+
+    /// Set the search status / diagnostic line.
+    pub fn set_search_status(&self, status: &str) {
+        self.component
+            .set_search_status(slint::SharedString::from(status));
+    }
+
+    /// Push unified search results into the UI.
+    /// Each tuple: `(id, source, title, snippet, path)`.
+    pub fn set_search_results(&self, hits: &[(String, String, String, String, String)]) {
+        let entries: Vec<SearchHitEntry> = hits
+            .iter()
+            .map(|(id, source, title, snippet, path)| SearchHitEntry {
+                id: slint::SharedString::from(id.as_str()),
+                source: slint::SharedString::from(source.as_str()),
+                title: slint::SharedString::from(title.as_str()),
+                snippet: slint::SharedString::from(snippet.as_str()),
+                path: slint::SharedString::from(path.as_str()),
+            })
+            .collect();
+        self.component
+            .set_search_results(Rc::new(slint::VecModel::from(entries)).into());
+    }
+
+    /// Populate the markdown viewer.
+    pub fn set_md_viewer(&self, title: &str, body: &str, path: &str) {
+        self.component
+            .set_md_viewer_title(slint::SharedString::from(title));
+        self.component
+            .set_md_viewer_body(slint::SharedString::from(body));
+        self.component
+            .set_md_viewer_path(slint::SharedString::from(path));
+    }
+
+    /// Push structured markdown blocks into the viewer (headings, lists, …).
+    pub fn set_md_viewer_blocks(&self, blocks: &[ephemeris_core::MdBlock]) {
+        use ephemeris_core::MdBlockKind;
+        let entries: Vec<MdBlockEntry> = blocks
+            .iter()
+            .map(|b| {
+                let kind = match b.kind {
+                    MdBlockKind::Heading1 => 0,
+                    MdBlockKind::Heading2 => 1,
+                    MdBlockKind::Heading3 => 2,
+                    MdBlockKind::Paragraph => 3,
+                    MdBlockKind::Bullet => 4,
+                    MdBlockKind::Numbered => 5,
+                    MdBlockKind::Quote => 6,
+                    MdBlockKind::Code => 7,
+                    MdBlockKind::Rule => 8,
+                };
+                MdBlockEntry {
+                    kind,
+                    text: slint::SharedString::from(b.text.as_str()),
+                }
+            })
+            .collect();
+        self.component
+            .set_md_viewer_blocks(Rc::new(slint::VecModel::from(entries)).into());
+    }
+
+    pub fn on_search_open<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_search_open(handler);
+    }
+
+    pub fn on_search_back<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_search_back(handler);
+    }
+
+    pub fn on_search_query_changed<F: FnMut(String) + 'static>(&self, mut handler: F) {
+        self.component
+            .on_search_query_changed(move |q| handler(q.to_string()));
+    }
+
+    pub fn on_search_submit<F: FnMut(String) + 'static>(&self, mut handler: F) {
+        self.component
+            .on_search_submit(move |q| handler(q.to_string()));
+    }
+
+    pub fn on_search_result_tapped<F: FnMut(String, String) + 'static>(&self, mut handler: F) {
+        self.component
+            .on_search_result_tapped(move |id, source| handler(id.to_string(), source.to_string()));
+    }
+
+    pub fn on_md_viewer_back<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_md_viewer_back(handler);
     }
 
     /// Set the theme index shown in settings (0 = light, 1 = dark).
@@ -809,6 +1209,170 @@ impl EphemerisUi {
             .on_settings_remove_source(move |idx| handler(idx));
     }
 
+    pub fn set_whisper_model_installed(&self, v: bool) {
+        self.component.set_whisper_model_installed(v);
+    }
+
+    pub fn set_whisper_downloading(&self, v: bool) {
+        self.component.set_whisper_downloading(v);
+    }
+
+    pub fn get_whisper_lang(&self) -> String {
+        self.component.get_whisper_lang().to_string()
+    }
+
+    pub fn on_settings_whisper_download<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_settings_whisper_download(handler);
+    }
+
+    pub fn on_settings_whisper_delete<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_settings_whisper_delete(handler);
+    }
+
+    pub fn on_settings_profile_add<F>(&self, mut handler: F)
+    where
+        F: FnMut(String, String) + 'static,
+    {
+        self.component
+            .on_settings_profile_add(move |name, icon| handler(name.to_string(), icon.to_string()));
+    }
+
+    pub fn on_settings_profile_edit<F>(&self, mut handler: F)
+    where
+        F: FnMut(String, String, String) + 'static,
+    {
+        self.component
+            .on_settings_profile_edit(move |id, name, icon| {
+                handler(id.to_string(), name.to_string(), icon.to_string())
+            });
+    }
+
+    pub fn on_settings_profile_delete<F>(&self, mut handler: F)
+    where
+        F: FnMut(String) + 'static,
+    {
+        self.component
+            .on_settings_profile_delete(move |id| handler(id.to_string()));
+    }
+
+    pub fn on_settings_profile_toggle_notes_in_all<F>(&self, mut handler: F)
+    where
+        F: FnMut(String) + 'static,
+    {
+        self.component
+            .on_settings_profile_toggle_notes_in_all(move |id| handler(id.to_string()));
+    }
+
+    pub fn on_settings_profile_toggle_recordings_in_all<F>(&self, mut handler: F)
+    where
+        F: FnMut(String) + 'static,
+    {
+        self.component
+            .on_settings_profile_toggle_recordings_in_all(move |id| handler(id.to_string()));
+    }
+
+    pub fn on_settings_browse_profile_icon<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_settings_browse_profile_icon(handler);
+    }
+
+    pub fn on_fb_select_profile_icon<F>(&self, mut handler: F)
+    where
+        F: FnMut(String) + 'static,
+    {
+        self.component
+            .on_fb_select_profile_icon(move |path| handler(path.to_string()));
+    }
+
+    pub fn set_create_picker_intent(&self, intent: &str) {
+        self.component.set_create_picker_intent(intent.into());
+    }
+
+    pub fn set_show_create_profile_picker(&self, show: bool) {
+        self.component.set_show_create_profile_picker(show);
+    }
+
+    pub fn on_create_profile_picked<F>(&self, mut handler: F)
+    where
+        F: FnMut(String, String) + 'static,
+    {
+        self.component
+            .on_create_profile_picked(move |intent, profile_id| {
+                handler(intent.to_string(), profile_id.to_string())
+            });
+    }
+
+    pub fn on_create_profile_pick_cancel<F>(&self, mut handler: F)
+    where
+        F: FnMut() + 'static,
+    {
+        self.component
+            .on_create_profile_pick_cancel(move || handler());
+    }
+
+    pub fn set_connect_profile_id(&self, id: &str) {
+        self.component
+            .set_connect_profile_id(slint::SharedString::from(id));
+    }
+
+    pub fn get_connect_profile_id(&self) -> String {
+        self.component.get_connect_profile_id().to_string()
+    }
+
+    pub fn set_connect_has_vault(&self, v: bool) {
+        self.component.set_connect_has_vault(v);
+    }
+
+    pub fn set_connect_calendar_count(&self, n: i32) {
+        self.component.set_connect_calendar_count(n);
+    }
+
+    pub fn on_connect_profile_changed<F>(&self, mut handler: F)
+    where
+        F: FnMut(String) + 'static,
+    {
+        self.component
+            .on_connect_profile_changed(move |id| handler(id.to_string()));
+    }
+
+    pub fn on_connection_remove<F>(&self, mut handler: F)
+    where
+        F: FnMut(i32) + 'static,
+    {
+        self.component.on_connection_remove(move |idx| handler(idx));
+    }
+
+    pub fn on_connection_cycle_profile<F>(&self, mut handler: F)
+    where
+        F: FnMut(i32) + 'static,
+    {
+        self.component
+            .on_connection_cycle_profile(move |idx| handler(idx));
+    }
+
+    pub fn on_connection_set_profile<F>(&self, mut handler: F)
+    where
+        F: FnMut(i32, String) + 'static,
+    {
+        self.component
+            .on_connection_set_profile(move |idx, pid| handler(idx, pid.to_string()));
+    }
+
+    pub fn on_connection_toggle_aggregated<F>(&self, mut handler: F)
+    where
+        F: FnMut(i32) + 'static,
+    {
+        self.component
+            .on_connection_toggle_aggregated(move |idx| handler(idx));
+    }
+
+    pub fn on_rec_transcription_save<F>(&self, mut handler: F)
+    where
+        F: FnMut(String) + 'static,
+    {
+        self.component
+            .on_rec_transcription_save(move |text| handler(text.to_string()));
+    }
+
     // ── File browser API ──────────────────────────────────────────────────
 
     /// Show or hide the file browser view.
@@ -898,6 +1462,11 @@ impl EphemerisUi {
         self.component.on_nav_notes_tapped(handler);
     }
 
+    /// Register a closure called when the "Tasks" nav item is tapped.
+    pub fn on_nav_tasks_tapped<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_nav_tasks_tapped(handler);
+    }
+
     // ── Note browser API ──────────────────────────────────────────────────
 
     /// Show or hide the note browser list view.
@@ -906,15 +1475,19 @@ impl EphemerisUi {
     }
 
     /// Push note entries into the note browser.
-    ///
-    /// Each tuple: `(id, title, date_label)`.
-    pub fn set_note_list(&self, entries: &[(String, String, String)]) {
+    pub fn set_note_list(&self, entries: &[NoteListItem]) {
         let items: Vec<NoteEntry> = entries
             .iter()
-            .map(|(id, title, date_label)| NoteEntry {
-                id: slint::SharedString::from(id.as_str()),
-                title: slint::SharedString::from(title.as_str()),
-                date_label: slint::SharedString::from(date_label.as_str()),
+            .map(|e| NoteEntry {
+                id: slint::SharedString::from(e.id.as_str()),
+                title: slint::SharedString::from(e.title.as_str()),
+                date_label: slint::SharedString::from(e.date_label.as_str()),
+                has_preview: e.has_preview,
+                preview: e.preview.clone(),
+                show_profile: e.show_profile,
+                profile_icon_char: slint::SharedString::from(e.profile_icon_char.as_str()),
+                has_custom_profile_icon: e.has_custom_profile_icon,
+                custom_profile_icon: e.custom_profile_icon.clone(),
             })
             .collect();
         self.component
@@ -955,6 +1528,403 @@ impl EphemerisUi {
         self.component.on_note_rename_cancel(handler);
     }
 
+    // ── Notebook browser API ──────────────────────────────────────────────
+
+    /// Show or hide the notebook list view.
+    pub fn set_show_notebook_list(&self, show: bool) {
+        self.component.set_show_notebook_list(show);
+    }
+
+    /// Push all notebooks (flat) for the move-note dialog.
+    pub fn set_notebook_list(&self, notebooks: &[FolderListItem]) {
+        let items: Vec<NotebookEntry> = notebooks.iter().map(folder_list_item_to_entry).collect();
+        self.component
+            .set_notebook_list(std::rc::Rc::new(slint::VecModel::from(items)).into());
+    }
+
+    /// Push child folders for the current notes-browser level.
+    pub fn set_folder_list(&self, folders: &[FolderListItem]) {
+        let items: Vec<NotebookEntry> = folders.iter().map(folder_list_item_to_entry).collect();
+        self.component
+            .set_folder_list(std::rc::Rc::new(slint::VecModel::from(items)).into());
+    }
+
+    /// Set the active notebook id and title shown in the note list header.
+    pub fn set_active_notebook(&self, id: &str, title: &str) {
+        self.component
+            .set_active_notebook_id(slint::SharedString::from(id));
+        self.component
+            .set_active_notebook_title(slint::SharedString::from(title));
+    }
+
+    /// Mark whether the notes browser is at the root level.
+    pub fn set_notes_at_root(&self, at_root: bool) {
+        self.component.set_notes_at_root(at_root);
+    }
+
+    /// Set notes overview mode: `"list"` or `"gallery"`.
+    pub fn set_notes_view_mode(&self, mode: &str) {
+        self.component
+            .set_notes_view_mode(slint::SharedString::from(mode));
+    }
+
+    /// Register a closure called when the list/gallery toggle is tapped.
+    pub fn on_notes_view_mode_toggled<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_notes_view_mode_toggled(handler);
+    }
+
+    /// Register a closure called when the sort-mode chip is tapped.
+    pub fn on_notes_sort_cycled<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_notes_sort_cycled(handler);
+    }
+
+    /// Register a closure called when the folder search field changes.
+    pub fn on_notes_search_changed<F>(&self, mut handler: F)
+    where
+        F: FnMut(String) + 'static,
+    {
+        self.component
+            .on_notes_search_changed(move |q| handler(q.to_string()));
+    }
+
+    /// Register a closure called when Delete is tapped on a note.
+    pub fn on_note_delete_tapped<F>(&self, mut handler: F)
+    where
+        F: FnMut(String) + 'static,
+    {
+        self.component
+            .on_note_delete_tapped(move |id| handler(id.to_string()));
+    }
+
+    pub fn set_notes_sort_mode(&self, mode: &str) {
+        self.component
+            .set_notes_sort_mode(slint::SharedString::from(mode));
+    }
+
+    pub fn notes_sort_mode(&self) -> String {
+        self.component.get_notes_sort_mode().to_string()
+    }
+
+    pub fn notes_search_query(&self) -> String {
+        self.component.get_notes_search_query().to_string()
+    }
+
+    /// Register a closure called when a notebook row is tapped.
+    pub fn on_notebook_tapped<F>(&self, mut handler: F)
+    where
+        F: FnMut(String) + 'static,
+    {
+        self.component
+            .on_notebook_tapped(move |id| handler(id.to_string()));
+    }
+
+    /// Register a closure called when "+ New Notebook" is tapped.
+    pub fn on_notebook_new_tapped<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_notebook_new_tapped(handler);
+    }
+
+    /// Register a closure called when "← Back" is tapped in the note list.
+    pub fn on_notebook_back_tapped<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_notebook_back_tapped(handler);
+    }
+
+    /// Register a closure called when Delete is tapped on a folder.
+    pub fn on_notebook_delete_tapped<F>(&self, mut handler: F)
+    where
+        F: FnMut(String) + 'static,
+    {
+        self.component
+            .on_notebook_delete_tapped(move |id| handler(id.to_string()));
+    }
+
+    pub fn on_notebook_delete_confirm<F>(&self, mut handler: F)
+    where
+        F: FnMut(String) + 'static,
+    {
+        self.component
+            .on_notebook_delete_confirm(move |id| handler(id.to_string()));
+    }
+
+    pub fn on_notebook_delete_cancel<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_notebook_delete_cancel(handler);
+    }
+
+    pub fn show_notebook_delete_confirm(&self, id: &str, title: &str, message: &str) {
+        self.component
+            .set_notebook_delete_id(slint::SharedString::from(id));
+        self.component
+            .set_notebook_delete_title(slint::SharedString::from(title));
+        self.component
+            .set_notebook_delete_message(slint::SharedString::from(message));
+        self.component.set_notebook_delete_visible(true);
+    }
+
+    pub fn hide_notebook_delete_confirm(&self) {
+        self.component.set_notebook_delete_visible(false);
+    }
+
+    // ── Note move API ─────────────────────────────────────────────────────
+
+    /// Register a closure called when the user confirms moving a note.
+    pub fn on_note_move_confirm<F>(&self, mut handler: F)
+    where
+        F: FnMut(String, String) + 'static,
+    {
+        self.component
+            .on_note_move_confirm(move |note_id, notebook_id| {
+                handler(note_id.to_string(), notebook_id.to_string())
+            });
+    }
+
+    /// Register a closure called when the move dialog is cancelled.
+    pub fn on_note_move_cancel<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_note_move_cancel(handler);
+    }
+
+    // ── Notebook rename API ───────────────────────────────────────────────
+
+    pub fn set_notebook_rename_visible(&self, v: bool) {
+        self.component.set_notebook_rename_visible(v);
+    }
+
+    pub fn on_notebook_rename_confirm<F>(&self, mut handler: F)
+    where
+        F: FnMut(String, String) + 'static,
+    {
+        self.component.on_notebook_rename_confirm(move |id, title| {
+            handler(id.to_string(), title.to_string())
+        });
+    }
+
+    pub fn on_notebook_rename_cancel<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_notebook_rename_cancel(handler);
+    }
+
+    // ── Calendar API ──────────────────────────────────────────────────────
+
+    pub fn set_show_calendar(&self, show: bool) {
+        self.component.set_show_calendar(show);
+    }
+
+    pub fn set_cal_header_label(&self, label: &str) {
+        self.component
+            .set_cal_header_label(slint::SharedString::from(label));
+    }
+
+    pub fn set_cal_year(&self, y: i32) {
+        self.component.set_cal_year(y);
+    }
+
+    pub fn set_cal_month(&self, m: i32) {
+        self.component.set_cal_month(m);
+    }
+
+    pub fn set_cal_day(&self, d: i32) {
+        self.component.set_cal_day(d);
+    }
+
+    pub fn set_cal_sub_view(&self, v: i32) {
+        self.component.set_cal_sub_view(v);
+    }
+
+    /// Push month-grid days: `(day, has_events, is_today, in_month, first_event_title)`.
+    pub fn set_cal_month_days(&self, days: &[(i32, bool, bool, bool, String)]) {
+        let items: Vec<CalDay> = days
+            .iter()
+            .map(|(day, has_events, is_today, in_month, title)| CalDay {
+                day: *day,
+                has_events: *has_events,
+                is_today: *is_today,
+                in_month: *in_month,
+                first_event_title: slint::SharedString::from(title.as_str()),
+            })
+            .collect();
+        self.component
+            .set_cal_month_days(std::rc::Rc::new(slint::VecModel::from(items)).into());
+    }
+
+    /// Push calendar events: `(title, time_label, all_day, col)`.
+    pub fn set_cal_events(&self, events: &[(String, String, bool, i32)]) {
+        let items: Vec<CalDayEvent> = events
+            .iter()
+            .map(|(title, time_label, all_day, col)| CalDayEvent {
+                title: slint::SharedString::from(title.as_str()),
+                time_label: slint::SharedString::from(time_label.as_str()),
+                all_day: *all_day,
+                col: *col,
+            })
+            .collect();
+        self.component
+            .set_cal_events(std::rc::Rc::new(slint::VecModel::from(items)).into());
+    }
+
+    /// Push week column labels (7 entries, e.g. "Mon\n21").
+    pub fn set_cal_week_day_labels(&self, labels: &[String]) {
+        let items: Vec<slint::SharedString> = labels
+            .iter()
+            .map(|s| slint::SharedString::from(s.as_str()))
+            .collect();
+        self.component
+            .set_cal_week_day_labels(std::rc::Rc::new(slint::VecModel::from(items)).into());
+    }
+
+    /// Push year-month summaries: `(name, short_name, event_count, month_num)`.
+    pub fn set_cal_year_months(&self, months: &[(String, String, i32, i32)]) {
+        let items: Vec<CalMonthInfo> = months
+            .iter()
+            .map(|(name, short_name, event_count, month_num)| CalMonthInfo {
+                name: slint::SharedString::from(name.as_str()),
+                short_name: slint::SharedString::from(short_name.as_str()),
+                event_count: *event_count,
+                month_num: *month_num,
+            })
+            .collect();
+        self.component
+            .set_cal_year_months(std::rc::Rc::new(slint::VecModel::from(items)).into());
+    }
+
+    pub fn on_nav_calendar_tapped<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_nav_calendar_tapped(handler);
+    }
+
+    pub fn on_cal_sub_view_changed<F>(&self, mut handler: F)
+    where
+        F: FnMut(i32) + 'static,
+    {
+        self.component.on_cal_sub_view_changed(move |v| handler(v));
+    }
+
+    pub fn on_cal_prev<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_cal_prev(handler);
+    }
+
+    pub fn on_cal_next<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_cal_next(handler);
+    }
+
+    pub fn on_cal_today<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_cal_today(handler);
+    }
+
+    pub fn on_cal_day_tapped<F>(&self, mut handler: F)
+    where
+        F: FnMut(i32, i32, i32) + 'static,
+    {
+        self.component
+            .on_cal_day_tapped(move |y, m, d| handler(y, m, d));
+    }
+
+    pub fn on_cal_open_day_note<F>(&self, mut handler: F)
+    where
+        F: FnMut(i32, i32, i32) + 'static,
+    {
+        self.component
+            .on_cal_open_day_note(move |y, m, d| handler(y, m, d));
+    }
+
+    pub fn set_cal_day_note_exists(&self, v: bool) {
+        self.component.set_cal_day_note_exists(v);
+    }
+
+    pub fn set_cal_day_note_id(&self, id: &str) {
+        self.component
+            .set_cal_day_note_id(slint::SharedString::from(id));
+    }
+
+    pub fn set_note_anchor_label(&self, label: &str) {
+        self.component
+            .set_note_anchor_label(slint::SharedString::from(label));
+    }
+
+    pub fn on_note_anchor_tapped<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_note_anchor_tapped(handler);
+    }
+
+    // ── Ring tool API ─────────────────────────────────────────────────────
+
+    /// Register a closure called when the "Pen" ring slice is tapped.
+    pub fn on_ring_pen<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_ring_pen_tapped(handler);
+    }
+
+    /// Register a closure called when the "Highlighter" ring slice is tapped.
+    pub fn on_ring_highlighter<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_ring_highlighter_tapped(handler);
+    }
+
+    /// Register a closure called when the "Eraser" ring slice is tapped.
+    pub fn on_ring_eraser<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_ring_eraser_tapped(handler);
+    }
+
+    /// Register a closure called when the "Clear" ring slice is tapped.
+    pub fn on_ring_clear<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_ring_clear_tapped(handler);
+    }
+
+    // ── Page state helpers ────────────────────────────────────────────────
+
+    /// Snapshot the current live ink state into the PageBook without navigating.
+    ///
+    /// Call this before switching to an overlay view (note list, notebook list)
+    /// so that the ink is guaranteed to be persisted even if no explicit
+    /// `navigate_to_page` follows.
+    pub fn save_current_page(&self) {
+        let canvas_h = self.canvas_height();
+        let live_state = self.snapshot_live_state(canvas_h);
+        let mut book = self.pages.borrow_mut();
+        let cur = book.current_index();
+        book.navigate_to(live_state, cur);
+    }
+
+    /// Zero-based index of the currently displayed page in the PageBook.
+    pub fn current_page_idx(&self) -> usize {
+        self.pages.borrow().current_index()
+    }
+
+    /// Raw grayscale pixel bytes of the committed ink layer for the current page.
+    pub fn get_committed_pixels(&self) -> Vec<u8> {
+        self.committed_layer.borrow().data.clone()
+    }
+
+    /// Canvas size for the committed ink layer `(width, height)`.
+    pub fn canvas_size(&self) -> (u32, u32) {
+        (self.width, self.canvas_height())
+    }
+
+    /// Restore saved pixel data into a specific PageBook slot.
+    ///
+    /// If the target page is currently displayed, the live committed_layer is
+    /// also updated and a screen-change repaint is triggered.
+    pub fn restore_page_pixels(&self, page_idx: usize, data: Vec<u8>) {
+        let canvas_h = self.canvas_height();
+        let expected = (self.width * canvas_h) as usize;
+        if data.len() != expected {
+            eprintln!(
+                "restore_page_pixels: size mismatch (expected {expected}, got {})",
+                data.len()
+            );
+            return;
+        }
+        let mut new_committed = PixelBuf::new(self.width, canvas_h);
+        new_committed.data = data;
+        {
+            let mut book = self.pages.borrow_mut();
+            while book.pages.len() <= page_idx {
+                book.pages.push(PageState::blank(
+                    self.width,
+                    canvas_h,
+                    self.default_base_width,
+                ));
+            }
+            book.pages[page_idx].committed = new_committed.clone();
+        }
+        if self.pages.borrow().current_index() == page_idx {
+            *self.committed_layer.borrow_mut() = new_committed;
+            self.screen_change.set(true);
+        }
+    }
+
     // ── Input event dispatch ──────────────────────────────────────────────
 
     /// Forward a pointer-moved event (logical pixels) to the Slint component.
@@ -992,7 +1962,8 @@ impl EphemerisUi {
     /// Forward a key-released event.
     pub fn dispatch_key_released(&self, text: slint::SharedString) {
         use slint::platform::WindowEvent;
-        self.window.dispatch_event(WindowEvent::KeyReleased { text });
+        self.window
+            .dispatch_event(WindowEvent::KeyReleased { text });
     }
 
     // ── Page navigation API ───────────────────────────────────────────────
@@ -1358,59 +2329,83 @@ impl EphemerisUi {
             pal_buf.data[i] = luma;
         }
 
-        // 4b. Render background pattern (lines, grid, dots) for current page.
-        let template = self.current_page_template();
-        render_background(&mut pal_buf, template, self.width, self.height);
-
-        // 5. Composite ink layers over the canvas region.
-        //
-        //    The canvas occupies rows [STATUS_BAR_H, height - TOOLBAR_H).
-        //    Both the committed layer and any in-progress points are composited
-        //    here.  We build a temporary per-frame in-progress layer so that
-        //    re-rendering the in-progress points doesn't permanently dirty the
-        //    committed layer.
+        // 4b–5. Canvas compositing: background pattern + ink layers.
+        //       Skipped for full-screen overlays and see-text — without this
+        //       guard, dark ink bleeds through white Slint backgrounds via min().
+        //       The floating drawing menu keeps ink visible; chrome rects are
+        //       restored afterward so nav / menu buttons stay opaque.
         let canvas_h = self.canvas_height();
+        let drawing_menu_open = self.component.get_drawing_menu_open();
+        if self.should_composite_ink() {
+            // Snapshot Slint luma for chrome restore when the drawing menu is open.
+            let pre_ink = if drawing_menu_open {
+                Some(pal_buf.data.clone())
+            } else {
+                None
+            };
 
-        // 5a. Build the in-progress layer for this frame (only if drawing).
-        let in_progress_pts = self.in_progress.borrow();
-        let has_in_progress = !in_progress_pts.is_empty();
-        let ip_layer = if has_in_progress {
-            let mut layer = PixelBuf::new(self.width, canvas_h);
-            raster::rasterize_points(
-                &mut layer,
-                &in_progress_pts,
-                *self.in_progress_base_width.borrow(),
-                0, // canvas X offset within the layer
-                0, // layer Y=0 corresponds to canvas top
-                self.width,
-                canvas_h,
-            );
-            Some(layer)
-        } else {
-            None
-        };
-        drop(in_progress_pts); // release borrow before compositing
+            // 4b. Render background pattern (lines, grid, dots) for current page.
+            let template = self.current_page_template();
+            render_background(&mut pal_buf, template, self.width, self.height);
 
-        // 5b. Composite committed layer + optional in-progress layer into pal_buf.
-        let committed = self.committed_layer.borrow();
-        let stride = self.width as usize;
-
-        for row in 0..canvas_h {
-            let buf_row = (STATUS_BAR_H + row) as usize;
-            for col in 0..self.width as usize {
-                let layer_idx = row as usize * stride + col;
-                let buf_idx = buf_row * stride + col;
-
-                // Start with the committed layer pixel.
-                let mut ink_px = committed.data[layer_idx];
-
-                // Overlay the in-progress layer if present.
-                if let Some(ref ip) = ip_layer {
-                    ink_px = ink_px.min(ip.data[layer_idx]);
+            // 5a. Build the in-progress layer for this frame (only if drawing).
+            let current_tool = self.engine.borrow().config().tool;
+            let in_progress_pts = self.in_progress.borrow();
+            let has_in_progress = !in_progress_pts.is_empty();
+            let ip_layer = if has_in_progress {
+                // Eraser in-progress: neutral value is 0 (max-blend identity).
+                // Pen/Highlighter in-progress: neutral value is 255 (min-blend identity).
+                let mut layer = PixelBuf::new(self.width, canvas_h);
+                if current_tool == Tool::Eraser {
+                    layer.fill(0);
                 }
+                raster::rasterize_points(
+                    &mut layer,
+                    &in_progress_pts,
+                    *self.in_progress_base_width.borrow(),
+                    0,
+                    0,
+                    self.width,
+                    canvas_h,
+                    current_tool,
+                );
+                Some(layer)
+            } else {
+                None
+            };
+            drop(in_progress_pts);
 
-                // min() blend: dark ink over the Slint-rendered background.
-                pal_buf.data[buf_idx] = pal_buf.data[buf_idx].min(ink_px);
+            // 5b. Composite committed layer + optional in-progress layer into pal_buf.
+            let committed = self.committed_layer.borrow();
+            let stride = self.width as usize;
+
+            for row in 0..canvas_h {
+                let buf_row = (STATUS_BAR_H + row) as usize;
+                for col in 0..self.width as usize {
+                    let layer_idx = row as usize * stride + col;
+                    let buf_idx = buf_row * stride + col;
+
+                    let mut ink_px = committed.data[layer_idx];
+                    if let Some(ref ip) = ip_layer {
+                        // Eraser in-progress uses max-blend: white pixels in ip
+                        // override dark ink in the committed layer so the erase
+                        // preview shows live while the gesture is still active.
+                        // Pen/Highlighter use min-blend (dark-wins).
+                        ink_px = if current_tool == Tool::Eraser {
+                            ink_px.max(ip.data[layer_idx])
+                        } else {
+                            ink_px.min(ip.data[layer_idx])
+                        };
+                    }
+                    pal_buf.data[buf_idx] = pal_buf.data[buf_idx].min(ink_px);
+                }
+            }
+            drop(committed);
+
+            // 5c. Restore opaque chrome (nav rail, burger dropdown, close button)
+            //     so ink does not bleed through via min() while the menu is open.
+            if let Some(pre) = pre_ink {
+                restore_chrome_rects(&mut pal_buf, &pre, self.width, self.height);
             }
         }
 
@@ -1527,6 +2522,99 @@ impl EphemerisUi {
         // Switching pages replaces the whole canvas — force a Clear refresh so
         // the outgoing page leaves no ghost and the incoming ink is presented.
         self.screen_change.set(true);
+    }
+
+    // ── Recording API ─────────────────────────────────────────────────────
+
+    pub fn set_has_mic(&self, v: bool) {
+        self.component.set_has_mic(v);
+    }
+
+    pub fn set_rec_state(&self, state: i32) {
+        self.component.set_rec_state(state);
+    }
+
+    pub fn set_rec_duration_label(&self, label: &str) {
+        self.component
+            .set_rec_duration_label(slint::SharedString::from(label));
+    }
+
+    pub fn set_show_recording_list(&self, show: bool) {
+        self.component.set_show_recording_list(show);
+    }
+
+    pub fn set_recording_list(&self, recordings: &[RecordingEntry]) {
+        self.component.set_recording_list(
+            std::rc::Rc::new(slint::VecModel::from(recordings.to_vec())).into(),
+        );
+    }
+
+    pub fn on_nav_rec_tapped<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_nav_rec_tapped(handler);
+    }
+
+    pub fn on_rec_new_tapped<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_rec_new_tapped(handler);
+    }
+
+    pub fn on_rec_pause_tapped<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_rec_pause_tapped(handler);
+    }
+
+    pub fn on_rec_resume_tapped<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_rec_resume_tapped(handler);
+    }
+
+    pub fn on_rec_stop_tapped<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_rec_stop_tapped(handler);
+    }
+
+    pub fn on_rec_discard_tapped<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_rec_discard_tapped(handler);
+    }
+
+    pub fn on_rec_play_tapped<F>(&self, mut handler: F)
+    where
+        F: FnMut(String) + 'static,
+    {
+        self.component
+            .on_rec_play_tapped(move |id| handler(id.to_string()));
+    }
+
+    pub fn on_rec_transcribe_tapped<F>(&self, mut handler: F)
+    where
+        F: FnMut(String) + 'static,
+    {
+        self.component
+            .on_rec_transcribe_tapped(move |id| handler(id.to_string()));
+    }
+
+    pub fn on_rec_delete_tapped<F>(&self, mut handler: F)
+    where
+        F: FnMut(String) + 'static,
+    {
+        self.component
+            .on_rec_delete_tapped(move |id| handler(id.to_string()));
+    }
+
+    pub fn on_rec_rename_confirm<F>(&self, mut handler: F)
+    where
+        F: FnMut(String, String) + 'static,
+    {
+        self.component
+            .on_rec_rename_confirm(move |id, title| handler(id.to_string(), title.to_string()));
+    }
+
+    pub fn on_rec_rename_cancel<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_rec_rename_cancel(handler);
+    }
+
+    pub fn on_rec_transcription_close<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_rec_transcription_close(handler);
+    }
+
+    pub fn on_rec_transcription_retranscribe<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_rec_transcription_retranscribe(handler);
     }
 }
 
@@ -2253,12 +3341,28 @@ mod tests {
         let black = slint::Color::from_rgb_u8(0, 0, 0);
         assert_eq!(theme.get_chrome_bg(), white, "chrome-bg must be white");
         assert_eq!(theme.get_canvas_bg(), white, "canvas-bg must be white");
-        assert_eq!(theme.get_chrome_border(), black, "chrome-border must be black");
+        assert_eq!(
+            theme.get_chrome_border(),
+            black,
+            "chrome-border must be black"
+        );
         assert_eq!(theme.get_btn_bg(), white, "btn-bg must be white");
         assert_eq!(theme.get_btn_fg(), black, "btn-fg must be black");
-        assert_eq!(theme.get_btn_active_bg(), black, "active btn fill must be black");
-        assert_eq!(theme.get_btn_active_fg(), white, "active btn text must be white");
-        assert_eq!(theme.get_danger_fg(), black, "danger-fg must be black (not red)");
+        assert_eq!(
+            theme.get_btn_active_bg(),
+            black,
+            "active btn fill must be black"
+        );
+        assert_eq!(
+            theme.get_btn_active_fg(),
+            white,
+            "active btn text must be white"
+        );
+        assert_eq!(
+            theme.get_danger_fg(),
+            black,
+            "danger-fg must be black (not red)"
+        );
     }
 
     /// Dark theme: chrome and canvas are black; borders and text are white.
@@ -2271,9 +3375,21 @@ mod tests {
         let black = slint::Color::from_rgb_u8(0, 0, 0);
         assert_eq!(theme.get_chrome_bg(), black, "chrome-bg must be black");
         assert_eq!(theme.get_canvas_bg(), black, "canvas-bg must be black");
-        assert_eq!(theme.get_chrome_border(), white, "chrome-border must be white");
-        assert_eq!(theme.get_btn_active_bg(), white, "active btn fill must be white");
-        assert_eq!(theme.get_btn_active_fg(), black, "active btn text must be black");
+        assert_eq!(
+            theme.get_chrome_border(),
+            white,
+            "chrome-border must be white"
+        );
+        assert_eq!(
+            theme.get_btn_active_bg(),
+            white,
+            "active btn fill must be white"
+        );
+        assert_eq!(
+            theme.get_btn_active_fg(),
+            black,
+            "active btn text must be black"
+        );
     }
 
     /// `swipe-right` callback emitted from `.slint` wires correctly to
@@ -2427,16 +3543,13 @@ mod tests {
             .expect("idle render failed")
             .is_empty());
 
-        // Change only the status-bar title → Slint repaints just that text.
-        ui.set_page_title("A different title");
+        // Toggle the start page — Slint repaints the content area.
+        ui.set_show_start_page(true);
         let damage = ui.render_frame(&mut disp).expect("partial render failed");
 
-        assert!(!damage.is_empty(), "title change must report damage");
-        let (_x0, _y0, _x1, y1) = damage_bbox(&damage);
         assert!(
-            y1 < 600,
-            "partial repaint of the status bar must not span the full window \
-             height (bottom={y1}); damage should reflect Slint's partial region"
+            !damage.is_empty(),
+            "show-start-page toggle must report damage"
         );
     }
 
@@ -2464,8 +3577,8 @@ mod tests {
         ui.render_frame(&mut disp).expect("ink render failed");
         assert_eq!(disp.last_mode, Some(RefreshMode::Fast));
 
-        // UI-only change (status-bar title) → Partial.
-        ui.set_page_title("Another title");
+        // UI-only change (toggle start page) → Partial.
+        ui.set_show_start_page(true);
         ui.render_frame(&mut disp).expect("ui render failed");
         assert_eq!(disp.last_mode, Some(RefreshMode::Partial));
 
@@ -2525,12 +3638,109 @@ mod tests {
         for i in 0..3 {
             let title = format!("Page {}", i);
             ui.set_page_title(&title);
-            let damage = ui.render_frame(&mut display)
+            let damage = ui
+                .render_frame(&mut display)
                 .expect("render_frame should not fail with text elements");
             // First frame should always have damage.
             if i == 0 {
                 assert!(!damage.is_empty(), "first frame should produce damage");
             }
         }
+    }
+
+    /// Drawing menu must not hide ink: compositing stays on, input is gated.
+    #[test]
+    fn drawing_menu_keeps_ink_visible_but_blocks_input() {
+        let ui = EphemerisUi::new(800, 600).expect("UI construction failed");
+        assert!(ui.is_canvas_active());
+        assert!(ui.should_composite_ink());
+
+        ui.set_drawing_menu_open(true);
+        assert!(
+            !ui.is_canvas_active(),
+            "drawing menu owns input — ink engine must not receive strokes"
+        );
+        assert!(
+            ui.should_composite_ink(),
+            "ink must stay composited under the floating drawing menu"
+        );
+    }
+
+    /// See-text overlay must hide ink compositing (no bleed through labels).
+    #[test]
+    fn see_text_hides_ink_compositing() {
+        let ui = EphemerisUi::new(800, 600).expect("UI construction failed");
+        ui.set_note_see_text(true);
+        assert!(!ui.is_canvas_active());
+        assert!(
+            !ui.should_composite_ink(),
+            "see-text must skip ink so handwriting does not bleed through the overlay"
+        );
+    }
+
+    /// With the drawing menu open, ink remains in the canvas area while chrome
+    /// rects (nav / menu) are restored from the pre-ink Slint frame.
+    #[test]
+    fn drawing_menu_composites_ink_outside_chrome() {
+        struct CapturingDisplay {
+            last: Option<PixelBuf>,
+        }
+        impl Display for CapturingDisplay {
+            fn size(&self) -> (u32, u32) {
+                (800, 600)
+            }
+            fn present(
+                &mut self,
+                buf: &PixelBuf,
+                _: &[Rect],
+                _: RefreshMode,
+            ) -> Result<(), ephemeris_pal::DisplayError> {
+                self.last = Some(buf.clone());
+                Ok(())
+            }
+        }
+
+        let ui = EphemerisUi::new(800, 600).expect("UI construction failed");
+        let canvas_h = ui.canvas_height();
+        let mut ink = PixelBuf::new(800, canvas_h);
+        // Black vertical strip in the middle of the canvas (away from nav/menu).
+        for row in 100..200 {
+            for col in 300..320 {
+                ink.data[(row * 800 + col) as usize] = 0;
+            }
+        }
+        // Also plant black under the nav rail and under the menu panel — those
+        // must be restored (not visible) when the menu is open.
+        for row in 0..canvas_h {
+            for col in 0..NAV_W {
+                ink.data[(row * 800 + col) as usize] = 0;
+            }
+        }
+        ui.push_canvas_pixels(&ink);
+        ui.set_drawing_menu_open(true);
+        ui.request_screen_change();
+
+        let mut cap = CapturingDisplay { last: None };
+        ui.render_frame(&mut cap).expect("render failed");
+        let buf = cap.last.expect("expected a presented frame");
+        let stride = buf.stride as usize;
+
+        // Canvas ink (away from chrome) must still be dark.
+        let mid_dark =
+            (100..200usize).any(|row| (300..320usize).any(|col| buf.data[row * stride + col] < 50));
+        assert!(
+            mid_dark,
+            "ink in the open canvas must remain visible with the drawing menu open"
+        );
+
+        // Nav rail columns must not be dominated by ink (chrome restored).
+        let nav_avg: u32 = (0..600usize)
+            .map(|row| buf.data[row * stride + 10] as u32)
+            .sum::<u32>()
+            / 600;
+        assert!(
+            nav_avg > 100,
+            "nav rail must restore Slint chrome (avg luma {nav_avg} too dark — ink bleed)"
+        );
     }
 }

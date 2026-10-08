@@ -18,6 +18,10 @@ sqlite = []
 webdav = ["dep:reqwest_dav", "dep:bytes"]
 # `ics` enables HTTPS ICS feed fetching (pulls in reqwest).
 ics = ["dep:reqwest"]
+# `ocr` enables RasterOcrTranscriber's Tesseract CLI backend (system `tesseract`
+# + tessdata at runtime). Without this feature the type still exists but is a
+# NoOp — desktop CI can skip OCR without a system dependency.
+ocr = []
 
 [dependencies]
 ephemeris-pal = { workspace = true }
@@ -33,6 +37,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 icalendar = { workspace = true }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
+printpdf = { workspace = true }
 # Optional — activated only when the `webdav` feature is enabled.
 reqwest_dav = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }

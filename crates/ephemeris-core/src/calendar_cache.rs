@@ -264,7 +264,9 @@ mod tests {
 
         assert_eq!(cache.len(), 2);
         let all = cache.list_all();
-        assert!(all.iter().any(|e| e.source == "ics" && e.title == "ICS event"));
+        assert!(all
+            .iter()
+            .any(|e| e.source == "ics" && e.title == "ICS event"));
         assert!(all
             .iter()
             .any(|e| e.source == "caldav" && e.title == "CalDAV event"));

@@ -37,16 +37,141 @@ use crate::{
     model::{
         Account, AccountId, AccountKind, CalendarEvent, Color, EventId, Note, NoteId, Page, PageId,
         PageTemplate, Point, Profile, ProfileId, Stroke, StrokeId, Task, TaskId, TaskPriority,
-        Tool,
+        TaskStatus, Tool,
     },
     AppError, Result,
 };
+
+/// Extended task fields stored as JSON in `tasks.meta`.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct TaskMetaRow {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(default)]
+    status: TaskStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scheduled: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    start: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completed_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    created_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recurrence: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    section: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+}
+
+fn task_meta_to_json(task: &Task) -> std::result::Result<String, serde_json::Error> {
+    let meta = TaskMetaRow {
+        description: task.description.clone(),
+        status: task.status,
+        scheduled: task.scheduled,
+        start: task.start,
+        completed_at: task.completed_at,
+        created_at: task.created_at,
+        recurrence: task.recurrence.clone(),
+        project: task.project.clone(),
+        section: task.section.clone(),
+        parent_id: task.parent_id.map(|p| p.0.to_string()),
+        url: task.url.clone(),
+    };
+    serde_json::to_string(&meta)
+}
+
+fn apply_task_meta(task: &mut Task, meta_json: Option<&str>) {
+    let Some(raw) = meta_json.filter(|s| !s.is_empty() && *s != "{}") else {
+        task.status = if task.done {
+            TaskStatus::Done
+        } else {
+            TaskStatus::Todo
+        };
+        return;
+    };
+    let Ok(meta) = serde_json::from_str::<TaskMetaRow>(raw) else {
+        return;
+    };
+    task.description = meta.description;
+    task.status = meta.status;
+    task.scheduled = meta.scheduled;
+    task.start = meta.start;
+    task.completed_at = meta.completed_at;
+    task.created_at = meta.created_at;
+    task.recurrence = meta.recurrence;
+    task.project = meta.project;
+    task.section = meta.section;
+    task.parent_id = meta
+        .parent_id
+        .and_then(|s| s.parse().ok())
+        .map(TaskId);
+    task.url = meta.url;
+    if task.done && task.status == TaskStatus::Todo {
+        task.status = TaskStatus::Done;
+    }
+}
+
+fn row_to_task(
+    id_s: String,
+    pid_s: String,
+    title: String,
+    due: Option<i64>,
+    prio: i64,
+    tags_s: String,
+    source: String,
+    done: i64,
+    source_ref: Option<String>,
+    meta: Option<String>,
+) -> Result<Task> {
+    let id = id_s
+        .parse()
+        .map_err(|e| AppError::Storage(format!("bad task uuid: {e}")))?;
+    let profile_id = pid_s
+        .parse()
+        .map_err(|e| AppError::Storage(format!("bad profile uuid: {e}")))?;
+    let priority = match prio {
+        0 => TaskPriority::Low,
+        2 => TaskPriority::High,
+        _ => TaskPriority::Medium,
+    };
+    let tags: Vec<String> = serde_json::from_str(&tags_s).map_err(serde_err)?;
+    let mut task = Task {
+        id: TaskId(id),
+        profile_id: ProfileId(profile_id),
+        title,
+        due: due.map(|d| d as u64),
+        priority,
+        tags,
+        source,
+        done: done != 0,
+        source_ref,
+        description: None,
+        status: TaskStatus::Todo,
+        scheduled: None,
+        start: None,
+        completed_at: None,
+        created_at: None,
+        recurrence: None,
+        project: None,
+        section: None,
+        parent_id: None,
+        url: None,
+    };
+    apply_task_meta(&mut task, meta.as_deref());
+    Ok(task)
+}
 
 // ── Schema migrations ────────────────────────────────────────────────────────
 
 /// Current schema version. Bump this and add a migration step in
 /// [`run_migrations`] whenever the schema changes.
-const CURRENT_VERSION: u32 = 2;
+const CURRENT_VERSION: u32 = 4;
 
 /// The migration SQL for each version level, indexed `0..CURRENT_VERSION`.
 /// Entry `i` takes the schema from version `i` to `i+1`.
@@ -129,6 +254,16 @@ static MIGRATIONS: &[&str] = &[
         value TEXT NOT NULL
     );
     UPDATE schema_version SET version = 2;
+    "#,
+    // 2 → 3: optional source_ref for provider round-trip (e.g. Obsidian path:line)
+    r#"
+    ALTER TABLE tasks ADD COLUMN source_ref TEXT;
+    UPDATE schema_version SET version = 3;
+    "#,
+    // 3 → 4: JSON blob for Obsidian/Todoist-extended task fields
+    r#"
+    ALTER TABLE tasks ADD COLUMN meta TEXT NOT NULL DEFAULT '{}';
+    UPDATE schema_version SET version = 4;
     "#,
 ];
 
@@ -295,6 +430,7 @@ impl SqliteStore {
                 Ok(Some(Profile {
                     id: ProfileId(uuid),
                     name,
+                    ..Profile::new("")
                 }))
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -322,6 +458,7 @@ impl SqliteStore {
             out.push(Profile {
                 id: ProfileId(id),
                 name,
+                ..Profile::new("")
             });
         }
         Ok(out)
@@ -711,11 +848,12 @@ impl SqliteStore {
     /// Insert or replace a task.
     pub fn upsert_task(&self, task: &Task) -> Result<()> {
         let tags_json = serde_json::to_string(&task.tags).map_err(serde_err)?;
+        let meta_json = task_meta_to_json(task).map_err(serde_err)?;
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO tasks
-                 (id, profile_id, title, due, priority, tags, source, done)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 (id, profile_id, title, due, priority, tags, source, done, source_ref, meta)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     task.id.0.to_string(),
                     task.profile_id.0.to_string(),
@@ -725,6 +863,8 @@ impl SqliteStore {
                     tags_json,
                     task.source,
                     task.done as i64,
+                    task.source_ref,
+                    meta_json,
                 ],
             )
             .map_err(storage_err)?;
@@ -736,7 +876,7 @@ impl SqliteStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, profile_id, title, due, priority, tags, source, done
+                "SELECT id, profile_id, title, due, priority, tags, source, done, source_ref, meta
                  FROM tasks WHERE id = ?1",
             )
             .map_err(storage_err)?;
@@ -750,31 +890,14 @@ impl SqliteStore {
                 row.get::<_, String>(5)?,
                 row.get::<_, String>(6)?,
                 row.get::<_, i64>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
             ))
         }) {
-            Ok((id_s, pid_s, title, due, prio, tags_s, source, done)) => {
-                let id = id_s
-                    .parse()
-                    .map_err(|e| AppError::Storage(format!("bad task uuid: {e}")))?;
-                let profile_id = pid_s
-                    .parse()
-                    .map_err(|e| AppError::Storage(format!("bad profile uuid: {e}")))?;
-                let priority = match prio {
-                    0 => TaskPriority::Low,
-                    2 => TaskPriority::High,
-                    _ => TaskPriority::Medium,
-                };
-                let tags: Vec<String> = serde_json::from_str(&tags_s).map_err(serde_err)?;
-                Ok(Some(Task {
-                    id: TaskId(id),
-                    profile_id: ProfileId(profile_id),
-                    title,
-                    due: due.map(|d| d as u64),
-                    priority,
-                    tags,
-                    source,
-                    done: done != 0,
-                }))
+            Ok((id_s, pid_s, title, due, prio, tags_s, source, done, source_ref, meta)) => {
+                Ok(Some(row_to_task(
+                    id_s, pid_s, title, due, prio, tags_s, source, done, source_ref, meta,
+                )?))
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(storage_err(e)),
@@ -786,7 +909,7 @@ impl SqliteStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, profile_id, title, due, priority, tags, source, done
+                "SELECT id, profile_id, title, due, priority, tags, source, done, source_ref, meta
                  FROM tasks",
             )
             .map_err(storage_err)?;
@@ -801,34 +924,18 @@ impl SqliteStore {
                     row.get::<_, String>(5)?,
                     row.get::<_, String>(6)?,
                     row.get::<_, i64>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
                 ))
             })
             .map_err(storage_err)?;
         let mut out = Vec::new();
         for row in rows {
-            let (id_s, pid_s, title, due, prio, tags_s, source, done) = row.map_err(storage_err)?;
-            let id = id_s
-                .parse()
-                .map_err(|e| AppError::Storage(format!("bad task uuid: {e}")))?;
-            let pid = pid_s
-                .parse()
-                .map_err(|e| AppError::Storage(format!("bad profile uuid: {e}")))?;
-            let priority = match prio {
-                0 => TaskPriority::Low,
-                2 => TaskPriority::High,
-                _ => TaskPriority::Medium,
-            };
-            let tags: Vec<String> = serde_json::from_str(&tags_s).map_err(serde_err)?;
-            out.push(Task {
-                id: TaskId(id),
-                profile_id: ProfileId(pid),
-                title,
-                due: due.map(|d| d as u64),
-                priority,
-                tags,
-                source,
-                done: done != 0,
-            });
+            let (id_s, pid_s, title, due, prio, tags_s, source, done, source_ref, meta) =
+                row.map_err(storage_err)?;
+            out.push(row_to_task(
+                id_s, pid_s, title, due, prio, tags_s, source, done, source_ref, meta,
+            )?);
         }
         Ok(out)
     }
@@ -838,7 +945,7 @@ impl SqliteStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, profile_id, title, due, priority, tags, source, done
+                "SELECT id, profile_id, title, due, priority, tags, source, done, source_ref, meta
                  FROM tasks WHERE profile_id = ?1",
             )
             .map_err(storage_err)?;
@@ -853,34 +960,18 @@ impl SqliteStore {
                     row.get::<_, String>(5)?,
                     row.get::<_, String>(6)?,
                     row.get::<_, i64>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
                 ))
             })
             .map_err(storage_err)?;
         let mut out = Vec::new();
         for row in rows {
-            let (id_s, pid_s, title, due, prio, tags_s, source, done) = row.map_err(storage_err)?;
-            let id = id_s
-                .parse()
-                .map_err(|e| AppError::Storage(format!("bad task uuid: {e}")))?;
-            let pid = pid_s
-                .parse()
-                .map_err(|e| AppError::Storage(format!("bad profile uuid: {e}")))?;
-            let priority = match prio {
-                0 => TaskPriority::Low,
-                2 => TaskPriority::High,
-                _ => TaskPriority::Medium,
-            };
-            let tags: Vec<String> = serde_json::from_str(&tags_s).map_err(serde_err)?;
-            out.push(Task {
-                id: TaskId(id),
-                profile_id: ProfileId(pid),
-                title,
-                due: due.map(|d| d as u64),
-                priority,
-                tags,
-                source,
-                done: done != 0,
-            });
+            let (id_s, pid_s, title, due, prio, tags_s, source, done, source_ref, meta) =
+                row.map_err(storage_err)?;
+            out.push(row_to_task(
+                id_s, pid_s, title, due, prio, tags_s, source, done, source_ref, meta,
+            )?);
         }
         Ok(out)
     }
@@ -1231,7 +1322,7 @@ impl SqliteStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{AccountKind, PageTemplate, Point, TaskPriority, Tool};
+    use crate::model::{AccountKind, PageTemplate, Point, TaskPriority, TaskStatus, Tool};
 
     /// Open a fresh in-memory store for each test.
     fn open() -> SqliteStore {
@@ -1521,6 +1612,34 @@ mod tests {
             let loaded = store.get_task(task.id).unwrap().expect("must be found");
             assert_eq!(loaded.priority, priority);
         }
+    }
+
+    #[test]
+    fn task_meta_round_trip() {
+        let store = open();
+        let profile = Profile::new("Meta");
+        store.upsert_profile(&profile).unwrap();
+
+        let mut task = Task::new("Extended", profile.id);
+        task.description = Some("notes".into());
+        task.status = TaskStatus::InProgress;
+        task.scheduled = Some(100);
+        task.start = Some(50);
+        task.recurrence = Some("every week".into());
+        task.project = Some("Inbox".into());
+        task.section = Some("Today".into());
+        task.url = Some("obsidian://open".into());
+        store.upsert_task(&task).unwrap();
+
+        let loaded = store.get_task(task.id).unwrap().expect("found");
+        assert_eq!(loaded.description.as_deref(), Some("notes"));
+        assert_eq!(loaded.status, TaskStatus::InProgress);
+        assert_eq!(loaded.scheduled, Some(100));
+        assert_eq!(loaded.start, Some(50));
+        assert_eq!(loaded.recurrence.as_deref(), Some("every week"));
+        assert_eq!(loaded.project.as_deref(), Some("Inbox"));
+        assert_eq!(loaded.section.as_deref(), Some("Today"));
+        assert_eq!(loaded.url.as_deref(), Some("obsidian://open"));
     }
 
     // ── CalendarEvent CRUD ────────────────────────────────────────────────────

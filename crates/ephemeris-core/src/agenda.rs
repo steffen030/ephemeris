@@ -86,13 +86,12 @@ pub fn to_agenda_entries(
     events
         .iter()
         .map(|e| {
-            let time_label = if range == AgendaRange::Day
-                || (e.start >= today_start && e.start < today_end)
-            {
-                format_time_hhmm(e.start)
-            } else {
-                format_time_dow_hhmm(e.start)
-            };
+            let time_label =
+                if range == AgendaRange::Day || (e.start >= today_start && e.start < today_end) {
+                    format_time_hhmm(e.start)
+                } else {
+                    format_time_dow_hhmm(e.start)
+                };
             AgendaEntry {
                 title: e.title.clone(),
                 time_label,
@@ -117,10 +116,10 @@ mod tests {
     #[test]
     fn day_filter_includes_within_24h() {
         let events = vec![
-            event("morning", 3_600),       // +1 h — in
-            event("evening", 82_800),      // +23 h — in
-            event("tomorrow", 90_000),     // +25 h — out
-            event("past", -(3_600_i64)),   // -1 h — out
+            event("morning", 3_600),     // +1 h — in
+            event("evening", 82_800),    // +23 h — in
+            event("tomorrow", 90_000),   // +25 h — out
+            event("past", -(3_600_i64)), // -1 h — out
         ];
         let result = filter_agenda(&events, AgendaRange::Day, NOW);
         assert_eq!(result.len(), 2);
@@ -132,7 +131,7 @@ mod tests {
     fn week_filter_spans_7_days() {
         let events = vec![
             event("day3", 3 * 86_400_i64),
-            event("day8", 8 * 86_400_i64),  // out
+            event("day8", 8 * 86_400_i64), // out
         ];
         let result = filter_agenda(&events, AgendaRange::Week, NOW);
         assert_eq!(result.len(), 1);
@@ -143,7 +142,7 @@ mod tests {
     fn month_filter_spans_30_days() {
         let events = vec![
             event("day29", 29 * 86_400_i64),
-            event("day31", 31 * 86_400_i64),  // out
+            event("day31", 31 * 86_400_i64), // out
         ];
         let result = filter_agenda(&events, AgendaRange::Month, NOW);
         assert_eq!(result.len(), 1);

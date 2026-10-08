@@ -208,6 +208,11 @@ impl InkEngine {
         self.cfg.tool = tool;
     }
 
+    /// Set the nominal stroke width in logical pixels. Takes effect on the next stroke.
+    pub fn set_base_width(&mut self, width: f32) {
+        self.cfg.base_width = width;
+    }
+
     /// Feed one input event. `t_ms` is the sample's absolute timestamp; pass a
     /// monotonically increasing clock (see [`InkEngine::update_now`] if you
     /// don't have real timestamps).
