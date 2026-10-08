@@ -19,8 +19,11 @@
 #   ephemeris-archive-keyring.gpg
 set -euo pipefail
 
-REPO_ROOT="${1:?repo root required}"
-DEB_FILE="${2:?deb file required}"
+REPO_ROOT_ARG="${1:?repo root required}"
+DEB_FILE_ARG="${2:?deb file required}"
+mkdir -p "$REPO_ROOT_ARG"
+REPO_ROOT="$(cd "$REPO_ROOT_ARG" && pwd)"
+DEB_FILE="$(cd "$(dirname "$DEB_FILE_ARG")" && pwd)/$(basename "$DEB_FILE_ARG")"
 CODENAME="${3:-stable}"
 COMPONENT="main"
 ARCH="arm64"
