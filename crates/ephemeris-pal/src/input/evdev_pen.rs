@@ -249,9 +249,7 @@ fn run_device(
                 EventSummary::Key(_, KeyCode::BTN_STYLUS | KeyCode::BTN_STYLUS2, val) => {
                     emit(&tx, &wake, InputEvent::PenButton { pressed: val != 0 });
                 }
-                EventSummary::Synchronization(_, _, _)
-                    if have_pos && (tip_down || in_range) =>
-                {
+                EventSummary::Synchronization(_, _, _) if have_pos && (tip_down || in_range) => {
                     let s = sample(
                         raw_x,
                         raw_y,
