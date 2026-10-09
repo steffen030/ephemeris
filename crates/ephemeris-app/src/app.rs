@@ -359,6 +359,8 @@ impl App {
                         anchor: None,
                         profile_id: String::new(),
                         text_content: None,
+                        doc_page: 0,
+                        doc_page_count: 1,
                     }],
                     vec![AppNotebook {
                         id: 1,
@@ -388,9 +390,9 @@ impl App {
         let notebooks: Rc<RefCell<Vec<AppNotebook>>> = Rc::new(RefCell::new(init_notebooks));
         let notes: Rc<RefCell<Vec<AppNote>>> = Rc::new(RefCell::new(init_notes));
 
-        // Restore ink pixels for all known notes.
+        // Restore ink pixels for all known notes (current document page).
         for note in notes.borrow().iter() {
-            if let Some((_w, _h, pixels)) = load_note_page(&data_dir, note.id) {
+            if let Some((_w, _h, pixels)) = load_note_page_n(&data_dir, note.id, note.doc_page) {
                 ui.restore_page_pixels(note.page_index, pixels);
             }
         }
@@ -1036,9 +1038,14 @@ impl App {
                 if id_u32 == 0 {
                     return;
                 }
+                let page_count = notes2
+                    .borrow()
+                    .iter()
+                    .find(|n| n.id == id_u32)
+                    .map(|n| n.doc_page_count)
+                    .unwrap_or(1);
                 notes2.borrow_mut().retain(|n| n.id != id_u32);
-                let page_path = data_dir2.join(format!("page_{id_u32}.bin"));
-                let _ = std::fs::remove_file(&page_path);
+                delete_note_page_files(&data_dir2, id_u32, page_count);
                 if ui2.get_active_note_id().as_str() == id.as_str() {
                     ui2.set_active_note_id("".into());
                 }
@@ -1082,11 +1089,17 @@ impl App {
                     .filter(|n| n.notebook_id.is_some_and(|fid| doomed.contains(&fid)))
                     .map(|n| n.id)
                     .collect();
+                let doomed_counts: Vec<(u32, usize)> = notes2
+                    .borrow()
+                    .iter()
+                    .filter(|n| doomed_notes.contains(&n.id))
+                    .map(|n| (n.id, n.doc_page_count))
+                    .collect();
                 notes2
                     .borrow_mut()
                     .retain(|n| !doomed_notes.contains(&n.id));
-                for nid in &doomed_notes {
-                    let _ = std::fs::remove_file(data_dir2.join(format!("page_{nid}.bin")));
+                for (nid, count) in doomed_counts {
+                    delete_note_page_files(&data_dir2, nid, count);
                 }
                 notebooks2
                     .borrow_mut()
@@ -1204,6 +1217,8 @@ impl App {
                     let note_title = note.title.clone();
                     let template = note.paper_template;
                     let anchor = note.anchor.clone().unwrap_or_default();
+                    let doc_page = note.doc_page;
+                    let doc_page_count = note.doc_page_count.max(1);
                     drop(notes);
                     let paper_str = match template {
                         ephemeris_core::PageTemplate::Lines => "lined",
@@ -1228,6 +1243,7 @@ impl App {
                     ui_rc.set_page_title(&note_title);
                     ui_rc.set_current_page_template(template);
                     ui_rc.navigate_to_page(page_idx);
+                    ui_rc.set_page_index((doc_page + 1) as i32, doc_page_count as i32);
                     push_note_text_for_active(&ui_rc, &notes2.borrow(), &note_id);
                 }
             });
@@ -1255,19 +1271,26 @@ impl App {
                         cfg.ocr_tessdata.clone(),
                     );
                     drop(cfg);
-                    let text = match ocr.transcribe_raster(w, h, &pixels) {
-                        Ok(spans) => RasterOcrTranscriber::spans_to_text(&spans),
+                    let (display, persist) = match ocr.transcribe_raster(w, h, &pixels) {
+                        Ok(spans) => {
+                            let joined = RasterOcrTranscriber::spans_to_text(&spans);
+                            if joined.is_empty() {
+                                (ocr.empty_result_hint(), None)
+                            } else {
+                                (joined.clone(), Some(joined))
+                            }
+                        }
                         Err(e) => {
                             tracing::warn!("See-text OCR failed: {e}");
-                            String::new()
+                            (format!("OCR failed: {e}"), None)
                         }
                     };
-                    ui_rc.set_note_text_content(&text);
+                    ui_rc.set_note_text_content(&display);
                     if !active_id.is_empty() {
                         if let Ok(id) = active_id.parse::<u32>() {
                             let mut ns = notes2.borrow_mut();
                             if let Some(note) = ns.iter_mut().find(|n| n.id == id) {
-                                note.text_content = if text.is_empty() { None } else { Some(text) };
+                                note.text_content = persist;
                                 note.updated_at = now_secs();
                             }
                             drop(ns);
@@ -1331,12 +1354,15 @@ impl App {
                         anchor: None,
                         profile_id: pf,
                         text_content: None,
+                        doc_page: 0,
+                        doc_page_count: 1,
                     });
                 }
                 *anchor_rc.borrow_mut() = String::new();
                 ui_rc.set_note_anchor_label("");
                 ui_rc.push_new_page();
                 ui_rc.set_page_title(&format!("Note {}", new_id));
+                ui_rc.set_page_index(1, 1);
                 ui2.set_active_paper("blank".into());
                 ui2.set_show_note_list(false);
                 ui2.set_show_notebook_list(false);
@@ -1395,6 +1421,8 @@ impl App {
                         anchor: None,
                         profile_id: pf,
                         text_content: None,
+                        doc_page: 0,
+                        doc_page_count: 1,
                     });
                 }
                 active_nb2.set(nb_id_u32);
@@ -1402,6 +1430,7 @@ impl App {
                 ui_rc.set_note_anchor_label("");
                 ui_rc.push_new_page();
                 ui_rc.set_page_title(&format!("Note {}", new_id));
+                ui_rc.set_page_index(1, 1);
                 ui2.set_active_paper("blank".into());
                 ui2.set_show_note_list(false);
                 ui2.set_show_notebook_list(false);
@@ -1825,8 +1854,11 @@ impl App {
                             anchor: Some(anchor_key.clone()),
                             profile_id: pf,
                             text_content: None,
+                            doc_page: 0,
+                            doc_page_count: 1,
                         });
                         ui_rc.push_new_page();
+                        ui_rc.set_page_index(1, 1);
                         save_notes_index_and_sync_vault(
                             &data_dir2,
                             &notes2.borrow(),
@@ -1847,6 +1879,11 @@ impl App {
                 ui_rc.set_page_title(&note_title);
                 ui_rc.set_current_page_template(ephemeris_core::PageTemplate::Blank);
                 ui_rc.navigate_to_page(page_idx);
+                if let Some(note) = notes2.borrow().iter().find(|n| n.id == note_id) {
+                    set_note_doc_page_chrome(&ui_rc, note);
+                } else {
+                    ui_rc.set_page_index(1, 1);
+                }
                 ui2.set_active_paper("blank".into());
                 ui2.set_show_calendar(false);
                 ui2.set_show_note_list(false);
@@ -1951,12 +1988,15 @@ impl App {
                         anchor: None,
                         profile_id: pf,
                         text_content: None,
+                        doc_page: 0,
+                        doc_page_count: 1,
                     });
                 }
                 *anchor_rc.borrow_mut() = String::new();
                 ui_rc.set_note_anchor_label("");
                 ui_rc.push_new_page();
                 ui_rc.set_page_title(&format!("Note {}", new_id));
+                ui_rc.set_page_index(1, 1);
                 ui2.set_active_paper("blank".into());
                 ui2.set_show_start_page(false);
                 ui2.set_show_task_view(false);
@@ -2725,6 +2765,11 @@ impl App {
         // is clicked — letting us block spurious ink strokes on those elements.
         let canvas_touch_down: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
+        // Finger/mouse page-swipe gestures (pen drawing must not flip pages).
+        let page_swipe_allowed: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        // Set by swipe handlers so pointer-up discards the drag stroke instead of inking it.
+        let page_swipe_handled: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+
         // ── Canvas tap → show action ring (only when Ctrl held on desktop) ────
         {
             let ui2 = ui.clone_component();
@@ -2738,6 +2783,85 @@ impl App {
                     ui2.set_ring_show_audio(true);
                     ui2.set_ring_visible(true);
                 }
+            });
+        }
+
+        // ── In-note page swipe: pull right = next/create, pull left = previous ─
+        {
+            let ui_rc = ui.clone();
+            let ui2 = ui.clone_component();
+            let notes2 = notes.clone();
+            let notebooks2 = notebooks.clone();
+            let note_seq2 = note_id_seq.clone();
+            let nb_seq2 = notebook_id_seq.clone();
+            let data_dir2 = data_dir.clone();
+            let cfg2 = config.clone();
+            let swipe_ok = page_swipe_allowed.clone();
+            let swipe_done = page_swipe_handled.clone();
+            ui.on_swipe_right(move || {
+                if !swipe_ok.get() || !ui_rc.is_canvas_active() {
+                    return;
+                }
+                let active = ui2.get_active_note_id().to_string();
+                let Ok(note_id) = active.parse::<u32>() else {
+                    return;
+                };
+                let mut ns = notes2.borrow_mut();
+                let Some(note) = ns.iter_mut().find(|n| n.id == note_id) else {
+                    return;
+                };
+                let target = note.doc_page + 1;
+                switch_note_doc_page(&ui_rc, &data_dir2, note, target, true);
+                swipe_done.set(true);
+                drop(ns);
+                save_notes_index_and_sync_vault(
+                    &data_dir2,
+                    &notes2.borrow(),
+                    &notebooks2.borrow(),
+                    note_seq2.get(),
+                    nb_seq2.get(),
+                    &cfg2.borrow(),
+                );
+            });
+        }
+        {
+            let ui_rc = ui.clone();
+            let ui2 = ui.clone_component();
+            let notes2 = notes.clone();
+            let notebooks2 = notebooks.clone();
+            let note_seq2 = note_id_seq.clone();
+            let nb_seq2 = notebook_id_seq.clone();
+            let data_dir2 = data_dir.clone();
+            let cfg2 = config.clone();
+            let swipe_ok = page_swipe_allowed.clone();
+            let swipe_done = page_swipe_handled.clone();
+            ui.on_swipe_left(move || {
+                if !swipe_ok.get() || !ui_rc.is_canvas_active() {
+                    return;
+                }
+                let active = ui2.get_active_note_id().to_string();
+                let Ok(note_id) = active.parse::<u32>() else {
+                    return;
+                };
+                let mut ns = notes2.borrow_mut();
+                let Some(note) = ns.iter_mut().find(|n| n.id == note_id) else {
+                    return;
+                };
+                if note.doc_page == 0 {
+                    return;
+                }
+                let target = note.doc_page - 1;
+                switch_note_doc_page(&ui_rc, &data_dir2, note, target, false);
+                swipe_done.set(true);
+                drop(ns);
+                save_notes_index_and_sync_vault(
+                    &data_dir2,
+                    &notes2.borrow(),
+                    &notebooks2.borrow(),
+                    note_seq2.get(),
+                    nb_seq2.get(),
+                    &cfg2.borrow(),
+                );
             });
         }
 
@@ -2818,6 +2942,7 @@ impl App {
                 // Populate settings view from current config.
                 let theme_idx = if cfg.theme == "dark" { 1 } else { 0 };
                 ui2.set_settings_theme_idx(theme_idx);
+                ui2.set_settings_pen_only(cfg.pen_only_drawing);
                 let vault = cfg
                     .vault_path
                     .as_ref()
@@ -3314,6 +3439,7 @@ impl App {
             ui.on_settings_save(move || {
                 let theme_idx = ui2.get_settings_theme_idx();
                 let theme = if theme_idx == 1 { "dark" } else { "light" };
+                let pen_only = ui2.get_settings_pen_only();
 
                 // Derive vault and ICS sources from the connections list.
                 let conns = conns_ss.borrow();
@@ -3338,22 +3464,16 @@ impl App {
                         ics_paths.push(PathBuf::from(val));
                     }
                 }
-                let new_cfg = Config {
-                    theme: theme.to_string(),
-                    vault_tasks_inbox: cfg2.borrow().vault_tasks_inbox.clone(),
-                    vault_export_subdir: cfg2.borrow().vault_export_subdir.clone(),
-                    ocr_enabled: cfg2.borrow().ocr_enabled,
-                    ocr_languages: cfg2.borrow().ocr_languages.clone(),
-                    ocr_tessdata: cfg2.borrow().ocr_tessdata.clone(),
-                    vault_path: if vault_str.is_empty() {
-                        None
-                    } else {
-                        Some(expand_user_path(&vault_str))
-                    },
-                    ics_urls,
-                    ics_paths,
-                    ..Config::default()
+                let mut new_cfg = cfg2.borrow().clone();
+                new_cfg.theme = theme.to_string();
+                new_cfg.pen_only_drawing = pen_only;
+                new_cfg.vault_path = if vault_str.is_empty() {
+                    None
+                } else {
+                    Some(expand_user_path(&vault_str))
                 };
+                new_cfg.ics_urls = ics_urls;
+                new_cfg.ics_paths = ics_paths;
 
                 if let Err(e) = new_cfg.save() {
                     tracing::warn!("Config save failed: {e}");
@@ -3678,6 +3798,9 @@ impl App {
             scale: 1.0,
             ctrl_held,
             canvas_touch_down,
+            page_swipe_allowed,
+            page_swipe_handled,
+            pointer_source: PointerSource::Mouse,
             is_drawing: false,
             data_dir,
             notes: notes.clone(),
@@ -3729,6 +3852,17 @@ fn probe_window_size() -> (u32, u32) {
 
 // ── Winit ApplicationHandler ──────────────────────────────────────────────────
 
+/// Distinguishes pen digitiser, finger touch, and desktop mouse for ink gating
+/// and page-swipe eligibility.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PointerSource {
+    /// EMR / evdev digitiser (Linux). Unused on desktop builds without a pen device.
+    #[allow(dead_code)]
+    Pen,
+    Finger,
+    Mouse,
+}
+
 struct WinitHandler {
     _rt: Runtime,
     ui: Rc<EphemerisUi>,
@@ -3741,6 +3875,12 @@ struct WinitHandler {
     /// before each dispatch so we know whether the canvas (vs. chrome like the
     /// burger button) actually received the press.
     canvas_touch_down: Rc<Cell<bool>>,
+    /// True when the active gesture may flip note pages (finger/mouse, not pen).
+    page_swipe_allowed: Rc<Cell<bool>>,
+    /// Set when a page swipe consumed the gesture — skip committing ink.
+    page_swipe_handled: Rc<Cell<bool>>,
+    /// Source of the current pointer gesture.
+    pointer_source: PointerSource,
     /// True while a draw stroke is in progress (mouse button down, no Ctrl).
     is_drawing: bool,
     /// Directory where per-note pixel data is saved.
@@ -3917,6 +4057,7 @@ impl WinitHandler {
         let (_, ui_h) = self.ui.size();
         self.cursor_pos = (lx, ly);
         self.chrome_pointer_held = true;
+        self.page_swipe_handled.set(false);
 
         if self.chrome_peeking && self.chrome_dismiss_armed {
             self.end_chrome_peek();
@@ -3944,7 +4085,13 @@ impl WinitHandler {
         let canvas_was_active = self.ui.is_canvas_active();
         self.ui.dispatch_pointer_pressed(lx, ly);
         let in_canvas = ly > STATUS_BAR_H as f32 && ly < ui_h as f32 - TOOLBAR_H as f32;
+        let pen_only = self.config.borrow().pen_only_drawing;
+        let allow_ink = match self.pointer_source {
+            PointerSource::Pen | PointerSource::Mouse => true,
+            PointerSource::Finger => !pen_only,
+        };
         if in_canvas
+            && allow_ink
             && !self.ctrl_held.get()
             && canvas_was_active
             && self.ui.is_canvas_active()
@@ -3987,7 +4134,20 @@ impl WinitHandler {
             self.chrome_dismiss_armed = true;
         }
 
+        // Dispatch first so Slint swipe callbacks can set `page_swipe_handled`
+        // before we decide whether to commit ink.
         self.ui.dispatch_pointer_released(lx, ly);
+        if self.page_swipe_handled.get() {
+            if self.is_drawing {
+                self.is_drawing = false;
+                self.ui.discard_in_progress_stroke();
+            }
+            self.page_swipe_handled.set(false);
+            if let Some(d) = &self.display {
+                d.request_redraw();
+            }
+            return;
+        }
         if self.is_drawing {
             self.is_drawing = false;
             let cy = ly - STATUS_BAR_H as f32;
@@ -4003,16 +4163,16 @@ impl WinitHandler {
             );
             if matches!(update, InkUpdate::Finished { .. }) {
                 let page_idx = self.ui.current_page_idx();
-                let note_id = self
+                let note_info = self
                     .notes
                     .borrow()
                     .iter()
                     .find(|n| n.page_index == page_idx)
-                    .map(|n| n.id);
-                if let Some(note_id) = note_id {
+                    .map(|n| (n.id, n.doc_page));
+                if let Some((note_id, doc_page)) = note_info {
                     let pixels = self.ui.get_committed_pixels();
                     let (w, h) = self.ui.canvas_size();
-                    save_note_page(&self.data_dir, note_id, w, h, &pixels);
+                    save_note_page_pixels(&self.data_dir, note_id, doc_page, w, h, &pixels);
                     if let Some(note) = self.notes.borrow_mut().iter_mut().find(|n| n.id == note_id)
                     {
                         note.updated_at = now_secs();
@@ -4041,9 +4201,19 @@ impl WinitHandler {
         let events: Vec<InputEvent> = src.try_iter().collect();
         for ev in events {
             match ev {
-                InputEvent::PenDown(s) => self.handle_pointer_press(s.x, s.y, s.pressure),
-                InputEvent::PenMove(s) => self.handle_pointer_move(s.x, s.y, s.pressure),
-                InputEvent::PenUp(s) => self.handle_pointer_release(s.x, s.y),
+                InputEvent::PenDown(s) => {
+                    self.pointer_source = PointerSource::Pen;
+                    self.page_swipe_allowed.set(false);
+                    self.handle_pointer_press(s.x, s.y, s.pressure);
+                }
+                InputEvent::PenMove(s) => {
+                    self.pointer_source = PointerSource::Pen;
+                    self.handle_pointer_move(s.x, s.y, s.pressure);
+                }
+                InputEvent::PenUp(s) => {
+                    self.pointer_source = PointerSource::Pen;
+                    self.handle_pointer_release(s.x, s.y);
+                }
                 InputEvent::PenButton { pressed } => {
                     // Side button ≈ Ctrl (opens tool ring / modifier paths).
                     self.ctrl_held.set(pressed);
@@ -4225,6 +4395,8 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
                 let (lx, ly) = self.cursor_pos;
                 match state {
                     winit::event::ElementState::Pressed => {
+                        self.pointer_source = PointerSource::Mouse;
+                        self.page_swipe_allowed.set(true);
                         self.handle_pointer_press(lx, ly, 0.8);
                     }
                     winit::event::ElementState::Released => {
@@ -4233,8 +4405,8 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
                 }
             }
 
-            // PineNote / Wayland: stylus and finger contacts arrive as Touch,
-            // not MouseInput. Without this the UI never sees pen or touch.
+            // PineNote / Wayland: finger contacts arrive as Touch. The EMR pen
+            // is handled separately via evdev on Linux (`drain_pen_events`).
             WindowEvent::Touch(touch) => {
                 use winit::event::TouchPhase;
                 let (lx, ly) = self.map_to_ui(touch.location);
@@ -4244,8 +4416,15 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
                     .unwrap_or(0.8)
                     .clamp(0.05, 1.0);
                 match touch.phase {
-                    TouchPhase::Started => self.handle_pointer_press(lx, ly, pressure),
-                    TouchPhase::Moved => self.handle_pointer_move(lx, ly, pressure),
+                    TouchPhase::Started => {
+                        self.pointer_source = PointerSource::Finger;
+                        self.page_swipe_allowed.set(true);
+                        self.handle_pointer_press(lx, ly, pressure);
+                    }
+                    TouchPhase::Moved => {
+                        self.pointer_source = PointerSource::Finger;
+                        self.handle_pointer_move(lx, ly, pressure);
+                    }
                     TouchPhase::Ended | TouchPhase::Cancelled => {
                         self.handle_pointer_release(lx, ly);
                     }
@@ -4353,6 +4532,11 @@ struct AppNotebook {
 }
 
 /// In-memory note record, parallel to a PageBook page at `page_index`.
+///
+/// `page_index` is the note's slot in the global [`EphemerisUi`] page book (one
+/// slot per note).  Within a note, `doc_page` / `doc_page_count` track multi-page
+/// documents; rasters are stored as `page_{id}_p{n}.bin` (page 0 also accepts
+/// legacy `page_{id}.bin`).
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct AppNote {
     id: u32,
@@ -4375,6 +4559,16 @@ struct AppNote {
     /// OCR / transcribed machine-readable text for see-text view + vault export.
     #[serde(default)]
     text_content: Option<String>,
+    /// Zero-based page within this note's document (swipe navigation).
+    #[serde(default)]
+    doc_page: usize,
+    /// Number of pages in this note's document (at least 1).
+    #[serde(default = "default_doc_page_count")]
+    doc_page_count: usize,
+}
+
+fn default_doc_page_count() -> usize {
+    1
 }
 
 fn note_updated_at(n: &AppNote) -> u64 {
@@ -4693,6 +4887,16 @@ fn play_audio(path: &Path) {
 }
 
 fn find_whisper_binary() -> Option<String> {
+    // Prefer the apt-bundled wrapper (sets LD_LIBRARY_PATH for shipped .so).
+    let bundled = [
+        "/usr/bin/whisper-cli",
+        "/usr/lib/ephemeris/whisper/whisper-cli",
+    ];
+    for path in &bundled {
+        if Path::new(path).is_file() {
+            return Some((*path).to_string());
+        }
+    }
     // "whisper" without a suffix is the Python/OpenAI package — exclude it.
     for cmd in &["whisper-cli", "whisper-cpp", "main"] {
         if std::process::Command::new(cmd)
@@ -4747,7 +4951,8 @@ fn download_whisper_model() -> Result<(), String> {
 fn run_whisper(wav_path: &Path, lang: &str) -> String {
     let Some(bin) = find_whisper_binary() else {
         return "whisper-cli not found.\n\
-            Install: brew install whisper-cpp (macOS)\n\
+            PineNote/apt: reinstall ephemeris (bundles whisper-cli).\n\
+            macOS: brew install whisper-cpp\n\
             or build from https://github.com/ggerganov/whisper.cpp"
             .to_string();
     };
@@ -4756,7 +4961,19 @@ fn run_whisper(wav_path: &Path, lang: &str) -> String {
             Go to Settings → Transcription and tap Download."
             .to_string();
     };
-    let output = std::process::Command::new(&bin)
+    let mut cmd = std::process::Command::new(&bin);
+    // Bundled binary (not the /usr/bin wrapper) needs its sibling .so path.
+    if bin.contains("/usr/lib/ephemeris/whisper/") {
+        let lib_dir = "/usr/lib/ephemeris/whisper";
+        let existing = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+        let joined = if existing.is_empty() {
+            lib_dir.to_string()
+        } else {
+            format!("{lib_dir}:{existing}")
+        };
+        cmd.env("LD_LIBRARY_PATH", joined);
+    }
+    let output = cmd
         .args(["-m", &model.to_string_lossy(), "-l", lang])
         .arg(wav_path)
         .output();
@@ -5106,22 +5323,41 @@ fn note_data_dir() -> PathBuf {
 
 const PAGE_BIN_MAGIC: &[u8; 4] = b"EPH1";
 
-fn save_note_page(data_dir: &Path, note_id: u32, width: u32, height: u32, pixels: &[u8]) {
-    let path = data_dir.join(format!("page_{note_id}.bin"));
+fn note_page_path(data_dir: &Path, note_id: u32, doc_page: usize) -> PathBuf {
+    data_dir.join(format!("page_{note_id}_p{doc_page}.bin"))
+}
+
+fn note_page_legacy_path(data_dir: &Path, note_id: u32) -> PathBuf {
+    data_dir.join(format!("page_{note_id}.bin"))
+}
+
+fn save_note_page_pixels(
+    data_dir: &Path,
+    note_id: u32,
+    doc_page: usize,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+) {
+    let path = note_page_path(data_dir, note_id, doc_page);
     let mut buf = Vec::with_capacity(12 + pixels.len());
     buf.extend_from_slice(PAGE_BIN_MAGIC);
     buf.extend_from_slice(&width.to_le_bytes());
     buf.extend_from_slice(&height.to_le_bytes());
     buf.extend_from_slice(pixels);
-    if let Err(e) = std::fs::write(&path, buf) {
-        tracing::warn!("Failed to save note page {note_id}: {e}");
+    if let Err(e) = std::fs::write(&path, &buf) {
+        tracing::warn!("Failed to save note {note_id} page {doc_page}: {e}");
+    }
+    // Keep legacy single-file name in sync for page 0 (previews / older tools).
+    if doc_page == 0 {
+        let legacy = note_page_legacy_path(data_dir, note_id);
+        if let Err(e) = std::fs::write(&legacy, &buf) {
+            tracing::warn!("Failed to save legacy note page {note_id}: {e}");
+        }
     }
 }
 
-/// Load a note page raster. Returns `(width, height, gray8)`.
-/// Legacy files without a header are treated as width=800 when divisible.
-fn load_note_page(data_dir: &Path, note_id: u32) -> Option<(u32, u32, Vec<u8>)> {
-    let path = data_dir.join(format!("page_{note_id}.bin"));
+fn read_page_bin(path: &Path) -> Option<(u32, u32, Vec<u8>)> {
     let data = std::fs::read(path).ok()?;
     if data.len() >= 12 && &data[0..4] == PAGE_BIN_MAGIC {
         let width = u32::from_le_bytes(data[4..8].try_into().ok()?);
@@ -5136,6 +5372,70 @@ fn load_note_page(data_dir: &Path, note_id: u32) -> Option<(u32, u32, Vec<u8>)> 
     } else {
         None
     }
+}
+
+/// Load document page `doc_page` for a note. Page 0 falls back to legacy
+/// `page_{id}.bin` when the paged file is missing.
+fn load_note_page_n(data_dir: &Path, note_id: u32, doc_page: usize) -> Option<(u32, u32, Vec<u8>)> {
+    let primary = note_page_path(data_dir, note_id, doc_page);
+    if let Some(loaded) = read_page_bin(&primary) {
+        return Some(loaded);
+    }
+    if doc_page == 0 {
+        read_page_bin(&note_page_legacy_path(data_dir, note_id))
+    } else {
+        None
+    }
+}
+
+/// Load a note page raster (document page 0). Returns `(width, height, gray8)`.
+fn load_note_page(data_dir: &Path, note_id: u32) -> Option<(u32, u32, Vec<u8>)> {
+    load_note_page_n(data_dir, note_id, 0)
+}
+
+fn delete_note_page_files(data_dir: &Path, note_id: u32, doc_page_count: usize) {
+    let _ = std::fs::remove_file(note_page_legacy_path(data_dir, note_id));
+    for p in 0..doc_page_count.max(1) {
+        let _ = std::fs::remove_file(note_page_path(data_dir, note_id, p));
+    }
+}
+
+fn set_note_doc_page_chrome(ui: &EphemerisUi, note: &AppNote) {
+    let count = note.doc_page_count.max(1);
+    let idx = (note.doc_page + 1).min(count);
+    ui.set_page_index(idx as i32, count as i32);
+}
+
+/// Persist the live canvas into `note`'s current doc page, then load `target`
+/// into the note's PageBook slot (creating a blank page when missing).
+fn switch_note_doc_page(
+    ui: &EphemerisUi,
+    data_dir: &Path,
+    note: &mut AppNote,
+    target: usize,
+    create_if_missing: bool,
+) {
+    let (w, h) = ui.canvas_size();
+    let pixels = ui.get_committed_pixels();
+    save_note_page_pixels(data_dir, note.id, note.doc_page, w, h, &pixels);
+
+    let count = note.doc_page_count.max(1);
+    let target = if create_if_missing && target >= count {
+        note.doc_page_count = target + 1;
+        target
+    } else {
+        target.min(count.saturating_sub(1))
+    };
+    note.doc_page = target;
+    note.updated_at = now_secs();
+
+    if let Some((_pw, _ph, data)) = load_note_page_n(data_dir, note.id, target) {
+        ui.restore_page_pixels(note.page_index, data);
+    } else {
+        ui.clear_ink();
+    }
+    ui.discard_in_progress_stroke();
+    set_note_doc_page_chrome(ui, note);
 }
 
 fn notes_index_path(data_dir: &Path) -> PathBuf {

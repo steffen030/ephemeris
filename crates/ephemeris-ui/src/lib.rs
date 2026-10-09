@@ -685,7 +685,9 @@ impl EphemerisUi {
     /// use [`Self::is_canvas_active`] for ink input and
     /// [`Self::should_composite_ink`] for compositing.
     ///
-    /// Keep the overlay list in sync with `is-canvas-context` in `main.slint`.
+    /// Keep the overlay list in sync with `is-canvas-context` in `main.slint`
+    /// (except `note-see-text`, which Slint treats as leaving canvas chrome while
+    /// this still counts as the note page — see [`Self::is_canvas_active`]).
     pub fn is_note_canvas_page(&self) -> bool {
         let c = &self.component;
         !c.get_show_start_page()
@@ -1122,6 +1124,16 @@ impl EphemerisUi {
     /// Read the theme index currently selected in the settings view.
     pub fn get_settings_theme_idx(&self) -> i32 {
         self.component.get_settings_theme_idx()
+    }
+
+    /// Set whether Settings › General shows "Pen only" ink input.
+    pub fn set_settings_pen_only(&self, pen_only: bool) {
+        self.component.set_settings_pen_only(pen_only);
+    }
+
+    /// Read the Settings › General "Pen only" toggle.
+    pub fn get_settings_pen_only(&self) -> bool {
+        self.component.get_settings_pen_only()
     }
 
     /// Set the vault path shown in settings.
@@ -2178,6 +2190,24 @@ impl EphemerisUi {
                 .borrow_mut()
                 .push(Rect::new(0, STATUS_BAR_H, self.width, canvas_h));
         }
+    }
+
+    /// Abandon an in-progress stroke without committing it (e.g. page swipe).
+    ///
+    /// Clears the live in-progress buffer and resets the ink engine so a
+    /// subsequent `PenDown` starts cleanly.  Does not touch the committed layer.
+    pub fn discard_in_progress_stroke(&self) {
+        self.in_progress.borrow_mut().clear();
+        let bw = *self.in_progress_base_width.borrow();
+        *self.engine.borrow_mut() = InkEngine::new(InkConfig {
+            base_width: bw,
+            ..InkConfig::default()
+        });
+        let canvas_h = self.canvas_height();
+        self.ink_damage
+            .borrow_mut()
+            .push(Rect::new(0, STATUS_BAR_H, self.width, canvas_h));
+        self.screen_change.set(true);
     }
 
     /// Clear both ink layers (committed and in-progress) for the current page.

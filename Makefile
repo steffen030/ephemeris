@@ -212,7 +212,7 @@ build-aarch64:
 	@cross build --target $(AARCH64_TARGET) -p ephemeris-app --release
 
 deb-aarch64: build-aarch64
-	@echo "📦 Building arm64 .deb (version $(VERSION))..."
+	@echo "📦 Building arm64 .deb (version $(VERSION); bundles whisper-cli)..."
 	@mkdir -p $(DIST_DIR)
 	@chmod +x scripts/build-deb.sh
 	@scripts/build-deb.sh $(AARCH64_BIN) $(VERSION) $(DIST_DIR)

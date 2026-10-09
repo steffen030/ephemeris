@@ -21,6 +21,7 @@
 //! | `EPHEMERIS_THEME`          | `theme`               |
 //! | `EPHEMERIS_SYNC_INTERVAL`  | `sync_interval_secs`  |
 //! | `EPHEMERIS_LOG_LEVEL`      | `logging_level`       |
+//! | `EPHEMERIS_PEN_ONLY`       | `pen_only_drawing`    |
 //!
 //! Optional TOML: `vault_tasks_inbox` (default `Ephemeris/Tasks.md`) — vault-relative
 //! file where new Ephemeris tasks are appended.
@@ -104,6 +105,12 @@ pub struct Config {
     #[serde(default)]
     pub ocr_tessdata: Option<PathBuf>,
 
+    /// When true, only pen (and desktop mouse) can leave ink on the note canvas;
+    /// finger/hand touch is ignored for drawing so a resting palm does not make
+    /// artifacts. Finger touch still drives UI chrome and page-swipe gestures.
+    #[serde(default = "default_pen_only_drawing")]
+    pub pen_only_drawing: bool,
+
     /// Arbitrary key-value overrides for experimental / future settings.
     #[serde(default)]
     pub custom: HashMap<String, String>,
@@ -137,6 +144,10 @@ fn default_ocr_languages() -> String {
     "eng".to_string()
 }
 
+fn default_pen_only_drawing() -> bool {
+    true
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -151,6 +162,7 @@ impl Default for Config {
             ocr_enabled: default_ocr_enabled(),
             ocr_languages: default_ocr_languages(),
             ocr_tessdata: None,
+            pen_only_drawing: default_pen_only_drawing(),
             custom: HashMap::new(),
         }
     }
@@ -278,6 +290,13 @@ fn apply_env_overrides(config: &mut Config) {
             config.ocr_languages = v;
         }
     }
+    if let Ok(v) = std::env::var("EPHEMERIS_PEN_ONLY") {
+        match v.to_lowercase().as_str() {
+            "0" | "false" | "off" | "no" => config.pen_only_drawing = false,
+            "1" | "true" | "on" | "yes" => config.pen_only_drawing = true,
+            _ => tracing::warn!("EPHEMERIS_PEN_ONLY={v:?} not recognised; ignoring"),
+        }
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -321,6 +340,7 @@ mod tests {
         assert!(cfg.ocr_enabled);
         assert_eq!(cfg.ocr_languages, "eng");
         assert!(cfg.ocr_tessdata.is_none());
+        assert!(cfg.pen_only_drawing);
         assert!(cfg.custom.is_empty());
     }
 

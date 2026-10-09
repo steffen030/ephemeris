@@ -4,9 +4,14 @@ Section: utils
 Priority: optional
 Architecture: arm64
 Maintainer: Steffen Galan <steffen.galan@gmail.com>
-Depends: libxkbcommon0, libwayland-client0
+Depends: libxkbcommon0, libwayland-client0, tesseract-ocr, tesseract-ocr-eng
+Recommends: tesseract-ocr-deu
 Description: Ephemeris — e-ink planner and note-taking app
  Ephemeris is a planner and note-taking application focused on e-ink
  devices with pens (e.g. PineNote). It manages profiles, calendars,
  tasks, and handwritten notes.
+ .
+ This package bundles whisper-cli for on-device voice transcription
+ (model downloaded from Settings). Handwriting OCR uses the system
+ Tesseract packages listed under Depends.
 Homepage: https://github.com/steffen030/ephemeris

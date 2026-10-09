@@ -27,7 +27,7 @@ Treat these as roadmap, not product claims:
 
 - Polished day-to-day UX on-device (refresh strategy, palm rejection, menus)
 - Broad calendar / task provider support (CalDAV, Todoist, etc. are incomplete or absent)
-- Reliable handwriting OCR (optional Tesseract path exists; default is a no-op)
+- High-accuracy cursive handwriting HWR (v1 uses Tesseract print OCR; apt installs `tesseract-ocr`)
 - Multi-arch desktop packages (only `arm64` Linux debs are released)
 - Stable sync story for WebDAV / cloud drives
 
@@ -82,6 +82,10 @@ echo "deb [signed-by=/usr/share/keyrings/ephemeris-archive-keyring.gpg arch=arm6
 
 sudo apt update && sudo apt install ephemeris
 ```
+
+That install also pulls **Tesseract** for handwriting See-text, and the `.deb`
+bundles **whisper-cli** for voice transcription. Download a Whisper model once
+from Settings → Transcription.
 
 **PineNote pen access:** the stylus is read from `/dev/input/event*`. Your user
 must be able to open those nodes (usually membership in the `input` group):

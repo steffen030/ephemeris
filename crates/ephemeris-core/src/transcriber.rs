@@ -141,6 +141,44 @@ impl RasterOcrTranscriber {
             .collect::<Vec<_>>()
             .join(" ")
     }
+
+    /// True when the configured `tesseract` binary responds (OCR can run).
+    ///
+    /// Always `false` when the `ocr` Cargo feature is off.
+    pub fn tesseract_available(&self) -> bool {
+        #[cfg(not(feature = "ocr"))]
+        {
+            false
+        }
+        #[cfg(feature = "ocr")]
+        {
+            let bin = self
+                .tesseract_bin
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("tesseract"));
+            let mut cmd = Command::new(&bin);
+            cmd.arg("--version");
+            if let Some(ref td) = self.tessdata {
+                cmd.env("TESSDATA_PREFIX", td);
+            }
+            match cmd.output() {
+                Ok(o) => o.status.success(),
+                Err(_) => false,
+            }
+        }
+    }
+
+    /// User-facing hint when See-text / export yields no spans.
+    pub fn empty_result_hint(&self) -> String {
+        if !self.enabled {
+            return "OCR is disabled (set EPHEMERIS_OCR=1 or ocr_enabled in config).".into();
+        }
+        if !self.tesseract_available() {
+            return "Tesseract not found. On PineNote: sudo apt install tesseract-ocr tesseract-ocr-eng"
+                .into();
+        }
+        "No text recognised. Block/print handwriting works best.".into()
+    }
 }
 
 impl Transcriber for RasterOcrTranscriber {
@@ -420,6 +458,15 @@ mod tests {
         };
         let gray = vec![255u8; 100 * 40];
         assert!(t.transcribe_raster(100, 40, &gray).unwrap().is_empty());
+    }
+
+    #[test]
+    fn empty_hint_when_disabled() {
+        let t = RasterOcrTranscriber {
+            enabled: false,
+            ..RasterOcrTranscriber::default()
+        };
+        assert!(t.empty_result_hint().contains("disabled"));
     }
 
     #[test]

@@ -17,7 +17,8 @@ name = "ephemeris"
 maintainer = "Steffen Galan <steffen.galan@gmail.com>"
 section = "utils"
 priority = "optional"
-depends = "libxkbcommon0, libwayland-client0"
+depends = "libxkbcommon0, libwayland-client0, tesseract-ocr, tesseract-ocr-eng"
+recommends = "tesseract-ocr-deu"
 assets = [
     ["target/release/ephemeris", "usr/bin/ephemeris", "755"],
     ["packaging/debian/ephemeris.desktop", "usr/share/applications/ephemeris.desktop", "644"],

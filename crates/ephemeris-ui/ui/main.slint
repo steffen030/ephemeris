@@ -352,6 +352,7 @@ export component EphemerisPage inherits Window {
 
     // ── Drawing mode ─────────────────────────────────────────────────────
     // True when no overlay view is active (pure drawing canvas).
+    // See-text is a reading view (nav visible); exclude it so chrome returns.
     private property <bool> is-canvas-context:
         !root.show-start-page && !root.show-task-view &&
         !root.show-settings && !root.show-filebrowser &&
@@ -365,7 +366,8 @@ export component EphemerisPage inherits Window {
         !root.show-profile-switcher && !root.profile-edit-dialog-visible &&
         !root.show-create-profile-picker && !root.connect-setup-visible &&
         !root.connect-soon-visible &&
-        !root.show-search && !root.show-md-viewer;
+        !root.show-search && !root.show-md-viewer &&
+        !root.note-see-text;
 
     // ── Unified search ───────────────────────────────────────────────────
     in-out property <string> search-query: "";
@@ -399,6 +401,8 @@ export component EphemerisPage inherits Window {
 
     // ── Settings view ────────────────────────────────────────────────────
     in-out property <int> settings-theme-idx: 0;
+    // When true, note canvas ink accepts pen (and desktop mouse) only — not finger.
+    in-out property <bool> settings-pen-only: true;
     in property <string> settings-vault-path: "";
     in property <[CalSource]> settings-cal-sources: [];
     in-out property <string> settings-new-url: "";
@@ -2610,140 +2614,168 @@ export component EphemerisPage inherits Window {
 
     }
 
-    // See-text overlay: machine-readable note text over the ink canvas.
-    Rectangle {
-        visible: root.note-see-text && root.is-canvas-context;
+    // See-text: first-class reading view for OCR / transcribed note text.
+    // Nav rail stays visible (is-canvas-context excludes note-see-text).
+    see-text-view := Rectangle {
+        visible: root.note-see-text
+            && !root.show-start-page && !root.show-task-view
+            && !root.show-settings && !root.show-filebrowser
+            && !root.show-note-list && !root.show-notebook-list
+            && !root.show-calendar && !root.show-recording-list
+            && !root.show-search && !root.show-md-viewer;
         x: root.nav-w;
-        y: 56px;
+        y: 0;
         width: parent.width - root.nav-w;
-        height: parent.height - 56px;
-        background: EinkTheme.chrome-bg;
-        border-width: 1px;
-        border-color: EinkTheme.chrome-border;
-
-        VerticalLayout {
-            padding: 16px;
-            spacing: 8px;
-
-            Text {
-                text: "Note text";
-                font-size: 14px;
-                font-weight: 700;
-                color: EinkTheme.btn-fg;
-            }
-            Text {
-                text: root.note-text-content == "" ? "No transcribed text yet." : root.note-text-content;
-                font-size: 14px;
-                color: EinkTheme.btn-fg;
-                wrap: word-wrap;
-                vertical-stretch: 1;
-            }
-            Rectangle {
-                height: 36px;
-                width: 120px;
-                border-radius: 4px;
-                border-width: 1px;
-                border-color: EinkTheme.btn-border;
-                background: EinkTheme.btn-bg;
-                Text {
-                    text: "Back to ink";
-                    font-size: 12px;
-                    color: EinkTheme.btn-fg;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
-                    width: parent.width; height: parent.height;
-                }
-                TouchArea {
-                    clicked => {
-                        root.note-see-text = false;
-                        root.note-see-text-toggled(false);
-                    }
-                }
-            }
-        }
-    }
-
-    // ── Profile switcher dropdown ──────────────────────────────────────────
-    // Backdrop: closes switcher on outside tap
-    Rectangle {
-        visible: root.show-profile-switcher;
-        x: 0; y: 0; width: parent.width; height: parent.height;
-        background: transparent;
-        TouchArea { clicked => { root.show-profile-switcher = false; } }
-    }
-
-    profile-switcher-panel := Rectangle {
-        visible: root.show-profile-switcher;
-        x: root.nav-w + 4px;
-        y: 4px;
-        width: 220px;
-        background: EinkTheme.chrome-bg;
-        border-width: 2px; border-color: EinkTheme.chrome-border;
-        border-radius: 6px;
+        height: parent.height;
+        background: EinkTheme.canvas-bg;
         clip: true;
 
-        property <int> item-count: root.profile-list.length + 1;  // +1 for "All"
-        height: item-count * 44px + 8px;
+        property <bool> has-body: root.note-text-content != "";
 
         VerticalLayout {
-            padding: 4px; spacing: 0px;
+            padding: 0px;
+            spacing: 0px;
 
-            // "All" row
+            // Header: return to ink + note title + mode badge
             Rectangle {
-                height: 44px;
-                background: root.active-profile-id == "" ? EinkTheme.btn-active-bg : transparent;
-                border-radius: 4px;
+                height: 52px;
+                background: EinkTheme.chrome-bg;
                 HorizontalLayout {
-                    padding-left: 10px; padding-right: 10px;
-                    spacing: 8px; alignment: start;
-                    Text {
-                        text: Icons.profile-group;
-                        font-family: "Material Icons"; font-size: 20px;
-                        color: root.active-profile-id == "" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
-                        vertical-alignment: center; width: 24px;
+                    padding-left: 10px;
+                    padding-right: 12px;
+                    padding-top: 8px;
+                    padding-bottom: 8px;
+                    spacing: 10px;
+                    alignment: stretch;
+
+                    Rectangle {
+                        width: 72px;
+                        height: 36px;
+                        border-radius: 4px;
+                        border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        background: EinkTheme.btn-bg;
+                        HorizontalLayout {
+                            padding-left: 6px;
+                            padding-right: 8px;
+                            spacing: 2px;
+                            alignment: center;
+                            Text {
+                                text: Icons.back;
+                                font-family: "Material Icons";
+                                font-size: 18px;
+                                color: EinkTheme.btn-fg;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                text: "Ink";
+                                font-size: 13px;
+                                font-weight: 700;
+                                color: EinkTheme.btn-fg;
+                                vertical-alignment: center;
+                            }
+                        }
+                        TouchArea {
+                            clicked => {
+                                root.note-see-text = false;
+                                root.note-see-text-toggled(false);
+                            }
+                        }
                     }
+
                     Text {
-                        text: "All profiles";
-                        font-size: 13px;
-                        color: root.active-profile-id == "" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
-                        vertical-alignment: center; horizontal-stretch: 1;
+                        text: root.page-title == "" ? "Untitled" : root.page-title;
+                        font-size: 16px;
+                        font-weight: 700;
+                        color: EinkTheme.btn-fg;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        overflow: elide;
                     }
-                }
-                TouchArea {
-                    clicked => {
-                        root.active-profile-id = "";
-                        root.profile-changed("");
-                        root.show-profile-switcher = false;
+
+                    Rectangle {
+                        width: 64px;
+                        height: 28px;
+                        border-radius: 4px;
+                        border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        background: EinkTheme.btn-active-bg;
+                        HorizontalLayout {
+                            spacing: 4px;
+                            alignment: center;
+                            Text {
+                                text: Icons.notes;
+                                font-family: "Material Icons";
+                                font-size: 14px;
+                                color: EinkTheme.btn-active-fg;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                text: "Text";
+                                font-size: 11px;
+                                font-weight: 700;
+                                color: EinkTheme.btn-active-fg;
+                                vertical-alignment: center;
+                            }
+                        }
                     }
                 }
             }
 
-            for p in root.profile-list: Rectangle {
-                height: 44px;
-                property <bool> sel: root.active-profile-id == p.id;
-                // icon via p.icon-char / ProfileIcon
-                background: sel ? EinkTheme.btn-active-bg : transparent;
-                border-radius: 4px;
-                HorizontalLayout {
-                    padding-left: 10px; padding-right: 10px;
-                    spacing: 8px; alignment: start;
-                    ProfileIcon {
-                        icon-char: p.icon-char; has-custom: p.has-custom-icon; custom-icon: p.custom-icon;
-                        size: 22px; fg: sel ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
-                    }
+            Rectangle { height: 2px; background: EinkTheme.chrome-border; }
+
+            if see-text-view.has-body: Flickable {
+                vertical-stretch: 1;
+                width: parent.width;
+                content-width: parent.width;
+                content-height: see-text-body.preferred-height;
+
+                see-text-body := VerticalLayout {
+                    width: parent.width;
+                    padding-left: 20px;
+                    padding-right: 20px;
+                    padding-top: 20px;
+                    padding-bottom: 28px;
+                    spacing: 0px;
+
                     Text {
-                        text: p.name;
-                        font-size: 13px;
-                        color: sel ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
-                        vertical-alignment: center; horizontal-stretch: 1;
-                        overflow: elide;
+                        text: root.note-text-content;
+                        font-size: 17px;
+                        color: EinkTheme.btn-fg;
+                        wrap: word-wrap;
+                        width: parent.width - 40px;
                     }
                 }
-                TouchArea {
-                    clicked => {
-                        root.active-profile-id = p.id;
-                        root.profile-changed(p.id);
-                        root.show-profile-switcher = false;
+            }
+
+            if !see-text-view.has-body: Rectangle {
+                vertical-stretch: 1;
+                background: EinkTheme.canvas-bg;
+                VerticalLayout {
+                    padding: 32px;
+                    spacing: 12px;
+                    alignment: center;
+
+                    Text {
+                        text: Icons.notes;
+                        font-family: "Material Icons";
+                        font-size: 40px;
+                        color: EinkTheme.btn-fg;
+                        horizontal-alignment: center;
+                    }
+                    Text {
+                        text: "No text yet";
+                        font-size: 18px;
+                        font-weight: 700;
+                        color: EinkTheme.btn-fg;
+                        horizontal-alignment: center;
+                    }
+                    Text {
+                        text: "Handwriting is transcribed when you open Text. Block or print letters work best.";
+                        font-size: 13px;
+                        color: EinkTheme.text-secondary;
+                        wrap: word-wrap;
+                        horizontal-alignment: center;
                     }
                 }
             }
@@ -2933,7 +2965,7 @@ export component EphemerisPage inherits Window {
 
             // ── Profile avatar button (round icon + profile name) ──────────
             // Match other nav items: full-width column, icon optically centered.
-            Rectangle {
+            profile-btn := Rectangle {
                 height: 64px;
                 background: root.show-profile-switcher ? EinkTheme.btn-active-bg : EinkTheme.chrome-bg;
                 VerticalLayout {
@@ -3008,6 +3040,129 @@ export component EphemerisPage inherits Window {
             width: 2px;
             height: parent.height;
             background: EinkTheme.chrome-border;
+        }
+    }
+
+    // ── Profile switcher (anchored to profile-btn, after nav for z-order) ─
+    // Backdrop covers content only so the nav rail (incl. profile toggle) stays live.
+    Rectangle {
+        visible: root.show-profile-switcher;
+        x: root.nav-w; y: 0;
+        width: parent.width - root.nav-w; height: parent.height;
+        background: transparent;
+        TouchArea { clicked => { root.show-profile-switcher = false; } }
+    }
+
+    profile-switcher-panel := Rectangle {
+        visible: root.show-profile-switcher;
+        x: root.nav-w + 4px;
+        width: 220px;
+        background: EinkTheme.chrome-bg;
+        border-width: 2px;
+        border-color: EinkTheme.chrome-border;
+        border-radius: 6px;
+        clip: true;
+
+        property <int> item-count: root.profile-list.length + 1;  // +1 for "All"
+        property <length> content-h: item-count * 44px + 40px;    // + header
+        property <length> max-h: parent.height - 16px;
+        height: min(content-h, max-h);
+        // Bottom-align with profile button; clamp so the menu stays on-screen.
+        property <length> ideal-y: profile-btn.y + profile-btn.height - self.height;
+        y: max(8px, ideal-y);
+
+        VerticalLayout {
+            padding: 0px;
+            spacing: 0px;
+
+            Rectangle {
+                height: 32px;
+                HorizontalLayout {
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    alignment: start;
+                    Text {
+                        text: "Profiles";
+                        font-size: 11px;
+                        font-weight: 700;
+                        color: EinkTheme.text-secondary;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+            Rectangle { height: 1px; background: EinkTheme.chrome-border; }
+
+            Flickable {
+                vertical-stretch: 1;
+                width: parent.width;
+                content-width: parent.width;
+                content-height: profile-switcher-list.preferred-height;
+
+                profile-switcher-list := VerticalLayout {
+                    width: parent.width;
+                    padding: 4px;
+                    spacing: 0px;
+
+                    // "All" row
+                    Rectangle {
+                        height: 44px;
+                        background: root.active-profile-id == "" ? EinkTheme.btn-active-bg : transparent;
+                        border-radius: 4px;
+                        HorizontalLayout {
+                            padding-left: 10px; padding-right: 10px;
+                            spacing: 8px; alignment: start;
+                            Text {
+                                text: Icons.profile-group;
+                                font-family: "Material Icons"; font-size: 20px;
+                                color: root.active-profile-id == "" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                                vertical-alignment: center; width: 24px;
+                            }
+                            Text {
+                                text: "All profiles";
+                                font-size: 13px;
+                                color: root.active-profile-id == "" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                                vertical-alignment: center; horizontal-stretch: 1;
+                            }
+                        }
+                        TouchArea {
+                            clicked => {
+                                root.active-profile-id = "";
+                                root.profile-changed("");
+                                root.show-profile-switcher = false;
+                            }
+                        }
+                    }
+
+                    for p in root.profile-list: Rectangle {
+                        height: 44px;
+                        property <bool> sel: root.active-profile-id == p.id;
+                        background: sel ? EinkTheme.btn-active-bg : transparent;
+                        border-radius: 4px;
+                        HorizontalLayout {
+                            padding-left: 10px; padding-right: 10px;
+                            spacing: 8px; alignment: start;
+                            ProfileIcon {
+                                icon-char: p.icon-char; has-custom: p.has-custom-icon; custom-icon: p.custom-icon;
+                                size: 22px; fg: sel ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                            }
+                            Text {
+                                text: p.name;
+                                font-size: 13px;
+                                color: sel ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                                vertical-alignment: center; horizontal-stretch: 1;
+                                overflow: elide;
+                            }
+                        }
+                        TouchArea {
+                            clicked => {
+                                root.active-profile-id = p.id;
+                                root.profile-changed(p.id);
+                                root.show-profile-switcher = false;
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -3566,6 +3721,46 @@ export component EphemerisPage inherits Window {
                                            color: root.settings-theme-idx == 1 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
                                            horizontal-alignment: center; vertical-alignment: center; }
                                     TouchArea { clicked => { root.settings-theme-idx = 1; } }
+                                }
+
+                                Rectangle { horizontal-stretch: 1; }
+                            }
+                        }
+
+                        Rectangle { height: 2px; background: EinkTheme.chrome-border; }
+
+                        Rectangle {
+                            height: 44px;
+                            background: EinkTheme.canvas-bg;
+                            HorizontalLayout {
+                                padding-left: 16px; padding-right: 16px;
+                                padding-top: 6px; padding-bottom: 6px;
+                                spacing: 12px;
+
+                                Text {
+                                    text: "Ink input";
+                                    font-size: 14px; color: EinkTheme.btn-fg;
+                                    vertical-alignment: center; width: 80px;
+                                }
+
+                                Rectangle {
+                                    width: 84px; height: 32px;
+                                    background: root.settings-pen-only ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+                                    border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                                    Text { text: "Pen only"; font-size: 13px;
+                                           color: root.settings-pen-only ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                                           horizontal-alignment: center; vertical-alignment: center; }
+                                    TouchArea { clicked => { root.settings-pen-only = true; } }
+                                }
+
+                                Rectangle {
+                                    width: 110px; height: 32px;
+                                    background: !root.settings-pen-only ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+                                    border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                                    Text { text: "Pen + finger"; font-size: 13px;
+                                           color: !root.settings-pen-only ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                                           horizontal-alignment: center; vertical-alignment: center; }
+                                    TouchArea { clicked => { root.settings-pen-only = false; } }
                                 }
 
                                 Rectangle { horizontal-stretch: 1; }
@@ -5124,7 +5319,8 @@ export component EphemerisPage inherits Window {
     Rectangle {
         visible: root.show-create-profile-picker;
         width: 280px;
-        property <int> row-count: root.profile-list.length + 1;
+        // Recordings must belong to a real profile — All is aggregator-only.
+        property <int> row-count: root.profile-list.length + (root.create-picker-intent != "rec" ? 1 : 0);
         height: 52px + row-count * 48px + 12px + 48px;
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
@@ -5148,7 +5344,7 @@ export component EphemerisPage inherits Window {
                 }
             }
 
-            Rectangle {
+            if root.create-picker-intent != "rec": Rectangle {
                 height: 48px;
                 border-radius: 4px;
                 background: EinkTheme.btn-bg;

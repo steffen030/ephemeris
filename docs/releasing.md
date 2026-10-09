@@ -129,6 +129,12 @@ sudo apt update
 sudo apt install ephemeris
 ```
 
+The package pulls in **Tesseract** (`tesseract-ocr`, `tesseract-ocr-eng`) for
+handwriting See-text / searchable PDF export, and **bundles `whisper-cli`**
+(plus its shared libraries under `/usr/lib/ephemeris/whisper/`) because
+`whisper.cpp` is not in Debian trixie yet. Voice transcription still needs a
+model: open Settings → Transcription → Download after install.
+
 Upgrades after later releases:
 
 ```bash
