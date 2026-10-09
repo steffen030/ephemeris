@@ -55,3 +55,22 @@ Description: Ephemeris — e-ink planner and note-taking app
  devices with pens (e.g. PineNote). It manages profiles, calendars,
  tasks, and handwritten notes.
 
+Package: ephemeris
+Version: 0.1.4
+Architecture: arm64
+Maintainer: Steffen Galan <steffen.galan@gmail.com>
+Installed-Size: 35988
+Depends: libxkbcommon0, libwayland-client0
+Filename: pool/main/e/ephemeris/ephemeris_0.1.4_arm64.deb
+Size: 10378446
+MD5sum: 5259e418932db5d3761d1ba549726974
+SHA1: 27f3b55ff74ac13ac2d61e216bd6787214047985
+SHA256: 75564f7fda06bb3c1cf8b1fa3e4dda13a05fd3d6461ac59984091354e03d8108
+Section: utils
+Priority: optional
+Homepage: https://github.com/steffen030/ephemeris
+Description: Ephemeris — e-ink planner and note-taking app
+ Ephemeris is a planner and note-taking application focused on e-ink
+ devices with pens (e.g. PineNote). It manages profiles, calendars,
+ tasks, and handwritten notes.
+
