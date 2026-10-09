@@ -117,7 +117,7 @@ fn find_pen_device() -> Option<PathBuf> {
             candidates.push((score, path));
         }
     }
-    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    candidates.sort_by_key(|a| std::cmp::Reverse(a.0));
     candidates.into_iter().map(|(_, p)| p).next()
 }
 
@@ -249,26 +249,26 @@ fn run_device(
                 EventSummary::Key(_, KeyCode::BTN_STYLUS | KeyCode::BTN_STYLUS2, val) => {
                     emit(&tx, &wake, InputEvent::PenButton { pressed: val != 0 });
                 }
-                EventSummary::Synchronization(_, _, _) => {
-                    if have_pos && (tip_down || in_range) {
-                        let s = sample(
-                            raw_x,
-                            raw_y,
-                            raw_p,
-                            tip_down || in_range,
-                            &target,
-                            x_min,
-                            x_max,
-                            y_min,
-                            y_max,
-                            p_min,
-                            p_max,
-                        );
-                        if tip_down {
-                            emit(&tx, &wake, InputEvent::PenMove(s));
-                        } else if in_range {
-                            emit(&tx, &wake, InputEvent::Hover { x: s.x, y: s.y });
-                        }
+                EventSummary::Synchronization(_, _, _)
+                    if have_pos && (tip_down || in_range) =>
+                {
+                    let s = sample(
+                        raw_x,
+                        raw_y,
+                        raw_p,
+                        tip_down || in_range,
+                        &target,
+                        x_min,
+                        x_max,
+                        y_min,
+                        y_max,
+                        p_min,
+                        p_max,
+                    );
+                    if tip_down {
+                        emit(&tx, &wake, InputEvent::PenMove(s));
+                    } else if in_range {
+                        emit(&tx, &wake, InputEvent::Hover { x: s.x, y: s.y });
                     }
                 }
                 _ => {}
