@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.3](https://github.com/steffen030/ephemeris/compare/v0.1.2...v0.1.3) (2026-10-09)
+
+
+### Bug Fixes
+
+* PineNote UI scale, maximized window, and evdev pen ([4bfca6c](https://github.com/steffen030/ephemeris/commit/4bfca6c0a987ff2f2bd92e574a24537c9e172417))
+* silence clippy lints in evdev pen reader ([877539b](https://github.com/steffen030/ephemeris/commit/877539bb12e30646585060df3d545563845cb481))
+
 ## [0.1.2](https://github.com/steffen030/ephemeris/compare/v0.1.1...v0.1.2) (2026-10-08)
 
 
