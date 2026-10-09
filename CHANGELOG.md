@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.5](https://github.com/steffen030/ephemeris/compare/v0.1.4...v0.1.5) (2026-10-09)
+
+
+### Features
+
+* multi-page notes, pen-only ink, See-text UX, and PineNote packaging ([bcbb4fa](https://github.com/steffen030/ephemeris/commit/bcbb4fa38227f4a4ed0c18afc595dabc05220ef3))
+
 ## [0.1.4](https://github.com/steffen030/ephemeris/compare/v0.1.3...v0.1.4) (2026-10-09)
 
 
