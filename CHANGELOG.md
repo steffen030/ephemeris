@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.4](https://github.com/steffen030/ephemeris/compare/v0.1.3...v0.1.4) (2026-10-09)
+
+
+### Bug Fixes
+
+* PineNote fullscreen kiosk and pen axis remap ([06f6084](https://github.com/steffen030/ephemeris/commit/06f60849fc0e8732d1124b4d16833e59c9e8cf7b))
+* PineNote fullscreen kiosk and pen axis remap ([5c5b81e](https://github.com/steffen030/ephemeris/commit/5c5b81e115cb7c1f99c91f9ec7d773e8c0886bc5))
+
 ## [0.1.3](https://github.com/steffen030/ephemeris/compare/v0.1.2...v0.1.3) (2026-10-09)
 
 
