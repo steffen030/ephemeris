@@ -7,4 +7,7 @@
 pub mod display;
 pub mod input;
 
-pub use display::{Display, DisplayError, PixelBuf, Rect, RefreshMode};
+pub use display::{
+    covers_output, kiosk_enabled, DesktopWindow, Display, DisplayError, PixelBuf, Rect,
+    RefreshMode, PINENOTE_PX,
+};

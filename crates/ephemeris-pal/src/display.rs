@@ -133,10 +133,33 @@ pub trait Display {
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
+/// Slop when comparing window size to output size (rounding / CSD).
+const COVER_SLOP: u32 = 8;
+
+/// PineNote panel physical size; fallback before a monitor is known.
+pub const PINENOTE_PX: (u32, u32) = (1404, 1872);
+
+/// True when `window` fills `output` aside from rounding.
+pub fn covers_output(window: (u32, u32), output: (u32, u32)) -> bool {
+    output.0 >= 64
+        && output.1 >= 64
+        && window.0 + COVER_SLOP >= output.0
+        && window.1 + COVER_SLOP >= output.1
+}
+
+/// Escape hatch: leave a normal decorated window (desktop debugging).
+pub fn kiosk_enabled() -> bool {
+    std::env::var_os("EPHEMERIS_WINDOWED").is_none()
+}
+
 /// Live desktop window backed by winit + softbuffer.
 ///
 /// Created inside an `ApplicationHandler::resumed` callback; presents an
 /// 8-bpp grayscale [`PixelBuf`] as XRGB8888 to the OS compositor.
+///
+/// On Linux/GNOME (PineNote), default mode is borderless exclusive fullscreen
+/// so the top panel stays hidden. Leave fullscreen (stay maximized) to peek
+/// the panel; re-enter fullscreen on the next tap — same protocol as Calibread.
 pub struct DesktopWindow {
     window: Arc<winit::window::Window>,
     // Context must outlive surface; prefixed `_` because it is only kept alive.
@@ -161,12 +184,11 @@ impl DesktopWindow {
         use winit::dpi::LogicalSize;
         use winit::window::Window;
 
+        let kiosk = kiosk_enabled();
         let attrs = Window::default_attributes()
             .with_title("Ephemeris")
             .with_inner_size(LogicalSize::new(width, height))
-            // Maximized (not borderless-fullscreen) so GNOME/Phosh can dismiss
-            // the top panel when the user taps back into the app. Softbuffer
-            // still fills the physical surface via nearest-neighbour upscale.
+            .with_decorations(!kiosk)
             .with_maximized(true)
             .with_resizable(true);
 
@@ -183,6 +205,10 @@ impl DesktopWindow {
                 .create_window(attrs)
                 .map_err(|e| DisplayError::init(e.to_string()))?,
         );
+
+        if kiosk {
+            apply_borderless_fullscreen(&window);
+        }
 
         let ctx = softbuffer::Context::new(window.clone())
             .map_err(|e| DisplayError::init(e.to_string()))?;
@@ -207,6 +233,59 @@ impl DesktopWindow {
             width,
             height,
         })
+    }
+
+    /// Enter exclusive borderless fullscreen (hides GNOME/Phosh top panel).
+    pub fn enter_kiosk(&self) {
+        if !kiosk_enabled() {
+            return;
+        }
+        apply_borderless_fullscreen(&self.window);
+    }
+
+    /// Leave exclusive fullscreen but stay maximized so the shell panel stays
+    /// visible on the workarea until the next tap.
+    pub fn show_panel(&self) {
+        if !kiosk_enabled() {
+            return;
+        }
+        self.window.set_fullscreen(None);
+        self.window.set_maximized(true);
+        self.window.set_decorations(false);
+    }
+
+    /// True when the window fills the current monitor output.
+    pub fn covers_output(&self) -> bool {
+        let Some(output) = self.output_px() else {
+            return false;
+        };
+        let inner = self.window.inner_size();
+        covers_output((inner.width, inner.height), output)
+    }
+
+    /// Current monitor physical size, if known.
+    pub fn output_px(&self) -> Option<(u32, u32)> {
+        let monitor = self
+            .window
+            .current_monitor()
+            .or_else(|| self.window.primary_monitor())?;
+        let size = monitor.size();
+        if size.width < 64 || size.height < 64 {
+            return None;
+        }
+        Some((size.width, size.height))
+    }
+
+    /// Window inner size and outer position in logical pixels (for pen mapping).
+    pub fn logical_geometry(&self) -> (u32, u32, u32, u32) {
+        let scale = self.window.scale_factor().max(0.01);
+        let inner = self.window.inner_size();
+        let pos = self.window.outer_position().unwrap_or_default();
+        let win_w = ((inner.width as f64) / scale).round().max(1.0) as u32;
+        let win_h = ((inner.height as f64) / scale).round().max(1.0) as u32;
+        let origin_x = ((pos.x as f64) / scale).round().max(0.0) as u32;
+        let origin_y = ((pos.y as f64) / scale).round().max(0.0) as u32;
+        (win_w, win_h, origin_x, origin_y)
     }
 
     /// Resize the softbuffer surface to the current physical window dimensions.
@@ -248,6 +327,14 @@ impl DesktopWindow {
     pub fn logical_size(&self) -> (u32, u32) {
         (self.width, self.height)
     }
+}
+
+fn apply_borderless_fullscreen(window: &winit::window::Window) {
+    use winit::window::Fullscreen;
+    window.set_decorations(false);
+    window.set_maximized(true);
+    let monitor = window.current_monitor();
+    window.set_fullscreen(Some(Fullscreen::Borderless(monitor)));
 }
 
 impl Display for DesktopWindow {
@@ -373,6 +460,25 @@ mod tests {
     #[test]
     fn refresh_mode_default() {
         assert_eq!(RefreshMode::default(), RefreshMode::Full);
+    }
+
+    #[test]
+    fn fullscreen_pinenote_covers() {
+        assert!(covers_output((1404, 1872), (1404, 1872)));
+    }
+
+    #[test]
+    fn workarea_under_gnome_bar_does_not_cover() {
+        assert!(!covers_output((1404, 1808), (1404, 1872)));
+        assert!(!covers_output((1404, 1840), (1404, 1872)));
+        // GNOME panel ~64px: treating this as covering would re-fullscreen and
+        // the bar would only flash.
+        assert!(!covers_output((1404, 1872 - 64), (1404, 1872)));
+    }
+
+    #[test]
+    fn preferred_window_does_not_cover() {
+        assert!(!covers_output((900, 1200), PINENOTE_PX));
     }
 
     #[test]

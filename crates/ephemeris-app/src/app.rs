@@ -32,8 +32,14 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::WindowId;
 
-use ephemeris_pal::display::DesktopWindow;
+use ephemeris_pal::display::{kiosk_enabled, DesktopWindow};
 use ephemeris_ui::EphemerisUi;
+
+/// Top-edge band (UI logical px) used to detect a swipe-down that reveals the
+/// GNOME/Phosh panel while in exclusive fullscreen.
+const CHROME_SWIPE_EDGE_Y: f32 = 36.0;
+/// Minimum downward travel (UI logical px) to count as a chrome reveal swipe.
+const CHROME_SWIPE_MIN_DY: f32 = 20.0;
 
 /// Wakes the event loop when the Linux evdev pen thread has samples ready.
 #[derive(Debug, Clone, Copy)]
@@ -3645,13 +3651,13 @@ impl App {
         }
 
         #[cfg(target_os = "linux")]
-        let pen_source = {
+        let (pen_source, pen_target) = {
             let proxy = event_loop.create_proxy();
             let wake: ephemeris_pal::input::PenWake = Arc::new(move || {
                 let _ = proxy.send_event(AppUserEvent::PenReady);
             });
             let target = PenTarget::new(win_w, win_h);
-            match EvdevPenSource::spawn(target, Some(wake)) {
+            let source = match EvdevPenSource::spawn(Arc::clone(&target), Some(wake)) {
                 Some(src) => {
                     tracing::info!("evdev pen source active");
                     Some(src)
@@ -3660,7 +3666,8 @@ impl App {
                     tracing::info!("no evdev pen device found; finger/mouse only");
                     None
                 }
-            }
+            };
+            (source, Some(target))
         };
 
         let mut handler = WinitHandler {
@@ -3687,6 +3694,15 @@ impl App {
             push_recordings,
             #[cfg(target_os = "linux")]
             pen_source,
+            #[cfg(target_os = "linux")]
+            pen_target,
+            chrome_peeking: false,
+            chrome_dismiss_armed: false,
+            chrome_pointer_held: false,
+            chrome_swallow: false,
+            chrome_was_covering: false,
+            chrome_swipe_start: None,
+            last_kiosk_check: Instant::now(),
         };
 
         event_loop.run_app(&mut handler)?;
@@ -3752,6 +3768,22 @@ struct WinitHandler {
     /// Linux: separate digitiser (PineNote pen) via `/dev/input` — not wl_touch.
     #[cfg(target_os = "linux")]
     pen_source: Option<EvdevPenSource>,
+    /// Shared with the evdev worker so resize / peek can refresh mapping.
+    #[cfg(target_os = "linux")]
+    pen_target: Option<Arc<PenTarget>>,
+    /// Exclusive-fullscreen peek: GNOME bar visible until the next tap.
+    chrome_peeking: bool,
+    /// Armed after the revealing pointer lifts (or immediately if none held).
+    chrome_dismiss_armed: bool,
+    chrome_pointer_held: bool,
+    /// Swallow the dismiss tap so it does not draw / open menus.
+    chrome_swallow: bool,
+    /// Was covering output last check (detect shell-driven un-fullscreen).
+    chrome_was_covering: bool,
+    /// Top-edge swipe tracking: start Y in UI logical px.
+    chrome_swipe_start: Option<f32>,
+    /// Throttle for the kiosk geometry watchdog.
+    last_kiosk_check: Instant,
 }
 
 impl WinitHandler {
@@ -3774,9 +3806,88 @@ impl WinitHandler {
         }
     }
 
+    fn sync_pen_geometry(&self) {
+        #[cfg(target_os = "linux")]
+        if let (Some(target), Some(d)) = (&self.pen_target, &self.display) {
+            let (ui_w, ui_h) = self.ui.size();
+            target.set_ui(ui_w, ui_h);
+            let (win_w, win_h, ox, oy) = d.logical_geometry();
+            target.set_window(win_w, win_h, ox, oy);
+        }
+    }
+
+    fn begin_chrome_peek(&mut self) {
+        if !kiosk_enabled() || self.chrome_peeking {
+            return;
+        }
+        self.chrome_peeking = true;
+        // Wait for the revealing swipe to lift so a synthesized mouse-press
+        // for the same finger cannot hide the bar immediately.
+        self.chrome_dismiss_armed = !self.chrome_pointer_held;
+        if let Some(d) = &self.display {
+            d.show_panel();
+            d.focus();
+        }
+        self.sync_pen_geometry();
+        tracing::info!("chrome peek: left exclusive fullscreen (panel visible)");
+    }
+
+    fn end_chrome_peek(&mut self) {
+        if !self.chrome_peeking {
+            return;
+        }
+        self.chrome_peeking = false;
+        self.chrome_dismiss_armed = false;
+        self.chrome_was_covering = false;
+        if let Some(d) = &self.display {
+            d.enter_kiosk();
+            d.focus();
+        }
+        self.sync_pen_geometry();
+        tracing::info!("chrome peek: restored exclusive fullscreen");
+    }
+
+    /// Re-apply kiosk / detect shell-driven un-fullscreen. Never re-fullscreen
+    /// while peeking (that would make the panel only flash).
+    fn on_kiosk_geometry(&mut self) {
+        if !kiosk_enabled() {
+            self.sync_pen_geometry();
+            return;
+        }
+        let Some(d) = &self.display else {
+            return;
+        };
+        if self.chrome_peeking {
+            self.sync_pen_geometry();
+            return;
+        }
+        if d.covers_output() {
+            self.chrome_was_covering = true;
+            self.sync_pen_geometry();
+            return;
+        }
+        if self.chrome_was_covering {
+            // Shell (or compositor) shrunk us off exclusive fullscreen — enter peek.
+            self.begin_chrome_peek();
+            return;
+        }
+        d.enter_kiosk();
+        self.sync_pen_geometry();
+    }
+
     fn handle_pointer_move(&mut self, lx: f32, ly: f32, pressure: f32) {
         use ephemeris_ui::STATUS_BAR_H;
         self.cursor_pos = (lx, ly);
+        if self.chrome_swallow {
+            return;
+        }
+        if let Some(start_y) = self.chrome_swipe_start {
+            if !self.chrome_peeking && kiosk_enabled() && ly - start_y >= CHROME_SWIPE_MIN_DY {
+                self.chrome_swipe_start = None;
+                self.begin_chrome_peek();
+                return;
+            }
+        }
         self.ui.dispatch_pointer_moved(lx, ly);
         if self.is_drawing && !self.ui.is_canvas_active() {
             self.is_drawing = false;
@@ -3805,6 +3916,24 @@ impl WinitHandler {
         use ephemeris_ui::{STATUS_BAR_H, TOOLBAR_H};
         let (_, ui_h) = self.ui.size();
         self.cursor_pos = (lx, ly);
+        self.chrome_pointer_held = true;
+
+        if self.chrome_peeking && self.chrome_dismiss_armed {
+            self.end_chrome_peek();
+            self.chrome_swallow = true;
+            self.chrome_swipe_start = None;
+            if let Some(d) = &self.display {
+                d.request_redraw();
+            }
+            return;
+        }
+
+        if !self.chrome_peeking && kiosk_enabled() && ly <= CHROME_SWIPE_EDGE_Y {
+            self.chrome_swipe_start = Some(ly);
+        } else {
+            self.chrome_swipe_start = None;
+        }
+
         // Bring the window forward so GNOME/Phosh dismisses the swipe-down panel.
         if let Some(d) = &self.display {
             d.focus();
@@ -3842,6 +3971,22 @@ impl WinitHandler {
     fn handle_pointer_release(&mut self, lx: f32, ly: f32) {
         use ephemeris_ui::STATUS_BAR_H;
         self.cursor_pos = (lx, ly);
+        self.chrome_pointer_held = false;
+        self.chrome_swipe_start = None;
+
+        if self.chrome_swallow {
+            self.chrome_swallow = false;
+            if let Some(d) = &self.display {
+                d.request_redraw();
+            }
+            return;
+        }
+
+        if self.chrome_peeking {
+            // Arm dismiss after the revealing swipe lifts.
+            self.chrome_dismiss_armed = true;
+        }
+
         self.ui.dispatch_pointer_released(lx, ly);
         if self.is_drawing {
             self.is_drawing = false;
@@ -3926,6 +4071,11 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         #[cfg(target_os = "linux")]
         self.drain_pen_events();
+        // Kiosk watchdog: re-cover the output unless we're peeking the panel.
+        if kiosk_enabled() && self.last_kiosk_check.elapsed() >= Duration::from_millis(250) {
+            self.last_kiosk_check = Instant::now();
+            self.on_kiosk_geometry();
+        }
         // --- Drain whisper download result ---
         if let Ok(mut guard) = self.download_result.lock() {
             if let Some(result) = guard.take() {
@@ -4011,8 +4161,13 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
         match DesktopWindow::new(event_loop, w, h) {
             Ok(d) => {
                 self.scale = d.scale_factor();
+                if kiosk_enabled() {
+                    d.enter_kiosk();
+                }
                 d.request_redraw();
                 self.display = Some(d);
+                self.chrome_was_covering = false;
+                self.on_kiosk_geometry();
             }
             Err(e) => {
                 tracing::error!("DesktopWindow creation failed: {e}");
@@ -4030,6 +4185,15 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
                     let _ = d.resize_surface();
                     d.request_redraw();
                 }
+                self.on_kiosk_geometry();
+            }
+
+            WindowEvent::Moved(_) => {
+                self.on_kiosk_geometry();
+            }
+
+            WindowEvent::Focused(_) => {
+                self.on_kiosk_geometry();
             }
 
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
@@ -4038,6 +4202,7 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
                     let _ = d.resize_surface();
                     d.request_redraw();
                 }
+                self.on_kiosk_geometry();
             }
 
             // Track Ctrl modifier so canvas-touch only opens ring when Ctrl is held.

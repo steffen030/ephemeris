@@ -18,7 +18,7 @@ APIs, UI, and on-disk formats will still change.
 | Agenda | Day / week / month views fed by ICS HTTPS / local calendar feeds |
 | Tasks | Local tasks + Obsidian markdown task extract / write-back |
 | Obsidian | Vault browse, FTS note search, export notes as PDF + markdown into the vault |
-| Desktop / device shell | Maximized Wayland window (winit + softbuffer); design-scaled UI; finger via `Touch`, pen via Linux evdev |
+| Desktop / device shell | Borderless fullscreen Wayland (winit + softbuffer); swipe-down peeks GNOME bar; design-scaled UI; finger via `Touch`, pen via Linux evdev with digitizer axis remap |
 | Device packaging | `arm64` `.deb` with `.desktop` launcher entry; signed apt repo on GitHub Pages |
 
 ## Not there yet
@@ -93,7 +93,8 @@ sudo usermod -aG input "$USER"
 
 Optional: `EPHEMERIS_SIZE=WxH` overrides the design UI resolution (default
 `800x1067`, upscaled to the panel). `EPHEMERIS_GRAB_PEN=1` takes exclusive
-evdev grab of the digitiser.
+evdev grab of the digitiser. `EPHEMERIS_WINDOWED=1` disables borderless
+fullscreen (decorated maximized window — useful on a desktop monitor).
 
 The public keyring also lives in-tree at
 [`packaging/keys/`](packaging/keys/). Full release and packaging notes:

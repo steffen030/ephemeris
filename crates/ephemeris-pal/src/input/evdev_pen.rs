@@ -3,8 +3,8 @@
 //!
 //! Scans `/dev/input/event*` for a device that looks like a tablet/pen
 //! (`BTN_TOOL_PEN` / `INPUT_PROP_DIRECT` + absolute axes), then streams
-//! normalised [`InputEvent`]s. Coordinates are mapped into the UI logical
-//! size supplied via [`PenTarget`].
+//! normalised [`InputEvent`]s. Coordinates are oriented and mapped into the
+//! design UI size via [`PenTarget`] (see [`super::stylus_map`]).
 
 #![cfg(target_os = "linux")]
 
@@ -18,28 +18,57 @@ use std::time::Duration;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use evdev::{AbsoluteAxisCode, Device, EventSummary, KeyCode, PropType};
 
+use super::stylus_map::{digitizer_to_window, window_to_ui};
 use super::{InputEvent, PenSample};
 
 const CHANNEL_CAPACITY: usize = 256;
 
-/// Live UI size the pen coordinates should be mapped into.
+/// Live geometry the pen coordinates should be mapped into.
+///
+/// - `ui_*`: design UI logical size (Slint / ink space)
+/// - `win_*`: window inner size in logical pixels
+/// - `origin_*`: window top-left on the output in logical pixels (GNOME bar gap
+///   when maximized under the panel)
 #[derive(Debug)]
 pub struct PenTarget {
-    pub width: AtomicU32,
-    pub height: AtomicU32,
+    pub ui_w: AtomicU32,
+    pub ui_h: AtomicU32,
+    pub win_w: AtomicU32,
+    pub win_h: AtomicU32,
+    pub origin_x: AtomicU32,
+    pub origin_y: AtomicU32,
 }
 
 impl PenTarget {
-    pub fn new(width: u32, height: u32) -> Arc<Self> {
+    pub fn new(ui_w: u32, ui_h: u32) -> Arc<Self> {
         Arc::new(Self {
-            width: AtomicU32::new(width.max(1)),
-            height: AtomicU32::new(height.max(1)),
+            ui_w: AtomicU32::new(ui_w.max(1)),
+            ui_h: AtomicU32::new(ui_h.max(1)),
+            win_w: AtomicU32::new(ui_w.max(1)),
+            win_h: AtomicU32::new(ui_h.max(1)),
+            origin_x: AtomicU32::new(0),
+            origin_y: AtomicU32::new(0),
         })
     }
 
+    /// Update design UI size (rarely changes).
+    pub fn set_ui(&self, width: u32, height: u32) {
+        self.ui_w.store(width.max(1), Ordering::Relaxed);
+        self.ui_h.store(height.max(1), Ordering::Relaxed);
+    }
+
+    /// Update window geometry used for digitizer → window → UI mapping.
+    pub fn set_window(&self, win_w: u32, win_h: u32, origin_x: u32, origin_y: u32) {
+        self.win_w.store(win_w.max(1), Ordering::Relaxed);
+        self.win_h.store(win_h.max(1), Ordering::Relaxed);
+        self.origin_x.store(origin_x, Ordering::Relaxed);
+        self.origin_y.store(origin_y, Ordering::Relaxed);
+    }
+
+    /// Convenience: set UI and window to the same size with zero origin.
     pub fn set(&self, width: u32, height: u32) {
-        self.width.store(width.max(1), Ordering::Relaxed);
-        self.height.store(height.max(1), Ordering::Relaxed);
+        self.set_ui(width, height);
+        self.set_window(width, height, 0, 0);
     }
 }
 
@@ -187,6 +216,7 @@ fn run_device(
     let (x_min, x_max) = abs_range(&device, AbsoluteAxisCode::ABS_X)?;
     let (y_min, y_max) = abs_range(&device, AbsoluteAxisCode::ABS_Y)?;
     let (p_min, p_max) = abs_range(&device, AbsoluteAxisCode::ABS_PRESSURE).unwrap_or((0, 4096));
+    let digitizer = ((x_max - x_min) as f32, (y_max - y_min) as f32);
 
     let mut raw_x = x_min;
     let mut raw_y = y_min;
@@ -223,8 +253,8 @@ fn run_device(
                     if val == 0 && tip_down {
                         tip_down = false;
                         let sample = sample(
-                            raw_x, raw_y, raw_p, false, &target, x_min, x_max, y_min, y_max, p_min,
-                            p_max,
+                            raw_x, raw_y, raw_p, false, &target, digitizer, x_min, x_max, y_min,
+                            y_max, p_min, p_max,
                         );
                         emit(&tx, &wake, InputEvent::PenUp(sample));
                     }
@@ -235,8 +265,8 @@ fn run_device(
                     }
                     let pressed = val != 0;
                     let s = sample(
-                        raw_x, raw_y, raw_p, pressed, &target, x_min, x_max, y_min, y_max, p_min,
-                        p_max,
+                        raw_x, raw_y, raw_p, pressed, &target, digitizer, x_min, x_max, y_min,
+                        y_max, p_min, p_max,
                     );
                     if pressed && !tip_down {
                         tip_down = true;
@@ -256,6 +286,7 @@ fn run_device(
                         raw_p,
                         tip_down || in_range,
                         &target,
+                        digitizer,
                         x_min,
                         x_max,
                         y_min,
@@ -296,6 +327,7 @@ fn sample(
     raw_p: i32,
     in_contact: bool,
     target: &PenTarget,
+    digitizer: (f32, f32),
     x_min: i32,
     x_max: i32,
     y_min: i32,
@@ -303,18 +335,36 @@ fn sample(
     p_min: i32,
     p_max: i32,
 ) -> PenSample {
-    let ui_w = target.width.load(Ordering::Relaxed).max(1) as f32;
-    let ui_h = target.height.load(Ordering::Relaxed).max(1) as f32;
+    let ui = (
+        target.ui_w.load(Ordering::Relaxed).max(1) as f32,
+        target.ui_h.load(Ordering::Relaxed).max(1) as f32,
+    );
+    let window = (
+        target.win_w.load(Ordering::Relaxed).max(1) as f32,
+        target.win_h.load(Ordering::Relaxed).max(1) as f32,
+    );
+    let origin = (
+        target.origin_x.load(Ordering::Relaxed) as f32,
+        target.origin_y.load(Ordering::Relaxed) as f32,
+    );
     let nx = ((raw_x - x_min) as f32) / ((x_max - x_min) as f32).max(1.0);
     let ny = ((raw_y - y_min) as f32) / ((y_max - y_min) as f32).max(1.0);
+    let (wx, wy) = digitizer_to_window(
+        nx.clamp(0.0, 1.0),
+        ny.clamp(0.0, 1.0),
+        digitizer,
+        origin,
+        window,
+    );
+    let (x, y) = window_to_ui(wx, wy, window, ui);
     let pressure = if in_contact {
         ((raw_p - p_min) as f32 / ((p_max - p_min) as f32).max(1.0)).clamp(0.05, 1.0)
     } else {
         0.0
     };
     PenSample {
-        x: nx.clamp(0.0, 1.0) * ui_w,
-        y: ny.clamp(0.0, 1.0) * ui_h,
+        x,
+        y,
         pressure,
         tilt: 0.0,
         in_range: true,
