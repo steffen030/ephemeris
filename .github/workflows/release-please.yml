@@ -70,6 +70,8 @@ jobs:
       - name: Wait for CI workflow on this commit
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # No checkout in this job — tell gh which repo (otherwise it looks for .git).
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           SHA="${{ github.sha }}"
