@@ -33,7 +33,8 @@ root `Cargo.toml`. release-please bumps that field and updates `CHANGELOG.md`.
   It never publishes a release or apt packages.
 - **Release Please** ([`.github/workflows/release-please.yml`](../.github/workflows/release-please.yml)):
   on push to `main`, opens/updates the Release PR. When that PR is merged and a
-  release is created, it calls the release workflow.
+  release is created, it **waits for CI on the same commit to succeed**, then
+  calls the release workflow. If CI fails, packaging/publish is skipped.
 - **Release** ([`.github/workflows/release.yml`](../.github/workflows/release.yml)):
   cross-builds `aarch64-unknown-linux-gnu`, packages an `arm64` `.deb`, attaches
   assets to the GitHub Release, and publishes a GPG-signed apt repo to the
@@ -41,10 +42,11 @@ root `Cargo.toml`. release-please bumps that field and updates `CHANGELOG.md`.
 
 ## Cut a release
 
-1. Land work on `main` with Conventional Commit messages.
+1. Land work on `main` with Conventional Commit messages (CI must be green).
 2. Wait for release-please to open or update the **Release Please** PR
    (changelog + version bump). Merge it when you want to ship.
-3. The release workflow builds artifacts and updates the apt repo.
+3. CI runs on the merge commit; once it passes, the release workflow builds
+   artifacts and updates the apt repo.
 
 To rebuild packaging for an existing tag without a new Release PR, run the
 **Release** workflow manually (`workflow_dispatch`) and pass the tag

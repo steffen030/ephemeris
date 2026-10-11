@@ -56,7 +56,8 @@ pub fn group_strokes_into_lines(strokes: &[Stroke], line_gap: f32) -> Vec<Stroke
     }
     items.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    let mut lines: Vec<Vec<(Stroke, f32, f32, f32, f32, f32)>> = Vec::new();
+    type LinedStroke = (Stroke, f32, f32, f32, f32, f32);
+    let mut lines: Vec<Vec<LinedStroke>> = Vec::new();
     for item in items {
         let cy = item.1;
         if let Some(line) = lines.last_mut() {
@@ -231,11 +232,7 @@ pub fn decode_charset_with_blank(indices: &[usize], charset: &str, blank: usize)
             if i == blank {
                 return None;
             }
-            let idx = if blank == 0 {
-                i.checked_sub(1)?
-            } else {
-                i
-            };
+            let idx = if blank == 0 { i.checked_sub(1)? } else { i };
             chars.get(idx).copied()
         })
         .collect()

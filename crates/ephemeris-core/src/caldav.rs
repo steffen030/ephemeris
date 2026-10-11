@@ -380,9 +380,7 @@ fn extract_local_tag_texts(xml: &str, local: &str) -> Vec<String> {
         }
         // Skip to tag name end.
         let rest = &lower[after_lt..];
-        let name_end = rest
-            .find(|c: char| c == '>' || c == ' ' || c == '/')
-            .unwrap_or(0);
+        let name_end = rest.find(['>', ' ', '/']).unwrap_or(0);
         let raw_name = &rest[..name_end];
         let local_name = raw_name.rsplit(':').next().unwrap_or(raw_name);
         if local_name != local_l {
@@ -438,9 +436,7 @@ fn find_tag_inner<'a>(xml: &'a str, local: &str) -> Option<&'a str> {
     let local_l = local.to_ascii_lowercase();
     let mut search_from = 0;
     while search_from < lower.len() {
-        let Some(rel) = lower[search_from..].find('<') else {
-            return None;
-        };
+        let rel = lower[search_from..].find('<')?;
         let start = search_from + rel;
         let after_lt = start + 1;
         if after_lt >= lower.len() || lower.as_bytes()[after_lt] == b'/' {
@@ -448,9 +444,7 @@ fn find_tag_inner<'a>(xml: &'a str, local: &str) -> Option<&'a str> {
             continue;
         }
         let rest = &lower[after_lt..];
-        let name_end = rest
-            .find(|c: char| c == '>' || c == ' ' || c == '/')
-            .unwrap_or(0);
+        let name_end = rest.find(['>', ' ', '/']).unwrap_or(0);
         let raw_name = &rest[..name_end];
         let local_name = raw_name.rsplit(':').next().unwrap_or(raw_name);
         if local_name != local_l {
@@ -458,9 +452,7 @@ fn find_tag_inner<'a>(xml: &'a str, local: &str) -> Option<&'a str> {
             continue;
         }
         let open = &xml[start..];
-        let Some(gt) = open.find('>') else {
-            return None;
-        };
+        let gt = open.find('>')?;
         if open[..gt].ends_with('/') {
             search_from = start + gt + 1;
             continue;

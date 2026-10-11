@@ -366,9 +366,7 @@ fn load_charset(dir: &std::path::Path) -> String {
             .map(|l| l.chars().next().unwrap_or(' '))
             .collect()
     } else {
-        raw.chars()
-            .filter(|c| *c != '\n' && *c != '\r')
-            .collect()
+        raw.chars().filter(|c| *c != '\n' && *c != '\r').collect()
     }
 }
 
