@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.7](https://github.com/steffen030/ephemeris/compare/v0.1.6...v0.1.7) (2026-10-11)
+
+
+### Bug Fixes
+
+* **deps:** bump toml from 0.8.23 to 1.1.7+spec-1.1.0 ([#18](https://github.com/steffen030/ephemeris/issues/18)) ([1d1100d](https://github.com/steffen030/ephemeris/commit/1d1100d4d06d0f9fbddb1b0e115a718e7f9b3ade))
+
 ## [0.1.6](https://github.com/steffen030/ephemeris/compare/v0.1.5...v0.1.6) (2026-10-11)
 
 
