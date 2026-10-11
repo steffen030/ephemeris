@@ -43,6 +43,8 @@ pub fn init_tracing() {
         .with_thread_ids(true)
         .init();
 }
+#[cfg(feature = "caldav")]
+pub mod caldav;
 pub mod calendar_cache;
 pub mod markdown_tasks;
 pub mod note_search;
@@ -50,14 +52,18 @@ pub mod obsidian;
 pub mod pdf_export;
 pub mod prioritizer;
 pub mod profile_manager;
+pub mod stroke_htr;
 pub mod stroke_persistence;
 pub mod task_cache;
 pub mod task_provider;
 pub mod transcriber;
 pub mod vault_export;
+pub mod vault_git;
 pub use agenda::{filter_agenda, to_agenda_entries, AgendaEntry, AgendaRange};
 #[cfg(feature = "sqlite")]
 pub use aggregation::AggregationService;
+#[cfg(feature = "caldav")]
+pub use caldav::{default_sync_window, CalDavCalendar, CalDavClient, CalDavConfig};
 pub use calendar_cache::CalendarCache;
 pub use markdown_tasks::{MarkdownTaskExtractor, DEFAULT_TASKS_INBOX};
 pub use note_search::{
@@ -69,16 +75,24 @@ pub use pdf_export::{
     raster_export_hash, PdfExportOptions, RasterPage,
 };
 pub use prioritizer::{rank_tasks, task_score};
+pub use stroke_htr::{
+    ctc_greedy_decode, decode_charset, default_line_gap, featurize_line, group_strokes_into_lines,
+    StrokeLine,
+};
 pub use task_cache::TaskCache;
 #[cfg(feature = "sqlite")]
 pub use task_provider::LocalTaskProvider;
 pub use task_provider::{ProviderCapabilities, TaskProvider};
 pub use transcriber::{
-    parse_tesseract_tsv, FakeTranscriber, NoOpTranscriber, RasterOcrTranscriber, TextSpan,
-    Transcriber,
+    mean_confidence, parse_tesseract_tsv, CascadingTranscriber, FakeTranscriber, NoOpTranscriber,
+    RasterOcrTranscriber, StrokeHtrTranscriber, TextSpan, Transcriber,
 };
 pub use vault_export::{
-    export_note_markdown, sync_notes_to_vault, VaultNoteExport, DEFAULT_EXPORT_SUBDIR,
+    export_note_markdown, notebook_export_dir, notebook_export_rel, path_under_export_subdir,
+    sync_notes_to_vault, VaultNoteExport, DEFAULT_EXPORT_SUBDIR,
+};
+pub use vault_git::{
+    commit_and_push as vault_git_commit_and_push, is_git_repo, pull as vault_git_pull,
 };
 #[cfg(feature = "webdav")]
 pub mod webdav;

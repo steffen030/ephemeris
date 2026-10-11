@@ -18,10 +18,15 @@ sqlite = []
 webdav = ["dep:reqwest_dav", "dep:bytes"]
 # `ics` enables HTTPS ICS feed fetching (pulls in reqwest).
 ics = ["dep:reqwest"]
+# `caldav` enables thin CalDAV discovery + calendar-query (pulls in reqwest).
+caldav = ["dep:reqwest"]
 # `ocr` enables RasterOcrTranscriber's Tesseract CLI backend (system `tesseract`
 # + tessdata at runtime). Without this feature the type still exists but is a
 # NoOp — desktop CI can skip OCR without a system dependency.
 ocr = []
+# `htr` enables StrokeHtrTranscriber's RTen ONNX runtime. Model weights are
+# downloaded at runtime (Settings); CI can omit this feature.
+htr = ["dep:rten", "dep:rten-tensor"]
 
 [dependencies]
 ephemeris-pal = { workspace = true }
@@ -43,6 +48,9 @@ reqwest_dav = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 # Optional — activated only when the `ics` feature is enabled.
 reqwest = { workspace = true, optional = true }
+# Optional — online stroke HTR inference (ephemeris-5g2).
+rten = { workspace = true, optional = true }
+rten-tensor = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"

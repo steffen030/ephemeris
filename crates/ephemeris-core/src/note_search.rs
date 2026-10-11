@@ -69,8 +69,12 @@ impl VaultFtsIndex {
     ///
     /// If `vault_path` is missing or not a directory, the index is cleared and
     /// `Ok(0)` is returned (so callers can safely reindex after disconnect).
-    pub fn reindex_vault(&mut self, vault_path: &Path) -> crate::Result<usize> {
-        self.reindex_vaults(&[vault_path])
+    pub fn reindex_vault(
+        &mut self,
+        vault_path: &Path,
+        exclude_subdir: Option<&Path>,
+    ) -> crate::Result<usize> {
+        self.reindex_vaults(&[vault_path], exclude_subdir)
     }
 
     /// Clear and rebuild the index from one or more vault directories.
@@ -78,7 +82,14 @@ impl VaultFtsIndex {
     /// Document `path` / `id` is the vault-relative path when a single vault is
     /// indexed, or `abspath` when multiple vaults are merged (so open-by-path
     /// stays unambiguous).
-    pub fn reindex_vaults(&mut self, vault_paths: &[&Path]) -> crate::Result<usize> {
+    ///
+    /// When `exclude_subdir` is set (vault-relative, e.g. `Ephemeris`), that
+    /// tree is skipped so local note exports are not indexed as vault notes.
+    pub fn reindex_vaults(
+        &mut self,
+        vault_paths: &[&Path],
+        exclude_subdir: Option<&Path>,
+    ) -> crate::Result<usize> {
         self.clear()?;
         let multi = vault_paths.len() > 1;
         let mut count = 0usize;
@@ -87,7 +98,7 @@ impl VaultFtsIndex {
                 tracing::warn!("Vault path {:?} is not a directory; skipping", vault_path);
                 continue;
             }
-            let files = list_markdown_files(vault_path)?;
+            let files = list_markdown_files(vault_path, exclude_subdir)?;
             for full in files {
                 let rel = full
                     .strip_prefix(vault_path)
@@ -574,13 +585,21 @@ fn sanitize_fts_query(query: &str) -> String {
     tokens.join(" ")
 }
 
-fn list_markdown_files(dir: &Path) -> crate::Result<Vec<PathBuf>> {
+fn list_markdown_files(
+    vault_root: &Path,
+    exclude_subdir: Option<&Path>,
+) -> crate::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
-    walk_md(dir, &mut files)?;
+    walk_md(vault_root, vault_root, exclude_subdir, &mut files)?;
     Ok(files)
 }
 
-fn walk_md(dir: &Path, files: &mut Vec<PathBuf>) -> crate::Result<()> {
+fn walk_md(
+    vault_root: &Path,
+    dir: &Path,
+    exclude_subdir: Option<&Path>,
+    files: &mut Vec<PathBuf>,
+) -> crate::Result<()> {
     if !dir.is_dir() {
         return Ok(());
     }
@@ -593,10 +612,21 @@ fn walk_md(dir: &Path, files: &mut Vec<PathBuf>) -> crate::Result<()> {
                 .and_then(|n| n.to_str())
                 .map(|n| n.starts_with('.'))
                 .unwrap_or(false);
-            if !hidden {
-                walk_md(&path, files)?;
+            if hidden {
+                continue;
             }
+            if let Some(ex) = exclude_subdir {
+                if crate::path_under_export_subdir(vault_root, &path, ex) {
+                    continue;
+                }
+            }
+            walk_md(vault_root, &path, exclude_subdir, files)?;
         } else if path.extension().map(|e| e == "md").unwrap_or(false) {
+            if let Some(ex) = exclude_subdir {
+                if crate::path_under_export_subdir(vault_root, &path, ex) {
+                    continue;
+                }
+            }
             files.push(path);
         }
     }
@@ -747,13 +777,32 @@ mod tests {
         write_md(tmp.path(), "Inbox.md", "# Inbox\n\nBuy milk");
 
         let mut idx = VaultFtsIndex::open_in_memory().unwrap();
-        let n = idx.reindex_vault(tmp.path()).unwrap();
+        let n = idx.reindex_vault(tmp.path(), None).unwrap();
         assert_eq!(n, 2);
 
         let hits = idx.search("ephemeris ink", 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path.as_deref(), Some("Projects/Alpha.md"));
         assert!(hits[0].snippet.to_lowercase().contains("ink"));
+    }
+
+    #[test]
+    fn fts_skips_export_subdir() {
+        let tmp = TempDir::new().unwrap();
+        write_md(tmp.path(), "Real.md", "# Real\n\nfindme-vault");
+        write_md(
+            tmp.path(),
+            "Ephemeris/Root/Local.md",
+            "# Local export\n\nfindme-export",
+        );
+
+        let mut idx = VaultFtsIndex::open_in_memory().unwrap();
+        let n = idx
+            .reindex_vault(tmp.path(), Some(Path::new("Ephemeris")))
+            .unwrap();
+        assert_eq!(n, 1);
+        assert!(idx.search("findme-vault", 10).unwrap().len() == 1);
+        assert!(idx.search("findme-export", 10).unwrap().is_empty());
     }
 
     #[test]

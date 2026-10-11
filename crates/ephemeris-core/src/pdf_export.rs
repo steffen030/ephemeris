@@ -411,13 +411,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let out = tmp.path().join("spans.pdf");
         let pages = vec![blank_page(200, 200)];
-        let spans = vec![vec![TextSpan {
-            text: "ephemeris".into(),
-            x: 20.0,
-            y: 40.0,
-            width: 80.0,
-            height: 14.0,
-        }]];
+        let spans = vec![vec![TextSpan::new("ephemeris", 20.0, 40.0, 80.0, 14.0)]];
         export_raster_pages_to_pdf(
             &pages,
             &out,

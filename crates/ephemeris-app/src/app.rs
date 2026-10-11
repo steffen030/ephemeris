@@ -7,16 +7,17 @@ use ephemeris_core::profile_manager::ProfileManager;
 use ephemeris_core::{
     export_raster_pages_to_pdf, filter_agenda, markdown_to_blocks, markdown_to_plain,
     search_events, search_local_notes, search_tasks, strip_inline_markdown, sync_notes_to_vault,
-    to_agenda_entries, AgendaRange, CalendarEvent, Config, MarkdownTaskExtractor, PdfExportOptions,
-    ProfileId, RasterOcrTranscriber, RasterPage, SearchHit, Task, TaskPriority, TaskProvider,
-    Transcriber, VaultFtsIndex, VaultNoteExport,
+    to_agenda_entries, AgendaRange, CalendarEvent, CascadingTranscriber, Config, EventId,
+    MarkdownTaskExtractor, PdfExportOptions, ProfileId, RasterOcrTranscriber, RasterPage,
+    SearchHit, StrokeHtrTranscriber, Task, TaskPriority, TaskProvider, VaultFtsIndex,
+    VaultNoteExport,
 };
 #[cfg(target_os = "linux")]
 use ephemeris_pal::input::{EvdevPenSource, PenTarget};
 use ephemeris_pal::input::{InputEvent, PenSample};
 use slint::{Global, Model};
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::{channel, Receiver};
@@ -40,6 +41,9 @@ use ephemeris_ui::EphemerisUi;
 const CHROME_SWIPE_EDGE_Y: f32 = 36.0;
 /// Minimum downward travel (UI logical px) to count as a chrome reveal swipe.
 const CHROME_SWIPE_MIN_DY: f32 = 20.0;
+
+/// Debounce flag for background vault git commit/push.
+static VAULT_GIT_PUSH_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// Wakes the event loop when the Linux evdev pen thread has samples ready.
 #[derive(Debug, Clone, Copy)]
@@ -168,6 +172,12 @@ impl App {
         let ui = Rc::new(EphemerisUi::new(win_w, win_h)?);
         ui.set_page_title("Ephemeris");
         ui.apply_theme(&config.theme);
+        ui.set_connect_setup_export_subdir(&config.vault_export_subdir.to_string_lossy());
+        ui.set_connect_setup_git_enabled(config.vault_git_enabled);
+        if let Some(ref vault) = config.vault_path {
+            ui.set_connect_setup_git_detected(ephemeris_core::is_git_repo(vault));
+            ui.set_settings_vault_path(&vault.to_string_lossy());
+        }
 
         // ── Profiles ──────────────────────────────────────────────────────────
         let profile_mgr = ProfileManager::new();
@@ -230,6 +240,8 @@ impl App {
                         value: vault.to_string_lossy().to_string(),
                         profile_id: default_conn_profile.clone(),
                         allow_in_aggregated: true,
+                        username: String::new(),
+                        password: String::new(),
                     });
                 }
                 let base = conns.len() as u32;
@@ -244,6 +256,8 @@ impl App {
                         value: path.to_string_lossy().to_string(),
                         profile_id: default_conn_profile.clone(),
                         allow_in_aggregated: true,
+                        username: String::new(),
+                        password: String::new(),
                     });
                 }
                 let base2 = conns.len() as u32;
@@ -262,6 +276,8 @@ impl App {
                         value: url.clone(),
                         profile_id: default_conn_profile.clone(),
                         allow_in_aggregated: true,
+                        username: String::new(),
+                        password: String::new(),
                     });
                 }
                 conns
@@ -287,13 +303,18 @@ impl App {
             }
         }
         if let Some(ref vault) = config.borrow().vault_path.clone() {
-            match vault_fts.borrow_mut().reindex_vault(vault) {
+            let exclude = config.borrow().vault_export_subdir.clone();
+            match vault_fts
+                .borrow_mut()
+                .reindex_vault(vault, Some(exclude.as_path()))
+            {
                 Ok(n) => {
                     tracing::info!("Indexed {n} vault notes for search");
                     *vault_fts_paths.borrow_mut() = vec![vault.clone()];
                 }
                 Err(e) => tracing::warn!("Vault FTS reindex failed: {e}"),
             }
+            schedule_vault_git_pull(&config.borrow());
         }
         let connections: Rc<RefCell<Vec<AppConnection>>> = Rc::new(RefCell::new(init_connections));
         save_connections(&connections.borrow());
@@ -303,7 +324,12 @@ impl App {
         let initial_tasks = {
             let cfg = config.borrow();
             if let Some(ref vault) = cfg.vault_path {
-                match load_vault_tasks_with_inbox(vault, &cfg.vault_tasks_inbox, profile_id) {
+                match load_vault_tasks_with_inbox(
+                    vault,
+                    &cfg.vault_tasks_inbox,
+                    &cfg.vault_export_subdir,
+                    profile_id,
+                ) {
                     Ok(ts) => {
                         tracing::info!("Loaded {} tasks from vault {}", ts.len(), vault.display());
                         ts
@@ -329,6 +355,7 @@ impl App {
             let cfg = config.borrow();
             let mut evts = load_ics_events(&cfg.ics_paths, profile_id, now);
             evts.extend(load_ics_from_urls(&cfg.ics_urls, profile_id, now));
+            evts.extend(load_caldav_events(&connections.borrow(), profile_id, now));
             Rc::new(RefCell::new(evts))
         };
 
@@ -338,6 +365,9 @@ impl App {
         // ── Note & notebook persistence ───────────────────────────────────────
         let data_dir = note_data_dir();
         let _ = std::fs::create_dir_all(&data_dir);
+        calendar_events
+            .borrow_mut()
+            .extend(load_local_events(&data_dir));
 
         let (init_notes, init_notebooks, note_seq_init, notebook_seq_init) =
             match load_notes_index(&data_dir) {
@@ -390,12 +420,17 @@ impl App {
         let notebooks: Rc<RefCell<Vec<AppNotebook>>> = Rc::new(RefCell::new(init_notebooks));
         let notes: Rc<RefCell<Vec<AppNote>>> = Rc::new(RefCell::new(init_notes));
 
-        // Restore ink pixels for all known notes (current document page).
+        // Restore ink pixels + stroke lists for all known notes (current doc page).
         for note in notes.borrow().iter() {
             if let Some((_w, _h, pixels)) = load_note_page_n(&data_dir, note.id, note.doc_page) {
                 ui.restore_page_pixels(note.page_index, pixels);
             }
+            if let Some(strokes) = load_note_page_strokes(&data_dir, note.id, note.doc_page) {
+                // Prefer stroke list as source of truth: rebuild raster to match.
+                ui.restore_page_strokes(note.page_index, strokes);
+            }
         }
+        ui.clear_strokes_dirty();
 
         // ── Microphone detection & recordings ─────────────────────────────────
         let device_has_mic = has_microphone();
@@ -414,11 +449,22 @@ impl App {
         let transcription_pending: Arc<Mutex<Vec<(u32, String)>>> =
             Arc::new(Mutex::new(Vec::new()));
         let transcription_active = Arc::new(AtomicBool::new(false));
+        // FIFO of recording ids waiting for whisper (plus the one currently running).
+        let transcription_queue: Arc<Mutex<VecDeque<u32>>> = Arc::new(Mutex::new(VecDeque::new()));
+        // Ids queued or in-flight — drives list "Transcribing…" chips.
+        let transcription_in_flight: Rc<RefCell<HashSet<u32>>> =
+            Rc::new(RefCell::new(HashSet::new()));
         let download_result: Arc<Mutex<Option<Result<(), String>>>> = Arc::new(Mutex::new(None));
         let download_active = Arc::new(AtomicBool::new(false));
+        let htr_download_result: Arc<Mutex<Option<Result<(), String>>>> =
+            Arc::new(Mutex::new(None));
+        let htr_download_active = Arc::new(AtomicBool::new(false));
+        // Completed CalDAV sync batches waiting to merge into the agenda.
+        let caldav_pending: Arc<Mutex<Vec<CalendarEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let caldav_active = Arc::new(AtomicBool::new(false));
 
         // ── Initial UI state ──────────────────────────────────────────────────
-        refresh_ui(&ui, &tasks.borrow(), profile_id);
+        refresh_ui(&ui, &tasks.borrow(), profile_id, &profile_mgr);
         push_agenda_ui(&ui, &calendar_events.borrow(), AgendaRange::Day, now);
         ui.set_show_start_page(true);
         ui.set_nav_section(0);
@@ -509,7 +555,9 @@ impl App {
                     .any(|c| c.kind == "vault" && c.profile_id == connect_pid);
                 let cal_count = conns
                     .iter()
-                    .filter(|c| c.kind == "calendar" && c.profile_id == connect_pid)
+                    .filter(|c| {
+                        (c.kind == "calendar" || c.kind == "caldav") && c.profile_id == connect_pid
+                    })
                     .count() as i32;
                 drop(conns);
                 ui2.set_connection_list(Rc::new(slint::VecModel::from(entries)).into());
@@ -531,10 +579,13 @@ impl App {
             let recs_rc = recordings.clone();
             let filter_rc = active_profile_filter.clone();
             let ria_rc = recordings_in_all_profiles.clone();
+            let inflight_rc = transcription_in_flight.clone();
+            let mgr_rc = profile_mgr.clone();
             let ui2 = ui.clone_component();
             Rc::new(move || {
                 let filter = filter_rc.borrow().clone();
                 let ria = ria_rc.borrow();
+                let inflight = inflight_rc.borrow();
                 let visible: Vec<AppRecording> = recs_rc
                     .borrow()
                     .iter()
@@ -550,7 +601,13 @@ impl App {
                     .cloned()
                     .collect();
                 drop(ria);
-                push_recording_list_comp(&ui2, &visible);
+                push_recording_list_comp(
+                    &ui2,
+                    &visible,
+                    &inflight,
+                    filter.is_empty(),
+                    &mgr_rc.borrow(),
+                );
             })
         };
 
@@ -751,7 +808,7 @@ impl App {
                 }
                 let now = now_secs();
                 let filtered_tasks = filter_tasks_by_profile(&tasks2.borrow(), &filter_str);
-                refresh_comp(&ui2, &filtered_tasks, work_pid);
+                refresh_comp(&ui2, &filtered_tasks, work_pid, &mgr2);
                 let range = int_to_range(ui2.get_agenda_range());
                 let visible_events = filter_events_by_profile(&cal2.borrow(), &filter_str);
                 push_agenda_comp(&ui2, &visible_events, range, now);
@@ -861,8 +918,9 @@ impl App {
             });
         }
 
-        // ── Ring "Task" → task view ───────────────────────────────────────────
+        // ── Ring "Task" → open create-task modal ──────────────────────────────
         {
+            let mgr_ring_task = profile_mgr.clone();
             let ui2 = ui.clone_component();
             let tasks2 = tasks.clone();
             let cfg2 = config.clone();
@@ -871,10 +929,12 @@ impl App {
                 {
                     let cfg = cfg2.borrow();
                     if let Some(ref vault) = cfg.vault_path {
+                        schedule_vault_git_pull(&cfg);
                         reload_obsidian_tasks(
                             &mut tasks2.borrow_mut(),
                             vault,
                             &cfg.vault_tasks_inbox,
+                            &cfg.vault_export_subdir,
                             work_pid,
                         );
                     }
@@ -885,9 +945,17 @@ impl App {
                 ui2.set_task_search_query("".into());
                 let filter_str = filter_rc.borrow().clone();
                 let filtered = filter_tasks_by_profile(&tasks2.borrow(), &filter_str);
-                push_full_task_list_comp(&ui2, &filtered);
+                push_full_task_list_comp(&ui2, &filtered, &mgr_ring_task);
+                ui2.set_show_start_page(false);
                 ui2.set_show_task_view(true);
                 ui2.set_ring_visible(false);
+                ui2.set_task_dialog_is_edit(false);
+                ui2.set_task_dialog_id("".into());
+                ui2.set_task_dialog_title("".into());
+                ui2.set_task_dialog_priority(1);
+                ui2.set_task_dialog_due("".into());
+                ui2.set_task_dialog_tags("".into());
+                ui2.set_task_dialog_visible(true);
             });
         }
 
@@ -931,9 +999,20 @@ impl App {
             let ui2 = ui.clone_component();
             let push_nbs_nav = push_notebooks.clone();
             let active_nb_nav = active_notebook_id.clone();
+            let notes_nav = notes.clone();
+            let data_dir_nav = data_dir.clone();
             ui.on_nav_notes_tapped(move || {
                 // Save current page state before switching views.
                 ui_rc.save_current_page();
+                {
+                    let active = ui2.get_active_note_id().to_string();
+                    flush_active_note_pixels(
+                        &ui_rc,
+                        &mut notes_nav.borrow_mut(),
+                        &data_dir_nav,
+                        &active,
+                    );
+                }
                 active_nb_nav.set(0);
                 ui2.set_notes_search_query("".into());
                 push_nbs_nav();
@@ -1264,25 +1343,31 @@ impl App {
                     let active_id = ui2.get_active_note_id().to_string();
                     let (w, h) = ui_rc.canvas_size();
                     let pixels = ui_rc.get_committed_pixels();
+                    let strokes = ui_rc.get_page_strokes();
                     let cfg = cfg2.borrow();
-                    let ocr = RasterOcrTranscriber::from_parts(
-                        cfg.ocr_enabled,
-                        cfg.ocr_languages.clone(),
-                        cfg.ocr_tessdata.clone(),
-                    );
+                    let cascade = build_cascading_transcriber(&cfg);
+                    let htr_hint = cascade.htr.empty_result_hint();
+                    let ocr_hint = cascade.ocr.empty_result_hint();
                     drop(cfg);
-                    let (display, persist) = match ocr.transcribe_raster(w, h, &pixels) {
+                    let (display, persist) = match cascade.transcribe_page(&strokes, w, h, &pixels)
+                    {
                         Ok(spans) => {
                             let joined = RasterOcrTranscriber::spans_to_text(&spans);
                             if joined.is_empty() {
-                                (ocr.empty_result_hint(), None)
+                                let hint = if !strokes.is_empty() && !cascade.htr.model_available()
+                                {
+                                    htr_hint
+                                } else {
+                                    ocr_hint
+                                };
+                                (hint, None)
                             } else {
                                 (joined.clone(), Some(joined))
                             }
                         }
                         Err(e) => {
-                            tracing::warn!("See-text OCR failed: {e}");
-                            (format!("OCR failed: {e}"), None)
+                            tracing::warn!("See-text transcription failed: {e}");
+                            (format!("Transcription failed: {e}"), None)
                         }
                     };
                     ui_rc.set_note_text_content(&display);
@@ -1622,37 +1707,47 @@ impl App {
         let cal_day: Rc<Cell<u32>> = Rc::new(Cell::new(today.day()));
         let cal_sub_view: Rc<Cell<i32>> = Rc::new(Cell::new(2)); // start with month view
 
+        // Shared calendar refresh (ICS/CalDAV + notes/recordings on creation date).
+        let refresh_cal: Rc<dyn Fn(i32, u32, u32, i32)> = {
+            let ui_rc = ui.clone();
+            let calendar_events2 = calendar_events.clone();
+            let notes2 = notes.clone();
+            let recordings2 = recordings.clone();
+            let filter_rc = active_profile_filter.clone();
+            let nia = notes_in_all_profiles.clone();
+            let ria = recordings_in_all_profiles.clone();
+            Rc::new(move |y, m, d, sv| {
+                let filter = filter_rc.borrow().clone();
+                let visible = visible_cal_events(
+                    &calendar_events2.borrow(),
+                    &notes2.borrow(),
+                    &recordings2.borrow(),
+                    &filter,
+                    &nia.borrow(),
+                    &ria.borrow(),
+                );
+                refresh_calendar(&ui_rc, &visible, y, m, d, sv);
+            })
+        };
+
         // Initial calendar data (month view)
         {
-            let days = cal_month_days(today.year(), today.month(), &calendar_events.borrow());
-            ui.set_cal_month_days(&days);
-            let label = format!("{} {}", month_name(today.month()), today.year());
-            ui.set_cal_header_label(&label);
+            refresh_cal(today.year(), today.month(), today.day(), 2);
         }
 
         // ── Nav rail: Calendar ────────────────────────────────────────────────
         {
             let ui_rc = ui.clone();
             let ui2 = ui.clone_component();
-            let calendar_events2 = calendar_events.clone();
             let cal_year2 = cal_year.clone();
             let cal_month2 = cal_month.clone();
             let cal_day2 = cal_day.clone();
             let cal_sub_view2 = cal_sub_view.clone();
-            let filter_rc = active_profile_filter.clone();
+            let refresh = refresh_cal.clone();
             ui.on_nav_calendar_tapped(move || {
                 ui_rc.save_current_page();
                 let sv = cal_sub_view2.get();
-                let filter_str = filter_rc.borrow().clone();
-                let visible = filter_events_by_profile(&calendar_events2.borrow(), &filter_str);
-                refresh_calendar(
-                    &ui_rc,
-                    &visible,
-                    cal_year2.get(),
-                    cal_month2.get(),
-                    cal_day2.get(),
-                    sv,
-                );
+                refresh(cal_year2.get(), cal_month2.get(), cal_day2.get(), sv);
                 ui2.set_show_start_page(false);
                 ui2.set_show_task_view(false);
                 ui2.set_show_settings(false);
@@ -1670,26 +1765,16 @@ impl App {
         // ── Calendar sub-view change ──────────────────────────────────────────
         {
             let ui_rc = ui.clone();
-            let calendar_events2 = calendar_events.clone();
             let cal_year2 = cal_year.clone();
             let cal_month2 = cal_month.clone();
             let cal_day2 = cal_day.clone();
             let cal_sub_view2 = cal_sub_view.clone();
             let notes2 = notes.clone();
-            let filter_rc = active_profile_filter.clone();
+            let refresh = refresh_cal.clone();
             ui.on_cal_sub_view_changed(move |v| {
                 cal_sub_view2.set(v);
                 ui_rc.set_cal_sub_view(v);
-                let filter_str = filter_rc.borrow().clone();
-                let visible = filter_events_by_profile(&calendar_events2.borrow(), &filter_str);
-                refresh_calendar(
-                    &ui_rc,
-                    &visible,
-                    cal_year2.get(),
-                    cal_month2.get(),
-                    cal_day2.get(),
-                    v,
-                );
+                refresh(cal_year2.get(), cal_month2.get(), cal_day2.get(), v);
                 if v == 0 {
                     refresh_day_note_ui(
                         &ui_rc,
@@ -1704,13 +1789,11 @@ impl App {
 
         // ── Calendar prev/next ────────────────────────────────────────────────
         {
-            let ui_rc = ui.clone();
-            let calendar_events2 = calendar_events.clone();
             let cal_year2 = cal_year.clone();
             let cal_month2 = cal_month.clone();
             let cal_day2 = cal_day.clone();
             let cal_sub_view2 = cal_sub_view.clone();
-            let filter_rc = active_profile_filter.clone();
+            let refresh = refresh_cal.clone();
             ui.on_cal_prev(move || {
                 let (y, m, d) = cal_navigate_prev(
                     cal_year2.get(),
@@ -1721,19 +1804,15 @@ impl App {
                 cal_year2.set(y);
                 cal_month2.set(m);
                 cal_day2.set(d);
-                let filter_str = filter_rc.borrow().clone();
-                let visible = filter_events_by_profile(&calendar_events2.borrow(), &filter_str);
-                refresh_calendar(&ui_rc, &visible, y, m, d, cal_sub_view2.get());
+                refresh(y, m, d, cal_sub_view2.get());
             });
         }
         {
-            let ui_rc = ui.clone();
-            let calendar_events2 = calendar_events.clone();
             let cal_year2 = cal_year.clone();
             let cal_month2 = cal_month.clone();
             let cal_day2 = cal_day.clone();
             let cal_sub_view2 = cal_sub_view.clone();
-            let filter_rc = active_profile_filter.clone();
+            let refresh = refresh_cal.clone();
             ui.on_cal_next(move || {
                 let (y, m, d) = cal_navigate_next(
                     cal_year2.get(),
@@ -1744,22 +1823,19 @@ impl App {
                 cal_year2.set(y);
                 cal_month2.set(m);
                 cal_day2.set(d);
-                let filter_str = filter_rc.borrow().clone();
-                let visible = filter_events_by_profile(&calendar_events2.borrow(), &filter_str);
-                refresh_calendar(&ui_rc, &visible, y, m, d, cal_sub_view2.get());
+                refresh(y, m, d, cal_sub_view2.get());
             });
         }
 
         // ── Calendar today button ─────────────────────────────────────────────
         {
             let ui_rc = ui.clone();
-            let calendar_events2 = calendar_events.clone();
             let cal_year2 = cal_year.clone();
             let cal_month2 = cal_month.clone();
             let cal_day2 = cal_day.clone();
             let cal_sub_view2 = cal_sub_view.clone();
             let notes2 = notes.clone();
-            let filter_rc = active_profile_filter.clone();
+            let refresh = refresh_cal.clone();
             ui.on_cal_today(move || {
                 let now = Utc::now();
                 let (y, m, d) = (now.year(), now.month(), now.day());
@@ -1767,9 +1843,7 @@ impl App {
                 cal_month2.set(m);
                 cal_day2.set(d);
                 let sv = cal_sub_view2.get();
-                let filter_str = filter_rc.borrow().clone();
-                let visible = filter_events_by_profile(&calendar_events2.borrow(), &filter_str);
-                refresh_calendar(&ui_rc, &visible, y, m, d, sv);
+                refresh(y, m, d, sv);
                 if sv == 0 {
                     refresh_day_note_ui(&ui_rc, &notes2.borrow(), y, m, d);
                 }
@@ -1779,13 +1853,12 @@ impl App {
         // ── Calendar day tap (from month/year → day view) ─────────────────────
         {
             let ui_rc = ui.clone();
-            let calendar_events2 = calendar_events.clone();
             let cal_year2 = cal_year.clone();
             let cal_month2 = cal_month.clone();
             let cal_day2 = cal_day.clone();
             let cal_sub_view2 = cal_sub_view.clone();
             let notes2 = notes.clone();
-            let filter_rc = active_profile_filter.clone();
+            let refresh = refresh_cal.clone();
             ui.on_cal_day_tapped(move |y, m, d| {
                 cal_year2.set(y);
                 cal_month2.set(m as u32);
@@ -1795,9 +1868,7 @@ impl App {
                 let new_sv = if sv == 3 { 2 } else { 0 };
                 cal_sub_view2.set(new_sv);
                 ui_rc.set_cal_sub_view(new_sv);
-                let filter_str = filter_rc.borrow().clone();
-                let visible = filter_events_by_profile(&calendar_events2.borrow(), &filter_str);
-                refresh_calendar(&ui_rc, &visible, y, m as u32, d as u32, new_sv);
+                refresh(y, m as u32, d as u32, new_sv);
                 if new_sv == 0 {
                     refresh_day_note_ui(&ui_rc, &notes2.borrow(), y, m as u32, d as u32);
                 }
@@ -1900,13 +1971,13 @@ impl App {
         {
             let ui_rc = ui.clone();
             let ui2 = ui.clone_component();
-            let calendar_events2 = calendar_events.clone();
             let cal_year2 = cal_year.clone();
             let cal_month2 = cal_month.clone();
             let cal_day2 = cal_day.clone();
             let cal_sub_view2 = cal_sub_view.clone();
             let notes2 = notes.clone();
             let anchor_rc = current_note_anchor.clone();
+            let refresh_cal_anchor = refresh_cal.clone();
             ui.on_note_anchor_tapped(move || {
                 let anchor = anchor_rc.borrow().clone();
                 // Parse "cal:YYYY-MM-DD"
@@ -1918,7 +1989,7 @@ impl App {
                         cal_day2.set(d);
                         cal_sub_view2.set(0);
                         ui_rc.set_cal_sub_view(0);
-                        refresh_calendar(&ui_rc, &calendar_events2.borrow(), y, m, d, 0);
+                        refresh_cal_anchor(y, m, d, 0);
                         refresh_day_note_ui(&ui_rc, &notes2.borrow(), y, m, d);
                         ui_rc.save_current_page();
                         ui2.set_show_calendar(true);
@@ -2025,25 +2096,20 @@ impl App {
             });
         }
 
-        // ── Ring "Event" → calendar view ─────────────────────────────────────
+        // ── Ring "Event" → open create-event modal ────────────────────────────
         {
             let ui_rc = ui.clone();
             let ui2 = ui.clone_component();
-            let calendar_events2 = calendar_events.clone();
             let cal_year2 = cal_year.clone();
             let cal_month2 = cal_month.clone();
             let cal_day2 = cal_day.clone();
-            let cal_sub_view2 = cal_sub_view.clone();
+            let refresh = refresh_cal.clone();
             ui.on_ring_calendar(move || {
-                let sv = cal_sub_view2.get();
-                refresh_calendar(
-                    &ui_rc,
-                    &calendar_events2.borrow(),
-                    cal_year2.get(),
-                    cal_month2.get(),
-                    cal_day2.get(),
-                    sv,
-                );
+                let y = cal_year2.get();
+                let m = cal_month2.get();
+                let d = cal_day2.get();
+                refresh(y, m, d, 0);
+                ui_rc.set_cal_sub_view(0);
                 ui2.set_show_start_page(false);
                 ui2.set_show_task_view(false);
                 ui2.set_show_settings(false);
@@ -2052,6 +2118,8 @@ impl App {
                 ui2.set_show_notebook_list(false);
                 ui2.set_show_calendar(true);
                 ui2.set_ring_visible(false);
+                let date = format!("{:04}-{:02}-{:02}", y, m, d);
+                ui_rc.open_event_dialog("", &date, "09:00", "10:00", false);
             });
         }
 
@@ -2155,6 +2223,10 @@ impl App {
             let filter_stop = active_profile_filter.clone();
             let rec_pf_stop = rec_pending_profile.clone();
             let push_recs_stop = push_recordings.clone();
+            let txn_queue_stop = transcription_queue.clone();
+            let txn_active_stop = transcription_active.clone();
+            let txn_pending_stop = transcription_pending.clone();
+            let txn_inflight_stop = transcription_in_flight.clone();
             ui.on_rec_stop_tapped(move || {
                 let mut h_opt = rec_handle2.borrow_mut();
                 if let Some(mut handle) = h_opt.take() {
@@ -2189,6 +2261,20 @@ impl App {
                     push_recs_stop();
                     ui2.set_rec_state(0);
                     ui2.set_rec_duration_label("0:00".into());
+                    // Auto-transcribe in the background when whisper is installed.
+                    if whisper_ready() {
+                        enqueue_transcription(
+                            rec_id,
+                            &txn_queue_stop,
+                            &txn_inflight_stop,
+                            &txn_active_stop,
+                            &txn_pending_stop,
+                            &recordings2,
+                            &rec_dir2,
+                            &ui2.get_whisper_lang(),
+                            &push_recs_stop,
+                        );
+                    }
                 }
             });
         }
@@ -2226,54 +2312,39 @@ impl App {
             });
         }
 
-        // ── Recording: transcribe ─────────────────────────────────────────────
+        // ── Recording: open detail (primary row action) ───────────────────────
         {
-            let ui2 = ui.clone_component();
-            let recordings2 = recordings.clone();
-            let rec_dir2 = rec_dir.clone();
-            let txn_pending2 = transcription_pending.clone();
-            let txn_active2 = transcription_active.clone();
-            ui.on_rec_transcribe_tapped(move |id| {
-                let id_u32: u32 = id.parse().unwrap_or(0);
-                let recs = recordings2.borrow();
-                let rec = recs.iter().find(|r| r.id == id_u32).cloned();
-                drop(recs);
-                let Some(rec) = rec else { return };
+            let open_rec_detail: Rc<dyn Fn(String)> = {
+                let ui2 = ui.clone_component();
+                let recordings2 = recordings.clone();
+                let inflight = transcription_in_flight.clone();
+                Rc::new(move |id: String| {
+                    let id_u32: u32 = id.parse().unwrap_or(0);
+                    let recs = recordings2.borrow();
+                    let rec = recs.iter().find(|r| r.id == id_u32).cloned();
+                    drop(recs);
+                    let Some(rec) = rec else { return };
 
-                // Track which recording is being shown so Save knows which to update.
-                ui2.set_rec_active_id(rec.id.to_string().as_str().into());
-
-                // If we already have a transcription, just display it.
-                if let Some(text) = &rec.transcription {
-                    ui2.set_rec_transcription_text(text.as_str().into());
-                    ui2.set_rec_transcription_visible(true);
-                    return;
-                }
-
-                // Show "Transcribing…" immediately while the subprocess runs.
-                ui2.set_rec_transcription_text("Transcribing…".into());
-                ui2.set_rec_transcription_visible(true);
-
-                if txn_active2.swap(true, Ordering::AcqRel) {
-                    // Another transcription is already running.
-                    ui2.set_rec_transcription_text(
-                        "A transcription is already running. Please wait.".into(),
-                    );
-                    return;
-                }
-
-                let wav_path = rec_dir2.join(&rec.audio_filename);
-                let lang = ui2.get_whisper_lang();
-                let mailbox = txn_pending2.clone();
-                let active_flag = txn_active2.clone();
-                std::thread::spawn(move || {
-                    let text = run_whisper(&wav_path, &lang);
-                    if let Ok(mut pending) = mailbox.lock() {
-                        pending.push((id_u32, text));
+                    ui2.set_rec_active_id(rec.id.to_string().as_str().into());
+                    ui2.set_rec_active_title(rec.title.as_str().into());
+                    if inflight.borrow().contains(&id_u32) {
+                        ui2.set_rec_transcription_text("Transcribing…".into());
+                    } else if let Some(text) = &rec.transcription {
+                        ui2.set_rec_transcription_text(text.as_str().into());
+                    } else {
+                        ui2.set_rec_transcription_text("".into());
                     }
-                    active_flag.store(false, Ordering::Release);
-                });
-            });
+                    ui2.set_rec_transcription_visible(true);
+                })
+            };
+            {
+                let open = open_rec_detail.clone();
+                ui.on_rec_open_tapped(move |id| open(id));
+            }
+            {
+                let open = open_rec_detail.clone();
+                ui.on_rec_transcribe_tapped(move |id| open(id));
+            }
         }
 
         // ── Recording: delete ─────────────────────────────────────────────────
@@ -2315,12 +2386,15 @@ impl App {
                 let id_u32: u32 = id.parse().unwrap_or(0);
                 let mut recs = recordings2.borrow_mut();
                 if let Some(rec) = recs.iter_mut().find(|r| r.id == id_u32) {
-                    rec.title = new_title;
+                    rec.title = new_title.clone();
                 }
                 drop(recs);
                 save_recordings_index(&rec_dir2, &recordings2.borrow(), rec_id_seq2.get());
                 push_recs_ren();
                 ui2.set_rec_rename_visible(false);
+                if ui2.get_rec_active_id() == id {
+                    ui2.set_rec_active_title(new_title.as_str().into());
+                }
             });
         }
 
@@ -2349,9 +2423,13 @@ impl App {
             let push_recs_txn = push_recordings.clone();
             ui.on_rec_transcription_save(move |text| {
                 let active_id: u32 = ui2.get_rec_active_id().parse().unwrap_or(0);
+                let new_title = ui2.get_rec_active_title().trim().to_string();
                 let mut recs = recordings2.borrow_mut();
                 if let Some(rec) = recs.iter_mut().find(|r| r.id == active_id) {
                     rec.transcription = Some(text.to_string());
+                    if !new_title.is_empty() {
+                        rec.title = new_title;
+                    }
                 }
                 save_recordings_index(&rec_dir2, &recs, rec_id_seq2.get());
                 drop(recs);
@@ -2368,44 +2446,37 @@ impl App {
             let rec_dir2 = rec_dir.clone();
             let txn_pending2 = transcription_pending.clone();
             let txn_active2 = transcription_active.clone();
+            let txn_queue2 = transcription_queue.clone();
+            let txn_inflight2 = transcription_in_flight.clone();
+            let push_recs_rtx = push_recordings.clone();
             ui.on_rec_transcription_retranscribe(move || {
                 let active_id: u32 = ui2.get_rec_active_id().parse().unwrap_or(0);
                 if active_id == 0 {
                     return;
                 }
 
-                if txn_active2.swap(true, Ordering::AcqRel) {
-                    ui2.set_rec_transcription_text(
-                        "A transcription is already running. Please wait.".into(),
-                    );
-                    return;
-                }
-
-                // Clear stored transcription so a fresh result is written back.
-                let wav_path = {
+                {
                     let mut recs = recordings2.borrow_mut();
                     let Some(rec) = recs.iter_mut().find(|r| r.id == active_id) else {
-                        txn_active2.store(false, Ordering::Release);
                         return;
                     };
                     rec.transcription = None;
-                    let path = rec_dir2.join(&rec.audio_filename);
                     drop(recs);
                     save_recordings_index(&rec_dir2, &recordings2.borrow(), rec_id_seq2.get());
-                    path
-                };
+                }
 
                 ui2.set_rec_transcription_text("Transcribing…".into());
-                let lang = ui2.get_whisper_lang();
-                let mailbox = txn_pending2.clone();
-                let active_flag = txn_active2.clone();
-                std::thread::spawn(move || {
-                    let text = run_whisper(&wav_path, &lang);
-                    if let Ok(mut pending) = mailbox.lock() {
-                        pending.push((active_id, text));
-                    }
-                    active_flag.store(false, Ordering::Release);
-                });
+                enqueue_transcription(
+                    active_id,
+                    &txn_queue2,
+                    &txn_inflight2,
+                    &txn_active2,
+                    &txn_pending2,
+                    &recordings2,
+                    &rec_dir2,
+                    &ui2.get_whisper_lang(),
+                    &push_recs_rtx,
+                );
             });
         }
 
@@ -2465,6 +2536,7 @@ impl App {
 
         // ── Start-page "All Tasks" button → task view ─────────────────────────
         {
+            let mgr_tasks_1 = profile_mgr.clone();
             let ui2 = ui.clone_component();
             let tasks2 = tasks.clone();
             let cfg2 = config.clone();
@@ -2474,10 +2546,12 @@ impl App {
                 {
                     let cfg = cfg2.borrow();
                     if let Some(ref vault) = cfg.vault_path {
+                        schedule_vault_git_pull(&cfg);
                         reload_obsidian_tasks(
                             &mut tasks2.borrow_mut(),
                             vault,
                             &cfg.vault_tasks_inbox,
+                            &cfg.vault_export_subdir,
                             work_pid,
                         );
                     }
@@ -2489,7 +2563,7 @@ impl App {
                 ui2.set_task_search_query("".into());
                 let filter_str = filter_rc.borrow().clone();
                 let filtered = filter_tasks_by_profile(&tasks2.borrow(), &filter_str);
-                push_full_task_list_comp(&ui2, &filtered);
+                push_full_task_list_comp(&ui2, &filtered, &mgr_tasks_1);
                 ui2.set_show_start_page(false);
                 ui2.set_show_recording_list(false);
                 ui2.set_show_task_view(true);
@@ -2498,6 +2572,7 @@ impl App {
 
         // ── Nav rail "Tasks" → task view ─────────────────────────────────────
         {
+            let mgr_tasks_2 = profile_mgr.clone();
             let ui_rc = ui.clone();
             let ui2 = ui.clone_component();
             let tasks2 = tasks.clone();
@@ -2508,10 +2583,12 @@ impl App {
                 {
                     let cfg = cfg2.borrow();
                     if let Some(ref vault) = cfg.vault_path {
+                        schedule_vault_git_pull(&cfg);
                         reload_obsidian_tasks(
                             &mut tasks2.borrow_mut(),
                             vault,
                             &cfg.vault_tasks_inbox,
+                            &cfg.vault_export_subdir,
                             work_pid,
                         );
                     }
@@ -2522,7 +2599,7 @@ impl App {
                 ui2.set_task_search_query("".into());
                 let filter_str = filter_rc.borrow().clone();
                 let filtered = filter_tasks_by_profile(&tasks2.borrow(), &filter_str);
-                push_full_task_list_comp(&ui2, &filtered);
+                push_full_task_list_comp(&ui2, &filtered, &mgr_tasks_2);
                 ui2.set_show_start_page(false);
                 ui2.set_show_note_list(false);
                 ui2.set_show_notebook_list(false);
@@ -2553,6 +2630,7 @@ impl App {
 
         // ── Toggle task done ──────────────────────────────────────────────────
         {
+            let mgr_refresh_1 = profile_mgr.clone();
             let tasks2 = tasks.clone();
             let ui2 = ui.clone_component();
             let cfg2 = config.clone();
@@ -2573,7 +2651,7 @@ impl App {
                 }
                 let filter_str = filter_rc.borrow().clone();
                 let filtered = filter_tasks_by_profile(&tasks2.borrow(), &filter_str);
-                refresh_comp(&ui2, &filtered, work_pid);
+                refresh_comp(&ui2, &filtered, work_pid, &mgr_refresh_1);
             });
         }
 
@@ -2597,6 +2675,7 @@ impl App {
 
         // ── Add confirmed ─────────────────────────────────────────────────────
         {
+            let mgr_refresh_2 = profile_mgr.clone();
             let tasks2 = tasks.clone();
             let ui2 = ui.clone_component();
             let cfg2 = config.clone();
@@ -2646,12 +2725,13 @@ impl App {
                 }
                 ui2.set_task_dialog_visible(false);
                 let filtered = filter_tasks_by_profile(&tasks2.borrow(), &filter_str);
-                refresh_comp(&ui2, &filtered, work_pid);
+                refresh_comp(&ui2, &filtered, work_pid, &mgr_refresh_2);
             });
         }
 
         // ── Edit confirmed — title / priority / due / tags (+ Obsidian write-back)
         {
+            let mgr_refresh_3 = profile_mgr.clone();
             let tasks2 = tasks.clone();
             let ui2 = ui.clone_component();
             let cfg2 = config.clone();
@@ -2679,7 +2759,7 @@ impl App {
                 ui2.set_task_dialog_visible(false);
                 let filter_str = filter_rc.borrow().clone();
                 let filtered = filter_tasks_by_profile(&tasks2.borrow(), &filter_str);
-                refresh_comp(&ui2, &filtered, work_pid);
+                refresh_comp(&ui2, &filtered, work_pid, &mgr_refresh_3);
             });
         }
 
@@ -2691,42 +2771,211 @@ impl App {
             });
         }
 
+        // ── Event create dialog ───────────────────────────────────────────────
+        {
+            let ui_rc = ui.clone();
+            let calendar_events2 = calendar_events.clone();
+            let cal_year2 = cal_year.clone();
+            let cal_month2 = cal_month.clone();
+            let cal_day2 = cal_day.clone();
+            let cal_sub_view2 = cal_sub_view.clone();
+            let filter_rc = active_profile_filter.clone();
+            let data_dir2 = data_dir.clone();
+            let refresh = refresh_cal.clone();
+            let new_event_n: Rc<Cell<u32>> = Rc::new(Cell::new(1));
+            ui.on_event_confirm_add(move |title, date, start, end, all_day| {
+                let title = title.trim().to_string();
+                let title = if title.is_empty() {
+                    let n = new_event_n.get();
+                    new_event_n.set(n + 1);
+                    format!("New Event {n}")
+                } else {
+                    title
+                };
+                let date_str = date.to_string();
+                let date =
+                    NaiveDate::parse_from_str(date_str.trim(), "%Y-%m-%d").unwrap_or_else(|_| {
+                        NaiveDate::from_ymd_opt(cal_year2.get(), cal_month2.get(), cal_day2.get())
+                            .unwrap_or_else(|| Utc::now().date_naive())
+                    });
+                let (start_ts, end_ts) = if all_day {
+                    let start = date
+                        .and_hms_opt(0, 0, 0)
+                        .map(|dt| dt.and_utc().timestamp() as u64)
+                        .unwrap_or(0);
+                    (start, start + 86399)
+                } else {
+                    let (sh, sm) = parse_hm(&start).unwrap_or((9, 0));
+                    let (eh, em) = parse_hm(&end).unwrap_or((10, 0));
+                    let start = date
+                        .and_hms_opt(sh, sm, 0)
+                        .map(|dt| dt.and_utc().timestamp() as u64)
+                        .unwrap_or(0);
+                    let mut end = date
+                        .and_hms_opt(eh, em, 0)
+                        .map(|dt| dt.and_utc().timestamp() as u64)
+                        .unwrap_or(start + 3600);
+                    if end <= start {
+                        end = start + 3600;
+                    }
+                    (start, end)
+                };
+                let filter_str = filter_rc.borrow().clone();
+                let pid = parse_profile_id(&filter_str).unwrap_or(work_pid);
+                let mut ev = CalendarEvent::new(
+                    format!("local-{}", uuid::Uuid::new_v4()),
+                    start_ts,
+                    end_ts,
+                    title,
+                    pid,
+                );
+                ev.source = "local".to_string();
+                {
+                    let mut evts = calendar_events2.borrow_mut();
+                    evts.push(ev);
+                    save_local_events(&data_dir2, &evts);
+                }
+                cal_year2.set(date.year());
+                cal_month2.set(date.month());
+                cal_day2.set(date.day());
+                ui_rc.close_event_dialog();
+                refresh(date.year(), date.month(), date.day(), cal_sub_view2.get());
+            });
+        }
+        {
+            let ui_rc = ui.clone();
+            ui.on_event_dialog_cancel(move || {
+                ui_rc.close_event_dialog();
+            });
+        }
+
+        // ── Calendar item tap (note / recording) ──────────────────────────────
+        {
+            let ui_rc = ui.clone();
+            let ui2 = ui.clone_component();
+            let notes2 = notes.clone();
+            let push_recs = push_recordings.clone();
+            let open_rec_detail = {
+                // Reuse open path: show detail overlay for recording.
+                let ui2 = ui.clone_component();
+                let recordings2 = recordings.clone();
+                let inflight = transcription_in_flight.clone();
+                Rc::new(move |id: String| {
+                    let id_u32: u32 = id.parse().unwrap_or(0);
+                    let recs = recordings2.borrow();
+                    let rec = recs.iter().find(|r| r.id == id_u32).cloned();
+                    drop(recs);
+                    let Some(rec) = rec else { return };
+                    ui2.set_rec_active_id(rec.id.to_string().as_str().into());
+                    ui2.set_rec_active_title(rec.title.as_str().into());
+                    if inflight.borrow().contains(&id_u32) {
+                        ui2.set_rec_transcription_text("Transcribing…".into());
+                    } else if let Some(text) = &rec.transcription {
+                        ui2.set_rec_transcription_text(text.as_str().into());
+                    } else {
+                        ui2.set_rec_transcription_text("".into());
+                    }
+                    ui2.set_rec_transcription_visible(true);
+                })
+            };
+            let anchor_rc = current_note_anchor.clone();
+            ui.on_cal_item_tapped(move |kind, id| {
+                let kind = kind.to_string();
+                let id = id.to_string();
+                if kind == "note" {
+                    let notes = notes2.borrow();
+                    if let Some(note) = notes.iter().find(|n| n.id.to_string() == id) {
+                        let page_idx = note.page_index;
+                        let note_id = note.id.to_string();
+                        let note_title = note.title.clone();
+                        let template = note.paper_template;
+                        let anchor = note.anchor.clone().unwrap_or_default();
+                        let doc_page = note.doc_page;
+                        let doc_page_count = note.doc_page_count.max(1);
+                        drop(notes);
+                        let paper_str = match template {
+                            ephemeris_core::PageTemplate::Lines => "lined",
+                            ephemeris_core::PageTemplate::Dot => "dotted",
+                            ephemeris_core::PageTemplate::Grid => "squared",
+                            ephemeris_core::PageTemplate::Blank => "blank",
+                        };
+                        let anchor_label = if let Some(ds) = anchor.strip_prefix("cal:") {
+                            NaiveDate::parse_from_str(ds, "%Y-%m-%d")
+                                .map(|d| format_day_anchor_label(d.year(), d.month(), d.day()))
+                                .unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
+                        *anchor_rc.borrow_mut() = anchor;
+                        ui_rc.set_note_anchor_label(&anchor_label);
+                        ui2.set_show_calendar(false);
+                        ui2.set_show_note_list(false);
+                        ui2.set_show_notebook_list(false);
+                        ui2.set_show_recording_list(false);
+                        ui2.set_active_note_id(note_id.as_str().into());
+                        ui2.set_active_paper(paper_str.into());
+                        ui2.set_drawing_menu_open(false);
+                        ui_rc.set_page_title(&note_title);
+                        ui_rc.set_current_page_template(template);
+                        ui_rc.navigate_to_page(page_idx);
+                        ui_rc.set_page_index((doc_page + 1) as i32, doc_page_count as i32);
+                        push_note_text_for_active(&ui_rc, &notes2.borrow(), &note_id);
+                    }
+                } else if kind == "recording" {
+                    ui2.set_show_calendar(false);
+                    ui2.set_show_start_page(false);
+                    ui2.set_show_task_view(false);
+                    ui2.set_show_note_list(false);
+                    ui2.set_show_notebook_list(false);
+                    push_recs();
+                    ui2.set_show_recording_list(true);
+                    ui2.set_nav_section(3);
+                    open_rec_detail(id);
+                }
+            });
+        }
+
         // ── Task filter / sort / profile-chip / search → rebuild list ─────────
         {
+            let mgr_tasklist_1 = profile_mgr.clone();
             let ui2 = ui.clone_component();
             let tasks2 = tasks.clone();
             ui.on_task_filter_changed(move |_filter| {
-                push_full_task_list_comp(&ui2, &tasks2.borrow());
+                push_full_task_list_comp(&ui2, &tasks2.borrow(), &mgr_tasklist_1);
             });
         }
         {
+            let mgr_tasklist_2 = profile_mgr.clone();
             let ui2 = ui.clone_component();
             let tasks2 = tasks.clone();
             ui.on_task_sort_changed(move |_sort| {
-                push_full_task_list_comp(&ui2, &tasks2.borrow());
+                push_full_task_list_comp(&ui2, &tasks2.borrow(), &mgr_tasklist_2);
             });
         }
         {
+            let mgr_refresh_4 = profile_mgr.clone();
             let ui2 = ui.clone_component();
             let tasks2 = tasks.clone();
             let filter_rc = active_profile_filter.clone();
             ui.on_task_profile_filter_changed(move |_pid| {
                 let filter_str = filter_rc.borrow().clone();
                 let filtered = filter_tasks_by_profile(&tasks2.borrow(), &filter_str);
-                refresh_comp(&ui2, &filtered, work_pid);
+                refresh_comp(&ui2, &filtered, work_pid, &mgr_refresh_4);
             });
         }
         {
+            let mgr_tasklist_3 = profile_mgr.clone();
             let ui2 = ui.clone_component();
             let tasks2 = tasks.clone();
             ui.on_task_search_changed(move |q| {
                 ui2.set_task_search_query(q.as_str().into());
-                push_full_task_list_comp(&ui2, &tasks2.borrow());
+                push_full_task_list_comp(&ui2, &tasks2.borrow(), &mgr_tasklist_3);
             });
         }
 
         // ── Task priority cycle ───────────────────────────────────────────────
         {
+            let mgr_prio = profile_mgr.clone();
             let ui2 = ui.clone_component();
             let tasks2 = tasks.clone();
             let cfg2 = config.clone();
@@ -2751,7 +3000,7 @@ impl App {
                 }
                 let filter_str = filter_rc.borrow().clone();
                 let profile_filtered = filter_tasks_by_profile(&tasks2.borrow(), &filter_str);
-                refresh_comp(&ui2, &profile_filtered, work_pid);
+                refresh_comp(&ui2, &profile_filtered, work_pid, &mgr_prio);
             });
         }
 
@@ -2949,6 +3198,20 @@ impl App {
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_default();
                 ui2.set_settings_vault_path(vault.as_str().into());
+                ui2.set_connect_setup_export_subdir(
+                    cfg.vault_export_subdir
+                        .to_string_lossy()
+                        .to_string()
+                        .as_str()
+                        .into(),
+                );
+                ui2.set_connect_setup_git_enabled(cfg.vault_git_enabled);
+                let git_detected = cfg
+                    .vault_path
+                    .as_ref()
+                    .map(|p| ephemeris_core::is_git_repo(p))
+                    .unwrap_or(false);
+                ui2.set_connect_setup_git_detected(git_detected);
 
                 let sources: Vec<ephemeris_ui::CalSource> = cfg
                     .ics_paths
@@ -2980,6 +3243,8 @@ impl App {
                 ui2.set_settings_cal_sources(Rc::new(slint::VecModel::from(sources)).into());
                 ui2.set_settings_new_url("".into());
                 ui2.set_whisper_model_installed(find_whisper_model().is_some());
+                ui2.set_htr_model_installed(find_htr_model_installed(&cfg));
+                drop(cfg);
                 ui2.set_show_start_page(false);
                 ui2.set_show_task_view(false);
                 ui2.set_show_note_list(false);
@@ -3051,6 +3316,7 @@ impl App {
                 } else {
                     // Keep legacy config path in sync with the first searchable vault.
                     cfg2.borrow_mut().vault_path = Some(vaults[0].clone());
+                    schedule_vault_git_pull(&cfg2.borrow());
                     let names: Vec<String> = vaults
                         .iter()
                         .map(|p| {
@@ -3061,6 +3327,7 @@ impl App {
                         .collect();
                     let cached = *fts_paths2.borrow() == vaults
                         && fts2.borrow().len().unwrap_or(0) > 0;
+                    let exclude = cfg2.borrow().vault_export_subdir.clone();
                     if cached {
                         let n = fts2.borrow().len().unwrap_or(0);
                         tracing::info!(
@@ -3070,7 +3337,10 @@ impl App {
                         format!("Ready — {n} vault notes from {}.", names.join(", "))
                     } else {
                         let refs: Vec<&Path> = vaults.iter().map(PathBuf::as_path).collect();
-                        match fts2.borrow_mut().reindex_vaults(&refs) {
+                        match fts2
+                            .borrow_mut()
+                            .reindex_vaults(&refs, Some(exclude.as_path()))
+                        {
                             Ok(n) => {
                                 *fts_paths2.borrow_mut() = vaults.clone();
                                 tracing::info!(
@@ -3362,6 +3632,82 @@ impl App {
             });
         }
 
+        // ── Settings → add CalDAV ─────────────────────────────────────────────
+        {
+            let ui2 = ui.clone_component();
+            let conns_cd = connections.clone();
+            let push_cd = push_connections.clone();
+            let default_pid = default_conn_profile.clone();
+            let pending_cd = caldav_pending.clone();
+            let active_cd = caldav_active.clone();
+            ui.on_settings_add_caldav(move |url, user, pass| {
+                let url = url.trim().to_string();
+                let user = user.trim().to_string();
+                let pass = pass.to_string();
+                if url.is_empty() || user.is_empty() {
+                    return;
+                }
+                let display = {
+                    let host = url
+                        .strip_prefix("https://")
+                        .or_else(|| url.strip_prefix("http://"))
+                        .unwrap_or(url.as_str())
+                        .chars()
+                        .take(36)
+                        .collect::<String>();
+                    format!("CalDAV {host}")
+                };
+                let mut profile_id = ui2.get_connect_profile_id().to_string();
+                if profile_id.is_empty() {
+                    profile_id = default_pid.clone();
+                }
+                let pid = parse_profile_id(&profile_id).unwrap_or(work_pid);
+                let mut conns = conns_cd.borrow_mut();
+                let new_id = next_conn_id(&conns);
+                conns.push(AppConnection {
+                    id: new_id,
+                    kind: "caldav".to_string(),
+                    display: display.clone(),
+                    value: url.clone(),
+                    profile_id,
+                    allow_in_aggregated: true,
+                    username: user.clone(),
+                    password: pass.clone(),
+                });
+                save_connections(&conns);
+                drop(conns);
+                push_cd();
+
+                // Sync in background; results drain in about_to_wait.
+                if active_cd.swap(true, Ordering::AcqRel) {
+                    tracing::info!("CalDAV sync already running; connection saved for next reload");
+                    return;
+                }
+                let mailbox = pending_cd.clone();
+                let active_flag = active_cd.clone();
+                std::thread::spawn(move || {
+                    let (start, end) = ephemeris_core::default_sync_window();
+                    let cfg = ephemeris_core::CalDavConfig::new(url, user, pass);
+                    match ephemeris_core::CalDavClient::new(cfg)
+                        .and_then(|c| c.sync_all(pid, start, end))
+                    {
+                        Ok((cals, events)) => {
+                            tracing::info!(
+                                "CalDAV sync: {} calendar(s), {} event(s)",
+                                cals.len(),
+                                events.len()
+                            );
+                            if let Ok(mut pending) = mailbox.lock() {
+                                pending.extend(events);
+                            }
+                        }
+                        Err(e) => tracing::warn!("CalDAV sync failed: {e}"),
+                    }
+                    active_flag.store(false, Ordering::Release);
+                });
+            });
+        }
+
         // ── Settings → add URL ────────────────────────────────────────────────
         {
             let ui2 = ui.clone_component();
@@ -3394,6 +3740,8 @@ impl App {
                     value: url.clone(),
                     profile_id,
                     allow_in_aggregated: true,
+                    username: String::new(),
+                    password: String::new(),
                 });
                 drop(conns);
                 push_url();
@@ -3428,6 +3776,7 @@ impl App {
 
         // ── Settings → save ───────────────────────────────────────────────────
         {
+            let mgr_settings = profile_mgr.clone();
             let ui2 = ui.clone_component();
             let cfg2 = config.clone();
             let tasks2 = tasks.clone();
@@ -3436,6 +3785,7 @@ impl App {
             let fts_paths2 = vault_fts_paths.clone();
             let filter_rc = active_profile_filter.clone();
             let conns_ss = connections.clone();
+            let data_dir_ss = data_dir.clone();
             ui.on_settings_save(move || {
                 let theme_idx = ui2.get_settings_theme_idx();
                 let theme = if theme_idx == 1 { "dark" } else { "light" };
@@ -3453,6 +3803,11 @@ impl App {
                     .filter(|c| c.kind == "calendar")
                     .map(|c| c.value.clone())
                     .collect();
+                let caldav_conns: Vec<AppConnection> = conns
+                    .iter()
+                    .filter(|c| c.kind == "caldav")
+                    .cloned()
+                    .collect();
                 drop(conns);
 
                 let mut ics_urls = Vec::new();
@@ -3464,6 +3819,17 @@ impl App {
                         ics_paths.push(PathBuf::from(val));
                     }
                 }
+                let export_subdir = {
+                    let s = ui2.get_connect_setup_export_subdir().to_string();
+                    let trimmed = s.trim();
+                    if trimmed.is_empty() {
+                        PathBuf::from(ephemeris_core::DEFAULT_EXPORT_SUBDIR)
+                    } else {
+                        PathBuf::from(trimmed.trim_start_matches('/'))
+                    }
+                };
+                let git_enabled = ui2.get_connect_setup_git_enabled();
+
                 let mut new_cfg = cfg2.borrow().clone();
                 new_cfg.theme = theme.to_string();
                 new_cfg.pen_only_drawing = pen_only;
@@ -3472,6 +3838,8 @@ impl App {
                 } else {
                     Some(expand_user_path(&vault_str))
                 };
+                new_cfg.vault_export_subdir = export_subdir;
+                new_cfg.vault_git_enabled = git_enabled;
                 new_cfg.ics_urls = ics_urls;
                 new_cfg.ics_paths = ics_paths;
 
@@ -3484,18 +3852,26 @@ impl App {
                 apply_theme_to_comp(&ui2, theme);
 
                 // Reload tasks (vault tasks use work_pid; sample tasks span both profiles).
+                schedule_vault_git_pull(&new_cfg);
                 let new_tasks = if let Some(ref vault) = new_cfg.vault_path {
-                    load_vault_tasks_with_inbox(vault, &new_cfg.vault_tasks_inbox, work_pid)
-                        .unwrap_or_else(|_| sample_tasks_split(work_pid, personal_pid))
+                    load_vault_tasks_with_inbox(
+                        vault,
+                        &new_cfg.vault_tasks_inbox,
+                        &new_cfg.vault_export_subdir,
+                        work_pid,
+                    )
+                    .unwrap_or_else(|_| sample_tasks_split(work_pid, personal_pid))
                 } else {
                     sample_tasks_split(work_pid, personal_pid)
                 };
                 *tasks2.borrow_mut() = new_tasks;
 
-                // Reload calendar events.
+                // Reload calendar events (ICS + CalDAV), keep local quick-add events.
                 let now = now_secs();
                 let mut evts = load_ics_events(&new_cfg.ics_paths, work_pid, now);
                 evts.extend(load_ics_from_urls(&new_cfg.ics_urls, work_pid, now));
+                evts.extend(load_caldav_events(&caldav_conns, work_pid, now));
+                evts.extend(load_local_events(&data_dir_ss));
                 *cal2.borrow_mut() = evts;
 
                 // Persist new config into the shared handle.
@@ -3503,7 +3879,10 @@ impl App {
 
                 // Rebuild vault search index for the new vault path.
                 if let Some(ref vault) = new_cfg.vault_path {
-                    match fts2.borrow_mut().reindex_vault(vault) {
+                    match fts2
+                        .borrow_mut()
+                        .reindex_vault(vault, Some(new_cfg.vault_export_subdir.as_path()))
+                    {
                         Ok(n) => {
                             tracing::info!("Reindexed {n} vault notes after settings save");
                             *fts_paths2.borrow_mut() = vec![vault.clone()];
@@ -3521,7 +3900,7 @@ impl App {
                 let filter_str = filter_rc.borrow().clone();
                 let filtered_tasks = filter_tasks_by_profile(&tasks2.borrow(), &filter_str);
                 let visible_events = filter_events_by_profile(&cal2.borrow(), &filter_str);
-                refresh_comp(&ui2, &filtered_tasks, work_pid);
+                refresh_comp(&ui2, &filtered_tasks, work_pid, &mgr_settings);
                 push_agenda_comp(&ui2, &visible_events, AgendaRange::Day, now);
 
                 ui2.set_show_settings(false);
@@ -3559,6 +3938,40 @@ impl App {
                     let _ = std::fs::remove_file(&path);
                 }
                 ui2.set_whisper_model_installed(false);
+            });
+        }
+
+        // ── Settings → HTR model download ─────────────────────────────────────
+        {
+            let ui2 = ui.clone_component();
+            let cfg2 = config.clone();
+            let dl_result2 = htr_download_result.clone();
+            let dl_active2 = htr_download_active.clone();
+            ui.on_settings_htr_download(move || {
+                if dl_active2.swap(true, Ordering::AcqRel) {
+                    return;
+                }
+                ui2.set_htr_downloading(true);
+                let mailbox = dl_result2.clone();
+                let active_flag = dl_active2.clone();
+                let cfg = cfg2.borrow().clone();
+                std::thread::spawn(move || {
+                    let result = download_htr_model(&cfg);
+                    if let Ok(mut guard) = mailbox.lock() {
+                        *guard = Some(result);
+                    }
+                    active_flag.store(false, Ordering::Release);
+                });
+            });
+        }
+
+        // ── Settings → HTR model delete ───────────────────────────────────────
+        {
+            let ui2 = ui.clone_component();
+            let cfg2 = config.clone();
+            ui.on_settings_htr_delete(move || {
+                delete_htr_model(&cfg2.borrow());
+                ui2.set_htr_model_installed(false);
             });
         }
 
@@ -3606,21 +4019,44 @@ impl App {
                     value: vault_path.to_string_lossy().to_string(),
                     profile_id,
                     allow_in_aggregated: true,
+                    username: String::new(),
+                    password: String::new(),
                 });
                 save_connections(&conns);
                 drop(conns);
                 push_v();
+
+                let export_subdir = {
+                    let s = ui2.get_connect_setup_export_subdir().to_string();
+                    let trimmed = s.trim();
+                    if trimmed.is_empty() {
+                        PathBuf::from(ephemeris_core::DEFAULT_EXPORT_SUBDIR)
+                    } else {
+                        PathBuf::from(trimmed.trim_start_matches('/'))
+                    }
+                };
+                let is_git = ephemeris_core::is_git_repo(&vault_path);
 
                 // Apply immediately — don't wait for Settings → Save, otherwise
                 // search/tasks keep using a stale or empty vault_path.
                 {
                     let mut cfg = cfg2.borrow_mut();
                     cfg.vault_path = Some(vault_path.clone());
+                    cfg.vault_export_subdir = export_subdir.clone();
+                    // Git stays off until the user opts in (offer dialog below).
+                    if !is_git {
+                        cfg.vault_git_enabled = false;
+                        ui2.set_connect_setup_git_enabled(false);
+                    }
                     if let Err(e) = cfg.save() {
                         tracing::warn!("Config save after vault select failed: {e}");
                     }
                 }
-                match fts2.borrow_mut().reindex_vault(&vault_path) {
+                schedule_vault_git_pull(&cfg2.borrow());
+                match fts2
+                    .borrow_mut()
+                    .reindex_vault(&vault_path, Some(export_subdir.as_path()))
+                {
                     Ok(n) => {
                         tracing::info!(
                             "Indexed {n} vault notes from {} after select",
@@ -3634,13 +4070,74 @@ impl App {
                     &mut tasks2.borrow_mut(),
                     &vault_path,
                     &cfg2.borrow().vault_tasks_inbox,
+                    &export_subdir,
                     work_pid,
                 );
+                schedule_vault_git_push(&cfg2.borrow());
 
                 ui2.set_settings_vault_path(vault_path.to_string_lossy().as_ref().into());
+                ui2.set_connect_setup_export_subdir(
+                    export_subdir.to_string_lossy().to_string().as_str().into(),
+                );
+                ui2.set_connect_setup_git_detected(is_git);
                 ui2.set_show_filebrowser(false);
                 ui2.set_show_settings(true);
                 ui2.set_settings_section(2);
+                if is_git {
+                    ui2.set_connect_setup_kind("vault-git".into());
+                    ui2.set_connect_setup_visible(true);
+                }
+            });
+        }
+
+        // ── Vault setup confirm (export path / git options) ───────────────────
+        {
+            let ui2 = ui.clone_component();
+            let cfg2 = config.clone();
+            let fts2 = vault_fts.clone();
+            let fts_paths2 = vault_fts_paths.clone();
+            let tasks2 = tasks.clone();
+            ui.on_connect_vault_setup_confirm(move || {
+                let export_subdir = {
+                    let s = ui2.get_connect_setup_export_subdir().to_string();
+                    let trimmed = s.trim();
+                    if trimmed.is_empty() {
+                        PathBuf::from(ephemeris_core::DEFAULT_EXPORT_SUBDIR)
+                    } else {
+                        PathBuf::from(trimmed.trim_start_matches('/'))
+                    }
+                };
+                let git_enabled = ui2.get_connect_setup_git_enabled();
+                {
+                    let mut cfg = cfg2.borrow_mut();
+                    cfg.vault_export_subdir = export_subdir.clone();
+                    cfg.vault_git_enabled = git_enabled;
+                    if let Err(e) = cfg.save() {
+                        tracing::warn!("Config save after vault setup confirm failed: {e}");
+                    }
+                }
+                let cfg = cfg2.borrow().clone();
+                schedule_vault_git_pull(&cfg);
+                if let Some(ref vault) = cfg.vault_path {
+                    match fts2
+                        .borrow_mut()
+                        .reindex_vault(vault, Some(export_subdir.as_path()))
+                    {
+                        Ok(n) => {
+                            *fts_paths2.borrow_mut() = vec![vault.clone()];
+                            tracing::info!("Reindexed {n} vault notes after setup confirm");
+                        }
+                        Err(e) => tracing::warn!("Vault FTS reindex after setup confirm: {e}"),
+                    }
+                    reload_obsidian_tasks(
+                        &mut tasks2.borrow_mut(),
+                        vault,
+                        &cfg.vault_tasks_inbox,
+                        &export_subdir,
+                        work_pid,
+                    );
+                    schedule_vault_git_push(&cfg);
+                }
             });
         }
 
@@ -3670,6 +4167,8 @@ impl App {
                     value: path_str.clone(),
                     profile_id,
                     allow_in_aggregated: true,
+                    username: String::new(),
+                    password: String::new(),
                 });
                 drop(conns);
                 push_i();
@@ -3812,8 +4311,16 @@ impl App {
             rec_dir: rec_dir.clone(),
             transcription_pending,
             transcription_active,
+            transcription_queue,
+            transcription_in_flight,
             download_result,
             download_active,
+            htr_download_result,
+            htr_download_active,
+            caldav_pending,
+            caldav_active,
+            calendar_events: calendar_events.clone(),
+            active_profile_filter: active_profile_filter.clone(),
             push_recordings,
             #[cfg(target_os = "linux")]
             pen_source,
@@ -3899,10 +4406,25 @@ struct WinitHandler {
     transcription_pending: Arc<Mutex<Vec<(u32, String)>>>,
     /// True while a whisper subprocess is running (prevents double-dispatch).
     transcription_active: Arc<AtomicBool>,
+    /// FIFO of recording ids waiting for (or between) whisper jobs.
+    transcription_queue: Arc<Mutex<VecDeque<u32>>>,
+    /// Ids queued or in-flight for list "Transcribing…" status.
+    transcription_in_flight: Rc<RefCell<HashSet<u32>>>,
     /// Result of a model download: Ok(()) on success, Err(msg) on failure.
     download_result: Arc<Mutex<Option<Result<(), String>>>>,
     /// True while a model download thread is running.
     download_active: Arc<AtomicBool>,
+    /// Result of an HTR model download.
+    htr_download_result: Arc<Mutex<Option<Result<(), String>>>>,
+    /// True while an HTR model download thread is running.
+    htr_download_active: Arc<AtomicBool>,
+    /// CalDAV events finished syncing off-thread.
+    caldav_pending: Arc<Mutex<Vec<CalendarEvent>>>,
+    /// True while a CalDAV sync thread is running.
+    caldav_active: Arc<AtomicBool>,
+    /// Shared calendar events — merged with CalDAV sync results.
+    calendar_events: Rc<RefCell<Vec<CalendarEvent>>>,
+    active_profile_filter: Rc<RefCell<String>>,
     /// Profile-filtered recording list refresh — called after transcription completes.
     push_recordings: Rc<dyn Fn()>,
     /// Linux: separate digitiser (PineNote pen) via `/dev/input` — not wl_touch.
@@ -4045,6 +4567,7 @@ impl WinitHandler {
                     }),
                     now_ms(),
                 );
+                self.persist_if_strokes_dirty();
             }
         }
         if let Some(d) = &self.display {
@@ -4109,9 +4632,40 @@ impl WinitHandler {
                 }),
                 now_ms(),
             );
+            self.persist_if_strokes_dirty();
         }
         if let Some(d) = &self.display {
             d.request_redraw();
+        }
+    }
+
+    /// Persist raster + strokes when the live stroke list changed (erase / clear).
+    fn persist_if_strokes_dirty(&mut self) {
+        if !self.ui.take_strokes_dirty() {
+            return;
+        }
+        let page_idx = self.ui.current_page_idx();
+        let note_info = self
+            .notes
+            .borrow()
+            .iter()
+            .find(|n| n.page_index == page_idx)
+            .map(|n| (n.id, n.doc_page));
+        let Some((note_id, doc_page)) = note_info else {
+            return;
+        };
+        let pixels = self.ui.get_committed_pixels();
+        let (w, h) = self.ui.canvas_size();
+        save_note_page_pixels(&self.data_dir, note_id, doc_page, w, h, &pixels);
+        save_note_page_strokes(
+            &self.data_dir,
+            note_id,
+            doc_page,
+            &self.ui.get_page_strokes(),
+        );
+        if let Some(note) = self.notes.borrow_mut().iter_mut().find(|n| n.id == note_id) {
+            note.updated_at = now_secs();
+            note.text_content = None;
         }
     }
 
@@ -4134,7 +4688,11 @@ impl WinitHandler {
             self.chrome_dismiss_armed = true;
         }
 
-        // Dispatch first so Slint swipe callbacks can set `page_swipe_handled`
+        // Ensure Slint TouchArea.mouse-x/y reflect the release point before up.
+        // On PineNote, Touch Ended often arrives without a final Moved at the
+        // lift coords — without this, page-swipe delta stays under threshold.
+        self.ui.dispatch_pointer_moved(lx, ly);
+        // Dispatch release so Slint swipe callbacks can set `page_swipe_handled`
         // before we decide whether to commit ink.
         self.ui.dispatch_pointer_released(lx, ly);
         if self.page_swipe_handled.get() {
@@ -4161,7 +4719,9 @@ impl WinitHandler {
                 }),
                 now_ms(),
             );
-            if matches!(update, InkUpdate::Finished { .. }) {
+            // Persist after pen commit; erase mid-gesture is handled via
+            // persist_if_strokes_dirty on move/down.
+            if matches!(update, InkUpdate::Finished { .. }) || self.ui.take_strokes_dirty() {
                 let page_idx = self.ui.current_page_idx();
                 let note_info = self
                     .notes
@@ -4173,9 +4733,16 @@ impl WinitHandler {
                     let pixels = self.ui.get_committed_pixels();
                     let (w, h) = self.ui.canvas_size();
                     save_note_page_pixels(&self.data_dir, note_id, doc_page, w, h, &pixels);
+                    save_note_page_strokes(
+                        &self.data_dir,
+                        note_id,
+                        doc_page,
+                        &self.ui.get_page_strokes(),
+                    );
                     if let Some(note) = self.notes.borrow_mut().iter_mut().find(|n| n.id == note_id)
                     {
                         note.updated_at = now_secs();
+                        note.text_content = None;
                     }
                     export_single_note_to_vault(
                         &self.config.borrow(),
@@ -4267,6 +4834,29 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
             }
         }
 
+        // --- Drain HTR download result ---
+        if let Ok(mut guard) = self.htr_download_result.lock() {
+            if let Some(result) = guard.take() {
+                drop(guard);
+                match result {
+                    Ok(()) => {
+                        self.ui.set_htr_downloading(false);
+                        self.ui.set_htr_model_installed(true);
+                    }
+                    Err(msg) => {
+                        tracing::error!("HTR download failed: {msg}");
+                        self.ui.set_htr_downloading(false);
+                        self.ui.set_htr_model_installed(find_htr_model_installed(
+                            &self.config.borrow(),
+                        ));
+                    }
+                }
+                if let Some(d) = &self.display {
+                    d.request_redraw();
+                }
+            }
+        }
+
         // --- Drain completed transcriptions ---
         if let Ok(mut pending) = self.transcription_pending.lock() {
             if !pending.is_empty() {
@@ -4274,14 +4864,18 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
                 drop(pending);
                 let mut recs = self.recordings.borrow_mut();
                 let mut updated = false;
+                let ui2 = self.ui.clone_component();
+                let active_open: u32 = ui2.get_rec_active_id().parse().unwrap_or(0);
                 for (id, text) in drained {
+                    self.transcription_in_flight.borrow_mut().remove(&id);
                     if let Some(rec) = recs.iter_mut().find(|r| r.id == id) {
                         rec.transcription = Some(text.clone());
                         updated = true;
-                        // Update the visible transcription dialog if it's still open.
-                        self.ui
-                            .clone_component()
-                            .set_rec_transcription_text(slint::SharedString::from(text.as_str()));
+                        if id == active_open && ui2.get_rec_transcription_visible() {
+                            ui2.set_rec_transcription_text(slint::SharedString::from(
+                                text.as_str(),
+                            ));
+                        }
                     }
                 }
                 if updated {
@@ -4291,7 +4885,21 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
                     if let Some(d) = &self.display {
                         d.request_redraw();
                     }
+                } else {
+                    drop(recs);
                 }
+                // Kick the next queued job now that the worker slot is free.
+                let lang = ui2.get_whisper_lang();
+                pump_transcription_queue(
+                    &self.transcription_queue,
+                    &self.transcription_active,
+                    &self.transcription_pending,
+                    &self.recordings,
+                    &self.rec_dir,
+                    &lang,
+                    &self.transcription_in_flight,
+                    &self.push_recordings,
+                );
             }
         }
 
@@ -4317,12 +4925,44 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
             ));
         } else if self.transcription_active.load(Ordering::Relaxed)
             || self.download_active.load(Ordering::Relaxed)
+            || self.htr_download_active.load(Ordering::Relaxed)
+            || self.caldav_active.load(Ordering::Relaxed)
         {
-            // Keep waking while a whisper subprocess or model download is running.
+            // Keep waking while whisper / model download / CalDAV sync runs.
             drop(h_opt);
             event_loop.set_control_flow(ControlFlow::WaitUntil(
                 Instant::now() + Duration::from_millis(500),
             ));
+        }
+
+        // --- Drain completed CalDAV syncs ---
+        if let Ok(mut pending) = self.caldav_pending.lock() {
+            if !pending.is_empty() {
+                let drained: Vec<CalendarEvent> = pending.drain(..).collect();
+                drop(pending);
+                {
+                    let mut evts = self.calendar_events.borrow_mut();
+                    // Replace prior events from the same CalDAV calendar URLs.
+                    for ev in &drained {
+                        let src = ev.source.clone();
+                        if src.starts_with("caldav:") {
+                            evts.retain(|e| e.source != src);
+                        }
+                    }
+                    evts.extend(drained);
+                }
+                let filter = self.active_profile_filter.borrow().clone();
+                let visible = filter_events_by_profile(&self.calendar_events.borrow(), &filter);
+                push_agenda_comp(
+                    &self.ui.clone_component(),
+                    &visible,
+                    AgendaRange::Day,
+                    now_secs(),
+                );
+                if let Some(d) = &self.display {
+                    d.request_redraw();
+                }
+            }
         }
     }
 
@@ -4583,11 +5223,18 @@ fn note_updated_at(n: &AppNote) -> u64 {
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct AppConnection {
     id: u32,
-    kind: String, // "vault" | "calendar"
+    /// `"vault"` | `"calendar"` (ICS) | `"caldav"` (authenticated CalDAV).
+    kind: String,
     display: String,
     value: String,
     profile_id: String,
     allow_in_aggregated: bool,
+    /// CalDAV username (empty for ICS/vault).
+    #[serde(default)]
+    username: String,
+    /// CalDAV password / app token (empty for ICS/vault). Stored locally with connections.
+    #[serde(default)]
+    password: String,
 }
 
 /// Persisted snapshot of all notes and notebooks (saved to notes_index.json).
@@ -4679,23 +5326,136 @@ fn load_recordings_index(dir: &Path) -> Option<RecordingsIndex> {
     serde_json::from_str(&json).ok()
 }
 
-fn build_recording_list(recordings: &[AppRecording]) -> Vec<ephemeris_ui::RecordingEntry> {
+fn build_recording_list(
+    recordings: &[AppRecording],
+    transcribing: &HashSet<u32>,
+    show_badges: bool,
+    mgr: &ephemeris_core::profile_manager::ProfileManager,
+) -> Vec<ephemeris_ui::RecordingEntry> {
     recordings
         .iter()
-        .map(|r| ephemeris_ui::RecordingEntry {
-            id: r.id.to_string().as_str().into(),
-            title: r.title.as_str().into(),
-            duration_label: format_rec_duration(r.duration_secs as u64).as_str().into(),
-            date_label: format_rec_date(r.created_at, now_secs()).as_str().into(),
-            has_transcription: r.transcription.is_some(),
+        .map(|r| {
+            let (show_profile, profile_icon_char, has_custom_profile_icon, custom_profile_icon) =
+                profile_badge_for(&r.profile_id, show_badges, mgr);
+            ephemeris_ui::RecordingEntry {
+                id: r.id.to_string().as_str().into(),
+                title: r.title.as_str().into(),
+                duration_label: format_rec_duration(r.duration_secs as u64).as_str().into(),
+                date_label: format_rec_date(r.created_at, now_secs()).as_str().into(),
+                has_transcription: r.transcription.is_some(),
+                is_transcribing: transcribing.contains(&r.id),
+                show_profile,
+                profile_icon_char: profile_icon_char.as_str().into(),
+                has_custom_profile_icon,
+                custom_profile_icon,
+            }
         })
         .collect()
 }
 
-fn push_recording_list_comp(comp: &ephemeris_ui::EphemerisPage, recordings: &[AppRecording]) {
+fn push_recording_list_comp(
+    comp: &ephemeris_ui::EphemerisPage,
+    recordings: &[AppRecording],
+    transcribing: &HashSet<u32>,
+    show_badges: bool,
+    mgr: &ephemeris_core::profile_manager::ProfileManager,
+) {
     comp.set_recording_list(
-        Rc::new(slint::VecModel::from(build_recording_list(recordings))).into(),
+        Rc::new(slint::VecModel::from(build_recording_list(
+            recordings,
+            transcribing,
+            show_badges,
+            mgr,
+        )))
+        .into(),
     );
+}
+
+fn whisper_ready() -> bool {
+    find_whisper_binary().is_some() && find_whisper_model().is_some()
+}
+
+/// Queue a recording for background whisper and kick the worker if idle.
+fn enqueue_transcription(
+    rec_id: u32,
+    queue: &Arc<Mutex<VecDeque<u32>>>,
+    in_flight: &Rc<RefCell<HashSet<u32>>>,
+    active: &Arc<AtomicBool>,
+    mailbox: &Arc<Mutex<Vec<(u32, String)>>>,
+    recordings: &Rc<RefCell<Vec<AppRecording>>>,
+    rec_dir: &Path,
+    lang: &str,
+    push_recordings: &Rc<dyn Fn()>,
+) {
+    in_flight.borrow_mut().insert(rec_id);
+    if let Ok(mut q) = queue.lock() {
+        if !q.iter().any(|&id| id == rec_id) {
+            q.push_back(rec_id);
+        }
+    }
+    push_recordings();
+    pump_transcription_queue(
+        queue,
+        active,
+        mailbox,
+        recordings,
+        rec_dir,
+        lang,
+        in_flight,
+        push_recordings,
+    );
+}
+
+/// Start the next queued whisper job if none is running.
+fn pump_transcription_queue(
+    queue: &Arc<Mutex<VecDeque<u32>>>,
+    active: &Arc<AtomicBool>,
+    mailbox: &Arc<Mutex<Vec<(u32, String)>>>,
+    recordings: &Rc<RefCell<Vec<AppRecording>>>,
+    rec_dir: &Path,
+    lang: &str,
+    in_flight: &Rc<RefCell<HashSet<u32>>>,
+    push_recordings: &Rc<dyn Fn()>,
+) {
+    if active.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let next_id = queue.lock().ok().and_then(|mut q| q.pop_front());
+    let Some(rec_id) = next_id else {
+        active.store(false, Ordering::Release);
+        return;
+    };
+    let wav_path = {
+        let recs = recordings.borrow();
+        let Some(rec) = recs.iter().find(|r| r.id == rec_id) else {
+            active.store(false, Ordering::Release);
+            in_flight.borrow_mut().remove(&rec_id);
+            push_recordings();
+            // Try the next queued id.
+            pump_transcription_queue(
+                queue,
+                active,
+                mailbox,
+                recordings,
+                rec_dir,
+                lang,
+                in_flight,
+                push_recordings,
+            );
+            return;
+        };
+        rec_dir.join(&rec.audio_filename)
+    };
+    let lang = lang.to_string();
+    let mailbox = mailbox.clone();
+    let active_flag = active.clone();
+    std::thread::spawn(move || {
+        let text = run_whisper(&wav_path, &lang);
+        if let Ok(mut pending) = mailbox.lock() {
+            pending.push((rec_id, text));
+        }
+        active_flag.store(false, Ordering::Release);
+    });
 }
 
 fn format_rec_duration(secs: u64) -> String {
@@ -4884,6 +5644,89 @@ fn play_audio(path: &Path) {
         #[cfg(not(target_os = "macos"))]
         let _ = std::process::Command::new("aplay").arg(&path).status();
     });
+}
+
+fn default_htr_model_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let base = std::env::var("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(home).join(".local").join("share"));
+    base.join("ephemeris").join("htr")
+}
+
+fn resolve_htr_model_dir(config: &ephemeris_core::Config) -> PathBuf {
+    config
+        .htr_model_dir
+        .clone()
+        .unwrap_or_else(default_htr_model_dir)
+}
+
+fn build_cascading_transcriber(config: &ephemeris_core::Config) -> CascadingTranscriber {
+    let htr =
+        StrokeHtrTranscriber::from_parts(config.htr_enabled, Some(resolve_htr_model_dir(config)));
+    let ocr = RasterOcrTranscriber::from_parts(
+        config.ocr_enabled,
+        config.ocr_languages.clone(),
+        config.ocr_tessdata.clone(),
+    );
+    CascadingTranscriber::new(htr, ocr)
+}
+
+fn find_htr_model_installed(config: &ephemeris_core::Config) -> bool {
+    let dir = resolve_htr_model_dir(config);
+    dir.join("model.onnx").is_file() || dir.join("model.rten").is_file()
+}
+
+fn download_htr_model(config: &ephemeris_core::Config) -> Result<(), String> {
+    // Packaged zip from scripts/export-htr-model.sh / GitHub Release asset.
+    const URL: &str =
+        "https://github.com/steffen030/ephemeris/releases/download/htr-model-v1/ephemeris-htr-v1.zip";
+    let dest_dir = resolve_htr_model_dir(config);
+    std::fs::create_dir_all(&dest_dir).map_err(|e| format!("mkdir failed: {e}"))?;
+    let zip_path = dest_dir.join("ephemeris-htr-v1.zip");
+    let mut resp = reqwest::blocking::get(URL).map_err(|e| format!("download failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "HTTP {} — build locally with scripts/export-htr-model.sh and copy model.onnx + charset.txt to {}",
+            resp.status(),
+            dest_dir.display()
+        ));
+    }
+    {
+        let mut f =
+            std::fs::File::create(&zip_path).map_err(|e| format!("create zip failed: {e}"))?;
+        std::io::copy(&mut resp, &mut f).map_err(|e| format!("write failed: {e}"))?;
+    }
+    // Prefer `unzip` if present; otherwise instruct the user.
+    let status = std::process::Command::new("unzip")
+        .args(["-o", "-d"])
+        .arg(&dest_dir)
+        .arg(&zip_path)
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            let _ = std::fs::remove_file(&zip_path);
+            if find_htr_model_installed(config) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "unzip succeeded but model.onnx missing in {}",
+                    dest_dir.display()
+                ))
+            }
+        }
+        _ => Err(format!(
+            "Downloaded zip to {} — install unzip or extract model.onnx + charset.txt manually",
+            zip_path.display()
+        )),
+    }
+}
+
+fn delete_htr_model(config: &ephemeris_core::Config) {
+    let dir = resolve_htr_model_dir(config);
+    for name in ["model.onnx", "model.rten", "charset.txt", "dict.txt"] {
+        let _ = std::fs::remove_file(dir.join(name));
+    }
 }
 
 fn find_whisper_binary() -> Option<String> {
@@ -5270,38 +6113,148 @@ fn notebook_display_path(notebooks: &[AppNotebook], id: u32) -> String {
     }
 }
 
-fn notebook_export_title(notebooks: &[AppNotebook], notebook_id: Option<u32>) -> String {
+/// Display title + sanitized path segments for vault note export.
+fn notebook_export_parts(
+    notebooks: &[AppNotebook],
+    notebook_id: Option<u32>,
+) -> (String, Vec<String>) {
     match notebook_id {
-        None => "Root".to_string(),
-        Some(id) => notebook_display_path(notebooks, id),
+        None => ("Root".to_string(), vec!["Root".to_string()]),
+        Some(id) => {
+            let mut parts = Vec::new();
+            let mut cur = Some(id);
+            let mut guard = 0;
+            while let Some(cid) = cur {
+                guard += 1;
+                if guard > 32 {
+                    break;
+                }
+                if let Some(nb) = notebooks.iter().find(|n| n.id == cid) {
+                    parts.push(nb.title.clone());
+                    cur = nb.parent_id;
+                } else {
+                    break;
+                }
+            }
+            parts.reverse();
+            if parts.is_empty() {
+                (format!("Folder {id}"), vec![format!("Folder_{id}")])
+            } else {
+                let title = parts.join(" / ");
+                let segs = parts
+                    .iter()
+                    .map(|p| ephemeris_core::vault_export::sanitize_component(p))
+                    .collect();
+                (title, segs)
+            }
+        }
     }
 }
 
 /// Downsample a gray8 page into a small RGBA preview for the notes gallery.
+/// Portrait thumbs match the note frame (~3∶4).
 fn note_preview_image(data_dir: &Path, note_id: u32) -> (bool, slint::Image) {
-    const TW: u32 = 120;
-    const TH: u32 = 90;
     let Some((w, h, gray)) = load_note_page(data_dir, note_id) else {
         return (false, slint::Image::default());
     };
+    note_preview_from_gray(w, h, &gray)
+}
+
+fn note_preview_from_gray(w: u32, h: u32, gray: &[u8]) -> (bool, slint::Image) {
     if w == 0 || h == 0 || gray.len() < (w * h) as usize {
         return (false, slint::Image::default());
     }
-    let mut rgba = vec![0u8; (TW * TH * 4) as usize];
-    for ty in 0..TH {
-        for tx in 0..TW {
-            let sx = tx * w / TW;
-            let sy = ty * h / TH;
-            let g = gray[(sy * w + sx) as usize];
-            let i = ((ty * TW + tx) * 4) as usize;
+
+    // Crop to ink content so empty margins don't dominate the thumb.
+    const INK_THRESH: u8 = 240;
+    let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0u32, 0u32);
+    let mut found = false;
+    for y in 0..h {
+        let row = (y * w) as usize;
+        for x in 0..w {
+            if gray[row + x as usize] < INK_THRESH {
+                found = true;
+                x0 = x0.min(x);
+                y0 = y0.min(y);
+                x1 = x1.max(x + 1);
+                y1 = y1.max(y + 1);
+            }
+        }
+    }
+    let (sx0, sy0, sw, sh) = if found && x1 > x0 && y1 > y0 {
+        // Pad ~4% so strokes aren't clipped at the edge.
+        let pad_x = ((x1 - x0) / 25).max(4).min(24);
+        let pad_y = ((y1 - y0) / 25).max(4).min(24);
+        let x0 = x0.saturating_sub(pad_x);
+        let y0 = y0.saturating_sub(pad_y);
+        let x1 = (x1 + pad_x).min(w);
+        let y1 = (y1 + pad_y).min(h);
+        (x0, y0, x1 - x0, y1 - y0)
+    } else {
+        (0, 0, w, h)
+    };
+
+    // Match gallery tile width (~220–240); keep crop aspect.
+    const TARGET_W: u32 = 240;
+    let (tw, th) = if sh * TARGET_W >= sw {
+        let tw = TARGET_W;
+        let th = (tw as u64 * sh as u64 / sw as u64).clamp(1, 320) as u32;
+        (tw, th)
+    } else {
+        let th = TARGET_W;
+        let tw = (th as u64 * sw as u64 / sh as u64).clamp(1, 320) as u32;
+        (tw, th)
+    };
+
+    let mut rgba = vec![255u8; (tw * th * 4) as usize];
+    for ty in 0..th {
+        let y_a = sy0 + ty * sh / th;
+        let y_b = sy0 + ((ty + 1) * sh / th).min(sh);
+        let y_b = y_b.max(y_a + 1);
+        for tx in 0..tw {
+            let x_a = sx0 + tx * sw / tw;
+            let x_b = sx0 + ((tx + 1) * sw / tw).min(sw);
+            let x_b = x_b.max(x_a + 1);
+            // Ink-preserving reduce: darkest pixel in the source block.
+            let mut darkest = 255u8;
+            for y in y_a..y_b {
+                let row = (y * w) as usize;
+                for x in x_a..x_b {
+                    let g = gray[row + x as usize];
+                    if g < darkest {
+                        darkest = g;
+                    }
+                }
+            }
+            // Mild contrast: push mid-grays toward ink for e-ink readability.
+            let g = if darkest > 250 {
+                255
+            } else if darkest < 40 {
+                0
+            } else {
+                // Stretch [40,250] → [0,255] then darken slightly.
+                let stretched = ((darkest.saturating_sub(40) as u32) * 255 / 210) as u8;
+                stretched.saturating_mul(9) / 10
+            };
+            let i = ((ty * tw + tx) * 4) as usize;
             rgba[i] = g;
             rgba[i + 1] = g;
             rgba[i + 2] = g;
             rgba[i + 3] = 255;
         }
     }
-    let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&rgba, TW, TH);
+    let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&rgba, tw, th);
     (true, slint::Image::from_rgba8(buffer))
+}
+
+/// Flush the live canvas of `active_note_id` to disk so gallery previews stay fresh.
+fn flush_active_note_pixels(
+    ui: &EphemerisUi,
+    notes: &mut [AppNote],
+    data_dir: &Path,
+    active_note_id: &str,
+) {
+    flush_active_note_ink(ui, notes, data_dir, active_note_id);
 }
 
 fn format_note_date(created_at: u64, now: u64) -> String {
@@ -5331,6 +6284,10 @@ fn note_page_legacy_path(data_dir: &Path, note_id: u32) -> PathBuf {
     data_dir.join(format!("page_{note_id}.bin"))
 }
 
+fn note_strokes_path(data_dir: &Path, note_id: u32, doc_page: usize) -> PathBuf {
+    data_dir.join(format!("strokes_{note_id}_p{doc_page}.json"))
+}
+
 fn save_note_page_pixels(
     data_dir: &Path,
     note_id: u32,
@@ -5355,6 +6312,62 @@ fn save_note_page_pixels(
             tracing::warn!("Failed to save legacy note page {note_id}: {e}");
         }
     }
+}
+
+fn save_note_page_strokes(
+    data_dir: &Path,
+    note_id: u32,
+    doc_page: usize,
+    strokes: &[ephemeris_core::Stroke],
+) {
+    let page = ephemeris_core::store::StrokePage {
+        strokes: strokes.to_vec(),
+    };
+    match serde_json::to_string(&page) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(note_strokes_path(data_dir, note_id, doc_page), json) {
+                tracing::warn!("Failed to save strokes for note {note_id} page {doc_page}: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("Failed to serialize strokes for note {note_id}: {e}"),
+    }
+}
+
+fn load_note_page_strokes(
+    data_dir: &Path,
+    note_id: u32,
+    doc_page: usize,
+) -> Option<Vec<ephemeris_core::Stroke>> {
+    let path = note_strokes_path(data_dir, note_id, doc_page);
+    let json = std::fs::read_to_string(&path).ok()?;
+    let page: ephemeris_core::store::StrokePage = serde_json::from_str(&json).ok()?;
+    Some(page.strokes)
+}
+
+/// Persist raster + stroke list for the active note's current doc page.
+fn flush_active_note_ink(
+    ui: &EphemerisUi,
+    notes: &mut [AppNote],
+    data_dir: &Path,
+    active_note_id: &str,
+) {
+    if active_note_id.is_empty() {
+        return;
+    }
+    let Ok(id) = active_note_id.parse::<u32>() else {
+        return;
+    };
+    let Some(note) = notes.iter_mut().find(|n| n.id == id) else {
+        return;
+    };
+    let (w, h) = ui.canvas_size();
+    let pixels = ui.get_committed_pixels();
+    if pixels.len() < (w * h) as usize {
+        return;
+    }
+    save_note_page_pixels(data_dir, note.id, note.doc_page, w, h, &pixels);
+    save_note_page_strokes(data_dir, note.id, note.doc_page, &ui.get_page_strokes());
+    note.updated_at = now_secs();
 }
 
 fn read_page_bin(path: &Path) -> Option<(u32, u32, Vec<u8>)> {
@@ -5397,6 +6410,7 @@ fn delete_note_page_files(data_dir: &Path, note_id: u32, doc_page_count: usize) 
     let _ = std::fs::remove_file(note_page_legacy_path(data_dir, note_id));
     for p in 0..doc_page_count.max(1) {
         let _ = std::fs::remove_file(note_page_path(data_dir, note_id, p));
+        let _ = std::fs::remove_file(note_strokes_path(data_dir, note_id, p));
     }
 }
 
@@ -5418,6 +6432,7 @@ fn switch_note_doc_page(
     let (w, h) = ui.canvas_size();
     let pixels = ui.get_committed_pixels();
     save_note_page_pixels(data_dir, note.id, note.doc_page, w, h, &pixels);
+    save_note_page_strokes(data_dir, note.id, note.doc_page, &ui.get_page_strokes());
 
     let count = note.doc_page_count.max(1);
     let target = if create_if_missing && target >= count {
@@ -5431,6 +6446,13 @@ fn switch_note_doc_page(
 
     if let Some((_pw, _ph, data)) = load_note_page_n(data_dir, note.id, target) {
         ui.restore_page_pixels(note.page_index, data);
+        if let Some(strokes) = load_note_page_strokes(data_dir, note.id, target) {
+            ui.restore_page_strokes(note.page_index, strokes);
+        } else {
+            // Legacy raster-only page: keep pixels, empty stroke list.
+            ui.restore_page_strokes(note.page_index, Vec::new());
+        }
+        ui.clear_strokes_dirty();
     } else {
         ui.clear_ink();
     }
@@ -5492,13 +6514,21 @@ fn export_single_note_to_vault(
     let Some(vault) = config.vault_path.as_ref() else {
         return;
     };
-    let notebook_title = notebook_export_title(notebooks, note.notebook_id);
-    let export = build_vault_note_export(config, vault, data_dir, note, &notebook_title);
+    let (notebook_title, notebook_segments) = notebook_export_parts(notebooks, note.notebook_id);
+    let export = build_vault_note_export(
+        config,
+        vault,
+        data_dir,
+        note,
+        &notebook_title,
+        &notebook_segments,
+    );
     if let Err(e) =
         ephemeris_core::export_note_markdown(vault, &config.vault_export_subdir, &export)
     {
         tracing::warn!("Vault markdown export for note {note_id} failed: {e}");
     }
+    schedule_vault_git_push(config);
 }
 
 fn build_vault_note_export(
@@ -5507,13 +6537,11 @@ fn build_vault_note_export(
     data_dir: &Path,
     note: &AppNote,
     notebook_title: &str,
+    notebook_segments: &[String],
 ) -> VaultNoteExport {
     let export_root = &config.vault_export_subdir;
-    let nb_safe = ephemeris_core::vault_export::sanitize_component(notebook_title);
     let note_safe = ephemeris_core::vault_export::sanitize_component(&note.title);
-    let pdf_abs = vault
-        .join(export_root)
-        .join(&nb_safe)
+    let pdf_abs = ephemeris_core::notebook_export_dir(vault, export_root, notebook_segments)
         .join(format!("{note_safe}.pdf"));
 
     let mut pdf_ok = false;
@@ -5523,15 +6551,12 @@ fn build_vault_note_export(
             height: h,
             gray8: gray,
         };
-        let ocr = RasterOcrTranscriber::from_parts(
-            config.ocr_enabled,
-            config.ocr_languages.clone(),
-            config.ocr_tessdata.clone(),
-        );
-        let spans = ocr
-            .transcribe_raster(w, h, &page.gray8)
+        let strokes = load_note_page_strokes(data_dir, note.id, note.doc_page).unwrap_or_default();
+        let cascade = build_cascading_transcriber(config);
+        let spans = cascade
+            .transcribe_page(&strokes, w, h, &page.gray8)
             .unwrap_or_else(|e| {
-                tracing::debug!("OCR for note {} skipped: {e}", note.id);
+                tracing::debug!("Transcription for note {} skipped: {e}", note.id);
                 Vec::new()
             });
         let searchable_text = note.text_content.clone().or_else(|| {
@@ -5558,19 +6583,18 @@ fn build_vault_note_export(
     }
 
     let pdf_vault_rel = if pdf_ok || pdf_abs.exists() {
-        Some(
-            export_root
-                .join(&nb_safe)
-                .join(format!("{note_safe}.pdf"))
-                .to_string_lossy()
-                .replace('\\', "/"),
-        )
+        Some(ephemeris_core::notebook_export_rel(
+            export_root,
+            notebook_segments,
+            &format!("{note_safe}.pdf"),
+        ))
     } else {
         None
     };
 
     VaultNoteExport {
         notebook_title: notebook_title.to_string(),
+        notebook_segments: notebook_segments.to_vec(),
         note_title: note.title.clone(),
         note_id: note.id,
         created_at: note.created_at,
@@ -5592,8 +6616,16 @@ fn sync_notes_export_to_vault(
     let payload: Vec<VaultNoteExport> = notes
         .iter()
         .map(|n| {
-            let notebook_title = notebook_export_title(notebooks, n.notebook_id);
-            build_vault_note_export(config, vault, data_dir, n, &notebook_title)
+            let (notebook_title, notebook_segments) =
+                notebook_export_parts(notebooks, n.notebook_id);
+            build_vault_note_export(
+                config,
+                vault,
+                data_dir,
+                n,
+                &notebook_title,
+                &notebook_segments,
+            )
         })
         .collect();
 
@@ -5604,6 +6636,7 @@ fn sync_notes_export_to_vault(
         ),
         Err(e) => tracing::warn!("Vault note export sync failed: {e}"),
     }
+    schedule_vault_git_push(config);
 }
 
 /// Push see-text content for the active note into the UI.
@@ -5724,13 +6757,25 @@ fn cal_month_days(
     result
 }
 
-/// Build day events: `(title, time_label, all_day, col=0)`.
-fn cal_day_events(
-    year: i32,
-    month: u32,
-    day: u32,
-    events: &[CalendarEvent],
-) -> Vec<(String, String, bool, i32)> {
+/// UI calendar row: `(title, time_label, all_day, col, item_kind, item_id)`.
+type CalUiEvent = (String, String, bool, i32, String, String);
+
+fn cal_item_meta(e: &CalendarEvent) -> (String, String) {
+    match e.source.as_str() {
+        "note" => (
+            "note".to_string(),
+            e.uid.strip_prefix("note:").unwrap_or("").to_string(),
+        ),
+        "recording" => (
+            "recording".to_string(),
+            e.uid.strip_prefix("recording:").unwrap_or("").to_string(),
+        ),
+        _ => ("event".to_string(), String::new()),
+    }
+}
+
+/// Build day events: `(title, time_label, all_day, col=0, kind, id)`.
+fn cal_day_events(year: i32, month: u32, day: u32, events: &[CalendarEvent]) -> Vec<CalUiEvent> {
     let date = NaiveDate::from_ymd_opt(year, month, day).unwrap_or_default();
     let day_start = date
         .and_hms_opt(0, 0, 0)
@@ -5744,7 +6789,11 @@ fn cal_day_events(
         .map(|e| {
             let all_day = e.end.saturating_sub(e.start) >= 86399;
             let label = if all_day {
-                "All day".to_string()
+                match e.source.as_str() {
+                    "note" => "Note".to_string(),
+                    "recording" => "Recording".to_string(),
+                    _ => "All day".to_string(),
+                }
             } else {
                 let start_dt = ts_to_naive(e.start);
                 let end_dt = ts_to_naive(e.end);
@@ -5756,7 +6805,8 @@ fn cal_day_events(
                     end_dt.minute()
                 )
             };
-            (e.title.clone(), label, all_day, 0i32)
+            let (kind, id) = cal_item_meta(e);
+            (e.title.clone(), label, all_day, 0i32, kind, id)
         })
         .collect();
     result.sort_by(|a, b| a.2.cmp(&b.2).reverse().then(a.1.cmp(&b.1)));
@@ -5764,14 +6814,12 @@ fn cal_day_events(
 }
 
 /// Build week events: col = day-of-week offset from Monday (0=Mon).
-type CalWeekEvent = (String, String, bool, i32);
-
 fn cal_week_events(
     year: i32,
     month: u32,
     day: u32,
     events: &[CalendarEvent],
-) -> (Vec<String>, Vec<CalWeekEvent>) {
+) -> (Vec<String>, Vec<CalUiEvent>) {
     let date = NaiveDate::from_ymd_opt(year, month, day).unwrap_or_default();
     let mon_offset = date.weekday().num_days_from_monday() as i64;
     let monday = date - chrono::Duration::days(mon_offset);
@@ -5796,12 +6844,17 @@ fn cal_week_events(
             let col = ((e.start.saturating_sub(week_start_ts)) / 86400).min(6) as i32;
             let all_day = e.end.saturating_sub(e.start) >= 86399;
             let label = if all_day {
-                "All day".to_string()
+                match e.source.as_str() {
+                    "note" => "Note".to_string(),
+                    "recording" => "Rec".to_string(),
+                    _ => "All day".to_string(),
+                }
             } else {
                 let dt = ts_to_naive(e.start);
                 format!("{:02}:{:02}", dt.hour(), dt.minute())
             };
-            (e.title.clone(), label, all_day, col)
+            let (kind, id) = cal_item_meta(e);
+            (e.title.clone(), label, all_day, col, kind, id)
         })
         .collect();
     result.sort_by(|a, b| {
@@ -5810,6 +6863,118 @@ fn cal_week_events(
             .then(a.1.cmp(&b.1))
     });
     (labels, result)
+}
+
+fn utc_day_start(ts: u64) -> u64 {
+    let dt = DateTime::<Utc>::from_timestamp(ts as i64, 0).unwrap_or_else(Utc::now);
+    dt.date_naive()
+        .and_hms_opt(0, 0, 0)
+        .and_then(|ndt| ndt.and_utc().timestamp().try_into().ok())
+        .unwrap_or(ts)
+}
+
+fn recording_visible(
+    r: &AppRecording,
+    profile_filter: &str,
+    recordings_in_all: &HashSet<String>,
+) -> bool {
+    if profile_filter.is_empty() {
+        r.profile_id.is_empty() || recordings_in_all.contains(&r.profile_id)
+    } else {
+        r.profile_id == profile_filter
+    }
+}
+
+/// Append notes/recordings as synthetic all-day calendar entries (creation date).
+fn append_notes_recordings_as_events(
+    events: &mut Vec<CalendarEvent>,
+    notes: &[AppNote],
+    recordings: &[AppRecording],
+    profile_filter: &str,
+    notes_in_all: &HashSet<String>,
+    recordings_in_all: &HashSet<String>,
+) {
+    let fallback_pid = ProfileId(uuid::Uuid::nil());
+    for n in notes
+        .iter()
+        .filter(|n| note_visible(n, profile_filter, notes_in_all))
+    {
+        let start = utc_day_start(n.created_at);
+        events.push(CalendarEvent {
+            id: EventId::new(),
+            uid: format!("note:{}", n.id),
+            start,
+            end: start + 86399,
+            title: n.title.clone(),
+            location: None,
+            source: "note".to_string(),
+            profile_id: parse_profile_id(&n.profile_id).unwrap_or(fallback_pid),
+        });
+    }
+    for r in recordings
+        .iter()
+        .filter(|r| recording_visible(r, profile_filter, recordings_in_all))
+    {
+        let start = utc_day_start(r.created_at);
+        events.push(CalendarEvent {
+            id: EventId::new(),
+            uid: format!("recording:{}", r.id),
+            start,
+            end: start + 86399,
+            title: r.title.clone(),
+            location: None,
+            source: "recording".to_string(),
+            profile_id: parse_profile_id(&r.profile_id).unwrap_or(fallback_pid),
+        });
+    }
+}
+
+fn visible_cal_events(
+    events: &[CalendarEvent],
+    notes: &[AppNote],
+    recordings: &[AppRecording],
+    profile_filter: &str,
+    notes_in_all: &HashSet<String>,
+    recordings_in_all: &HashSet<String>,
+) -> Vec<CalendarEvent> {
+    let mut visible = filter_events_by_profile(events, profile_filter);
+    append_notes_recordings_as_events(
+        &mut visible,
+        notes,
+        recordings,
+        profile_filter,
+        notes_in_all,
+        recordings_in_all,
+    );
+    visible
+}
+
+fn local_events_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("local_events.json")
+}
+
+fn load_local_events(data_dir: &Path) -> Vec<CalendarEvent> {
+    let Ok(json) = std::fs::read_to_string(local_events_path(data_dir)) else {
+        return Vec::new();
+    };
+    serde_json::from_str(&json).unwrap_or_default()
+}
+
+fn save_local_events(data_dir: &Path, events: &[CalendarEvent]) {
+    let local: Vec<&CalendarEvent> = events.iter().filter(|e| e.source == "local").collect();
+    if let Ok(json) = serde_json::to_string_pretty(&local) {
+        let _ = std::fs::write(local_events_path(data_dir), json);
+    }
+}
+
+fn parse_hm(s: &str) -> Option<(u32, u32)> {
+    let mut parts = s.trim().split(':');
+    let h: u32 = parts.next()?.parse().ok()?;
+    let m: u32 = parts.next()?.parse().ok()?;
+    if h > 23 || m > 59 {
+        return None;
+    }
+    Some((h, m))
 }
 
 /// Year view: `(name, short, event_count, month_num)` for months 1..=12.
@@ -6137,9 +7302,11 @@ fn run_unified_search(
 fn load_vault_tasks_with_inbox(
     vault_path: &std::path::Path,
     inbox_rel: &std::path::Path,
+    export_subdir: &std::path::Path,
     profile_id: ProfileId,
 ) -> ephemeris_core::Result<Vec<Task>> {
-    let extractor = MarkdownTaskExtractor::with_inbox(vault_path, profile_id, inbox_rel);
+    let extractor = MarkdownTaskExtractor::with_inbox(vault_path, profile_id, inbox_rel)
+        .with_exclude_export_subdir(export_subdir.to_path_buf());
     TaskProvider::list(&extractor, profile_id)
 }
 
@@ -6148,9 +7315,10 @@ fn reload_obsidian_tasks(
     tasks: &mut Vec<Task>,
     vault_path: &std::path::Path,
     inbox_rel: &std::path::Path,
+    export_subdir: &std::path::Path,
     profile_id: ProfileId,
 ) {
-    match load_vault_tasks_with_inbox(vault_path, inbox_rel, profile_id) {
+    match load_vault_tasks_with_inbox(vault_path, inbox_rel, export_subdir, profile_id) {
         Ok(vault_tasks) => {
             tasks.retain(|t| t.source != "obsidian");
             tasks.extend(vault_tasks);
@@ -6164,11 +7332,14 @@ fn write_back_obsidian_task(config: &Config, task: &Task) {
     let Some(vault) = config.vault_path.as_ref() else {
         return;
     };
+    schedule_vault_git_pull(config);
     let extractor =
-        MarkdownTaskExtractor::with_inbox(vault, task.profile_id, &config.vault_tasks_inbox);
+        MarkdownTaskExtractor::with_inbox(vault, task.profile_id, &config.vault_tasks_inbox)
+            .with_exclude_export_subdir(config.vault_export_subdir.clone());
     if let Err(e) = TaskProvider::update(&extractor, task) {
         tracing::warn!("Obsidian task write-back failed for '{}': {e}", task.title);
     }
+    schedule_vault_git_push(config);
 }
 
 /// Append a new task into the vault inbox and refresh in-memory Obsidian tasks.
@@ -6181,10 +7352,19 @@ fn create_obsidian_task(
     let Some(vault) = config.vault_path.as_ref() else {
         return false;
     };
-    let extractor = MarkdownTaskExtractor::with_inbox(vault, profile_id, &config.vault_tasks_inbox);
+    schedule_vault_git_pull(config);
+    let extractor = MarkdownTaskExtractor::with_inbox(vault, profile_id, &config.vault_tasks_inbox)
+        .with_exclude_export_subdir(config.vault_export_subdir.clone());
     match TaskProvider::create(&extractor, task) {
         Ok(()) => {
-            reload_obsidian_tasks(tasks, vault, &config.vault_tasks_inbox, profile_id);
+            reload_obsidian_tasks(
+                tasks,
+                vault,
+                &config.vault_tasks_inbox,
+                &config.vault_export_subdir,
+                profile_id,
+            );
+            schedule_vault_git_push(config);
             true
         }
         Err(e) => {
@@ -6192,6 +7372,47 @@ fn create_obsidian_task(
             false
         }
     }
+}
+
+/// Background `git pull` when vault git sync is enabled.
+fn schedule_vault_git_pull(config: &Config) {
+    if !config.vault_git_enabled {
+        return;
+    }
+    let Some(vault) = config.vault_path.clone() else {
+        return;
+    };
+    if !ephemeris_core::is_git_repo(&vault) {
+        return;
+    }
+    std::thread::spawn(move || match ephemeris_core::vault_git_pull(&vault) {
+        Ok(()) => tracing::debug!("Vault git pull ok: {}", vault.display()),
+        Err(e) => tracing::warn!("Vault git pull failed: {e}"),
+    });
+}
+
+/// Debounced background `git add/commit/push` after vault writes.
+fn schedule_vault_git_push(config: &Config) {
+    if !config.vault_git_enabled {
+        return;
+    }
+    let Some(vault) = config.vault_path.clone() else {
+        return;
+    };
+    if !ephemeris_core::is_git_repo(&vault) {
+        return;
+    }
+    if VAULT_GIT_PUSH_PENDING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(3));
+        VAULT_GIT_PUSH_PENDING.store(false, Ordering::Release);
+        match ephemeris_core::vault_git_commit_and_push(&vault, "ephemeris: sync notes and tasks") {
+            Ok(()) => tracing::debug!("Vault git commit/push ok: {}", vault.display()),
+            Err(e) => tracing::warn!("Vault git commit/push failed: {e}"),
+        }
+    });
 }
 
 /// Parse every `.ics` file in `paths` and return all events in a 90-day window
@@ -6216,6 +7437,40 @@ fn load_ics_events(
                 }
             }
             Err(e) => tracing::warn!("ICS read failed for {}: {e}", path.display()),
+        }
+    }
+    all
+}
+
+fn parse_profile_id(s: &str) -> Option<ProfileId> {
+    uuid::Uuid::parse_str(s).ok().map(ProfileId)
+}
+
+/// Sync all CalDAV connections (blocking). Used on startup / settings save.
+fn load_caldav_events(
+    conns: &[AppConnection],
+    default_pid: ProfileId,
+    now: u64,
+) -> Vec<CalendarEvent> {
+    let window_start = now.saturating_sub(30 * 86_400);
+    let window_end = now.saturating_add(180 * 86_400);
+    let mut all = Vec::new();
+    for c in conns.iter().filter(|c| c.kind == "caldav") {
+        let pid = parse_profile_id(&c.profile_id).unwrap_or(default_pid);
+        let cfg = ephemeris_core::CalDavConfig::new(&c.value, &c.username, &c.password);
+        match ephemeris_core::CalDavClient::new(cfg)
+            .and_then(|client| client.sync_all(pid, window_start, window_end))
+        {
+            Ok((cals, events)) => {
+                tracing::info!(
+                    "CalDAV {}: {} calendar(s), {} event(s)",
+                    c.display,
+                    cals.len(),
+                    events.len()
+                );
+                all.extend(events);
+            }
+            Err(e) => tracing::warn!("CalDAV load failed for {}: {e}", c.display),
         }
     }
     all
@@ -6417,12 +7672,22 @@ fn push_agenda_comp(
 const HOME_TASK_LIMIT: usize = 5;
 
 /// Refresh both the start-page ranked list and the full-task-list in the UI.
-fn refresh_ui(ui: &EphemerisUi, tasks: &[Task], profile_id: ProfileId) {
-    refresh_comp(&ui.clone_component(), tasks, profile_id);
+fn refresh_ui(
+    ui: &EphemerisUi,
+    tasks: &[Task],
+    profile_id: ProfileId,
+    mgr: &ephemeris_core::profile_manager::ProfileManager,
+) {
+    refresh_comp(&ui.clone_component(), tasks, profile_id, mgr);
 }
 
 /// Same as `refresh_ui` but operates on a cloned `EphemerisPage` component.
-fn refresh_comp(comp: &ephemeris_ui::EphemerisPage, tasks: &[Task], profile_id: ProfileId) {
+fn refresh_comp(
+    comp: &ephemeris_ui::EphemerisPage,
+    tasks: &[Task],
+    profile_id: ProfileId,
+    mgr: &ephemeris_core::profile_manager::ProfileManager,
+) {
     let now = now_secs();
 
     // In All-profiles mode, home Tasks Ahead chips filter without switching profile.
@@ -6439,6 +7704,7 @@ fn refresh_comp(comp: &ephemeris_ui::EphemerisPage, tasks: &[Task], profile_id: 
         &chip_scoped
     };
 
+    let show_badges = comp.get_active_profile_id().is_empty();
     let ranked = rank_tasks(home_tasks, now);
     let task_entries: Vec<ephemeris_ui::TaskEntry> = ranked
         .iter()
@@ -6446,22 +7712,32 @@ fn refresh_comp(comp: &ephemeris_ui::EphemerisPage, tasks: &[Task], profile_id: 
         .map(|t| {
             let title = strip_inline_markdown(&t.title);
             let (dl, ov) = format_due(t.due, now);
+            let (show_profile, profile_icon_char, has_custom_profile_icon, custom_profile_icon) =
+                profile_badge_for(&t.profile_id.0.to_string(), show_badges, mgr);
             ephemeris_ui::TaskEntry {
                 id: t.id.0.to_string().as_str().into(),
                 title: title.as_str().into(),
                 priority_label: priority_label(t.priority).as_str().into(),
                 due_label: dl.as_str().into(),
                 overdue: ov,
+                show_profile,
+                profile_icon_char: profile_icon_char.as_str().into(),
+                has_custom_profile_icon,
+                custom_profile_icon,
             }
         })
         .collect();
     comp.set_task_list(Rc::new(slint::VecModel::from(task_entries)).into());
-    push_full_task_list_comp(comp, tasks);
+    push_full_task_list_comp(comp, tasks, mgr);
     let _ = profile_id;
 }
 
 /// Push the task-view list using current UI filter/sort/profile-chip/search.
-fn push_full_task_list_comp(comp: &ephemeris_ui::EphemerisPage, all_tasks: &[Task]) {
+fn push_full_task_list_comp(
+    comp: &ephemeris_ui::EphemerisPage,
+    all_tasks: &[Task],
+    mgr: &ephemeris_core::profile_manager::ProfileManager,
+) {
     let global_profile = comp.get_active_profile_id().to_string();
     let chip = if global_profile.is_empty() {
         comp.get_task_profile_filter().to_string()
@@ -6479,13 +7755,16 @@ fn push_full_task_list_comp(comp: &ephemeris_ui::EphemerisPage, all_tasks: &[Tas
     }
     scoped = filter_tasks_by_query(&scoped, &search);
 
+    let show_badges = global_profile.is_empty();
     let entries = build_full_task_list(&scoped, now, &filter, &sort);
     comp.set_full_task_list(
         Rc::new(slint::VecModel::from(
             entries
                 .iter()
-                .map(
-                    |(id, title, pl, pi, dl, ov, done)| ephemeris_ui::TaskViewEntry {
+                .map(|(id, title, pl, pi, dl, ov, done, profile_id)| {
+                    let (show_profile, profile_icon_char, has_custom, custom_icon) =
+                        profile_badge_for(profile_id, show_badges, mgr);
+                    ephemeris_ui::TaskViewEntry {
                         id: id.as_str().into(),
                         title: title.as_str().into(),
                         priority_label: pl.as_str().into(),
@@ -6493,8 +7772,12 @@ fn push_full_task_list_comp(comp: &ephemeris_ui::EphemerisPage, all_tasks: &[Tas
                         due_label: dl.as_str().into(),
                         overdue: *ov,
                         done: *done,
-                    },
-                )
+                        show_profile,
+                        profile_icon_char: profile_icon_char.as_str().into(),
+                        has_custom_profile_icon: has_custom,
+                        custom_profile_icon: custom_icon,
+                    }
+                })
                 .collect::<Vec<_>>(),
         ))
         .into(),
@@ -6536,7 +7819,7 @@ fn build_full_task_list(
     now: u64,
     filter: &str,
     sort: &str,
-) -> Vec<(String, String, String, i32, String, bool, bool)> {
+) -> Vec<(String, String, String, i32, String, bool, bool, String)> {
     let mut v: Vec<_> = tasks
         .iter()
         .filter(|t| match filter {
@@ -6563,6 +7846,7 @@ fn build_full_task_list(
                 dl,
                 ov,
                 t.done,
+                t.profile_id.0.to_string(),
             )
         })
         .collect();
@@ -6875,6 +8159,7 @@ mod tests {
         let result = load_vault_tasks_with_inbox(
             std::path::Path::new("/tmp/no-such-vault-xyz"),
             std::path::Path::new(ephemeris_core::DEFAULT_TASKS_INBOX),
+            std::path::Path::new(ephemeris_core::DEFAULT_EXPORT_SUBDIR),
             profile,
         );
         // Either Ok(empty) or Err — both are acceptable; just must not panic.

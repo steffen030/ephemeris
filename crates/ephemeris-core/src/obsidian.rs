@@ -5,13 +5,22 @@ use std::path::{Path, PathBuf};
 /// Obsidian vault filesystem reader.
 pub struct ObsidianVault {
     vault_path: PathBuf,
+    /// Vault-relative tree to skip (typically the notes export subdir).
+    exclude_subdir: Option<PathBuf>,
 }
 
 impl ObsidianVault {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         ObsidianVault {
             vault_path: path.into(),
+            exclude_subdir: None,
         }
+    }
+
+    /// Skip a vault-relative subdirectory when listing notes (e.g. export root).
+    pub fn with_exclude_subdir(mut self, subdir: impl Into<PathBuf>) -> Self {
+        self.exclude_subdir = Some(subdir.into());
+        self
     }
 
     /// List all markdown files in the vault.
@@ -76,10 +85,21 @@ impl ObsidianVault {
             let path = entry.path();
 
             if path.is_dir() {
-                if !self.is_hidden(&path) {
-                    self.walk_directory(&path, files)?;
+                if self.is_hidden(&path) {
+                    continue;
                 }
+                if let Some(ref ex) = self.exclude_subdir {
+                    if crate::path_under_export_subdir(&self.vault_path, &path, ex) {
+                        continue;
+                    }
+                }
+                self.walk_directory(&path, files)?;
             } else if path.extension().map(|e| e == "md").unwrap_or(false) {
+                if let Some(ref ex) = self.exclude_subdir {
+                    if crate::path_under_export_subdir(&self.vault_path, &path, ex) {
+                        continue;
+                    }
+                }
                 files.push(path);
             }
         }

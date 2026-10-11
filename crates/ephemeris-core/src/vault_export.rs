@@ -1,7 +1,8 @@
 //! Export Ephemeris notes into an Obsidian vault subfolder (ADR ephemeris-mry).
 //!
-//! Layout: `{vault}/{export_subdir}/{Notebook}/{Note}.md`
-//! Optional PDF sibling `{Note}.pdf` is linked from the markdown when present.
+//! Layout: `{vault}/{export_subdir}/{Notebook}/{…}/{Note}.md`
+//! Nested notebooks become nested directories. Optional PDF sibling `{Note}.pdf`
+//! is linked from the markdown when present.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -12,7 +13,10 @@ pub const DEFAULT_EXPORT_SUBDIR: &str = "Ephemeris";
 /// Payload for writing one note into the vault.
 #[derive(Debug, Clone)]
 pub struct VaultNoteExport {
+    /// Display path for frontmatter (e.g. `"Work / Ideas"`).
     pub notebook_title: String,
+    /// Sanitized folder segments under the export root (nested hierarchy).
+    pub notebook_segments: Vec<String>,
     pub note_title: String,
     pub note_id: u32,
     pub created_at: u64,
@@ -20,6 +24,32 @@ pub struct VaultNoteExport {
     pub text_content: Option<String>,
     /// If set, markdown embeds a wiki-style link to this vault-relative PDF.
     pub pdf_vault_rel: Option<String>,
+}
+
+/// Absolute directory for a note's notebook under the export root.
+pub fn notebook_export_dir(
+    vault_path: &Path,
+    export_subdir: &Path,
+    segments: &[String],
+) -> PathBuf {
+    let mut dir = vault_path.join(export_subdir);
+    for seg in segments {
+        dir.push(seg);
+    }
+    dir
+}
+
+/// Vault-relative path (`/` separators) for a file under the notebook dir.
+pub fn notebook_export_rel(export_subdir: &Path, segments: &[String], file_name: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for c in export_subdir.components() {
+        parts.push(c.as_os_str().to_string_lossy().into_owned());
+    }
+    for seg in segments {
+        parts.push(seg.clone());
+    }
+    parts.push(file_name.to_string());
+    parts.join("/")
 }
 
 /// Write (or overwrite) the markdown sidecar for `note` under the export root.
@@ -30,11 +60,15 @@ pub fn export_note_markdown(
     export_subdir: &Path,
     note: &VaultNoteExport,
 ) -> crate::Result<PathBuf> {
-    let notebook_dir = sanitize_component(&note.notebook_title);
-    let note_stem = sanitize_component(&note.note_title);
-    let dir = vault_path.join(export_subdir).join(&notebook_dir);
+    let segments = if note.notebook_segments.is_empty() {
+        vec![sanitize_component(&note.notebook_title)]
+    } else {
+        note.notebook_segments.clone()
+    };
+    let dir = notebook_export_dir(vault_path, export_subdir, &segments);
     fs::create_dir_all(&dir).map_err(crate::AppError::Io)?;
 
+    let note_stem = sanitize_component(&note.note_title);
     let md_path = dir.join(format!("{note_stem}.md"));
     let body = render_markdown(note);
     atomic_write(&md_path, &body)?;
@@ -53,6 +87,15 @@ pub fn sync_notes_to_vault(
         n += 1;
     }
     Ok(n)
+}
+
+/// True when `path` is the export root or a file/dir inside it.
+pub fn path_under_export_subdir(vault_root: &Path, path: &Path, export_subdir: &Path) -> bool {
+    if export_subdir.as_os_str().is_empty() {
+        return false;
+    }
+    let exclude_abs = vault_root.join(export_subdir);
+    path == exclude_abs || path.starts_with(&exclude_abs)
 }
 
 fn render_markdown(note: &VaultNoteExport) -> String {
@@ -95,7 +138,7 @@ fn render_markdown(note: &VaultNoteExport) -> String {
     out
 }
 
-/// Sanitize a path component for cross-platform vault folders.
+/// Sanitize a single path component for cross-platform vault folders.
 pub fn sanitize_component(name: &str) -> String {
     let trimmed = name.trim();
     let base = if trimmed.is_empty() {
@@ -137,11 +180,12 @@ mod tests {
     }
 
     #[test]
-    fn export_writes_notebook_mirror() {
+    fn export_writes_nested_notebook_dirs() {
         let tmp = TempDir::new().unwrap();
         let vault = tmp.path();
         let note = VaultNoteExport {
-            notebook_title: "Work/Ideas".into(),
+            notebook_title: "Work / Ideas".into(),
+            notebook_segments: vec!["Work".into(), "Ideas".into()],
             note_title: "Meeting Notes".into(),
             note_id: 7,
             created_at: 1_700_000_000,
@@ -149,11 +193,11 @@ mod tests {
             pdf_vault_rel: None,
         };
         let path = export_note_markdown(vault, Path::new("Ephemeris"), &note).unwrap();
-        assert!(path.ends_with("Ephemeris/Work_Ideas/Meeting Notes.md"));
+        assert!(path.ends_with("Ephemeris/Work/Ideas/Meeting Notes.md"));
         let body = fs::read_to_string(&path).unwrap();
         assert!(body.contains("ephemeris_note_id: 7"));
         assert!(body.contains("Hello from OCR"));
-        assert!(body.contains("notebook: \"Work/Ideas\""));
+        assert!(body.contains("notebook: \"Work / Ideas\""));
     }
 
     #[test]
@@ -161,6 +205,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let note = VaultNoteExport {
             notebook_title: "N".into(),
+            notebook_segments: vec!["N".into()],
             note_title: "T".into(),
             note_id: 1,
             created_at: 0,
@@ -179,6 +224,7 @@ mod tests {
         let notes = vec![
             VaultNoteExport {
                 notebook_title: "A".into(),
+                notebook_segments: vec!["A".into()],
                 note_title: "One".into(),
                 note_id: 1,
                 created_at: 0,
@@ -187,6 +233,7 @@ mod tests {
             },
             VaultNoteExport {
                 notebook_title: "B".into(),
+                notebook_segments: vec!["B".into()],
                 note_title: "Two".into(),
                 note_id: 2,
                 created_at: 0,
@@ -198,5 +245,26 @@ mod tests {
         assert_eq!(n, 2);
         assert!(tmp.path().join("Ephemeris/A/One.md").exists());
         assert!(tmp.path().join("Ephemeris/B/Two.md").exists());
+    }
+
+    #[test]
+    fn path_under_export_detects_tree() {
+        let vault = Path::new("/vault");
+        let ex = Path::new("Ephemeris");
+        assert!(path_under_export_subdir(
+            vault,
+            Path::new("/vault/Ephemeris"),
+            ex
+        ));
+        assert!(path_under_export_subdir(
+            vault,
+            Path::new("/vault/Ephemeris/Work/n.md"),
+            ex
+        ));
+        assert!(!path_under_export_subdir(
+            vault,
+            Path::new("/vault/Other/n.md"),
+            ex
+        ));
     }
 }

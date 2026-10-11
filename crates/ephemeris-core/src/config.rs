@@ -65,11 +65,16 @@ pub struct Config {
     pub vault_tasks_inbox: PathBuf,
 
     /// Vault-relative folder where exported notes are mirrored
-    /// (`{subdir}/{Notebook}/{Note}.md`).
+    /// (`{subdir}/{Notebook}/…/{Note}.md` + `.pdf`).
     ///
     /// Example TOML: `vault_export_subdir = "Ephemeris"`
     #[serde(default = "default_vault_export_subdir")]
     pub vault_export_subdir: PathBuf,
+
+    /// When true and the vault is a git repo, Ephemeris pulls before vault
+    /// reads and autocommits + pushes after note/task writes (background).
+    #[serde(default)]
+    pub vault_git_enabled: bool,
 
     /// Local `.ics` file paths to load calendar events from.
     /// Each path should point to a valid iCalendar file on disk.
@@ -104,6 +109,16 @@ pub struct Config {
     /// default search path is used.
     #[serde(default)]
     pub ocr_tessdata: Option<PathBuf>,
+
+    /// When true, See-text prefers local stroke HTR when a model is installed
+    /// (falls back to Tesseract OCR).
+    #[serde(default = "default_htr_enabled")]
+    pub htr_enabled: bool,
+
+    /// Directory containing `model.onnx` + `charset.txt` for stroke HTR.
+    /// When unset, defaults to `$XDG_DATA_HOME/ephemeris/htr`.
+    #[serde(default)]
+    pub htr_model_dir: Option<PathBuf>,
 
     /// When true, only pen (and desktop mouse) can leave ink on the note canvas;
     /// finger/hand touch is ignored for drawing so a resting palm does not make
@@ -148,6 +163,10 @@ fn default_pen_only_drawing() -> bool {
     true
 }
 
+fn default_htr_enabled() -> bool {
+    true
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -157,11 +176,14 @@ impl Default for Config {
             vault_path: None,
             vault_tasks_inbox: default_vault_tasks_inbox(),
             vault_export_subdir: default_vault_export_subdir(),
+            vault_git_enabled: false,
             ics_paths: Vec::new(),
             ics_urls: Vec::new(),
             ocr_enabled: default_ocr_enabled(),
             ocr_languages: default_ocr_languages(),
             ocr_tessdata: None,
+            htr_enabled: default_htr_enabled(),
+            htr_model_dir: None,
             pen_only_drawing: default_pen_only_drawing(),
             custom: HashMap::new(),
         }
@@ -295,6 +317,18 @@ fn apply_env_overrides(config: &mut Config) {
             "0" | "false" | "off" | "no" => config.pen_only_drawing = false,
             "1" | "true" | "on" | "yes" => config.pen_only_drawing = true,
             _ => tracing::warn!("EPHEMERIS_PEN_ONLY={v:?} not recognised; ignoring"),
+        }
+    }
+    if let Ok(v) = std::env::var("EPHEMERIS_HTR") {
+        match v.to_lowercase().as_str() {
+            "0" | "false" | "off" | "no" => config.htr_enabled = false,
+            "1" | "true" | "on" | "yes" => config.htr_enabled = true,
+            _ => tracing::warn!("EPHEMERIS_HTR={v:?} not recognised; ignoring"),
+        }
+    }
+    if let Ok(v) = std::env::var("EPHEMERIS_HTR_MODEL_DIR") {
+        if !v.trim().is_empty() {
+            config.htr_model_dir = Some(PathBuf::from(v));
         }
     }
 }

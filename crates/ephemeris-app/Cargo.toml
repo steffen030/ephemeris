@@ -30,7 +30,7 @@ tempfile = "3"
 
 [dependencies]
 chrono = { workspace = true }
-ephemeris-core = { workspace = true, features = ["ics", "ocr"] }
+ephemeris-core = { workspace = true, features = ["ics", "ocr", "caldav", "htr"] }
 ephemeris-pal  = { workspace = true }
 ephemeris-ui   = { workspace = true }
 log = { workspace = true }
@@ -45,3 +45,4 @@ winit = { workspace = true }
 cpal    = { workspace = true }
 hound   = { workspace = true }
 reqwest = { workspace = true }
+uuid = { workspace = true }

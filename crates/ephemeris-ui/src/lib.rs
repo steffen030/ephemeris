@@ -88,8 +88,10 @@ use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferTyp
 use slint::platform::{Platform, WindowAdapter};
 use slint::{Model, PhysicalSize, SharedString};
 
-use ephemeris_core::ink::{InkConfig, InkEngine, InkUpdate};
-use ephemeris_core::model::{Point, Tool};
+use ephemeris_core::ink::{
+    EraserConfig, EraserEngine, EraserUpdate, InkConfig, InkEngine, InkUpdate,
+};
+use ephemeris_core::model::{Point, Stroke, StrokeId, Tool};
 use ephemeris_core::refresh::{DamageSource, RefreshConfig, RefreshScheduler};
 use ephemeris_pal::display::{Display, PixelBuf, Rect};
 use ephemeris_pal::input::InputEvent;
@@ -110,6 +112,9 @@ pub mod raster;
 struct PageState {
     /// Rasterized committed strokes layer for this page (canvas-sized, 8 bpp).
     committed: PixelBuf,
+    /// Surviving vector strokes for this page (pen/highlighter only; eraser
+    /// removes entries). Used by stroke HTR and must match visible ink.
+    strokes: Vec<Stroke>,
     /// Points of any in-progress stroke on this page (empty when no stroke is
     /// active or after the stroke was committed).
     in_progress: Vec<Point>,
@@ -124,6 +129,7 @@ impl PageState {
     fn blank(canvas_w: u32, canvas_h: u32, default_base_width: f32) -> Self {
         PageState {
             committed: PixelBuf::new(canvas_w, canvas_h),
+            strokes: Vec::new(),
             in_progress: Vec::new(),
             in_progress_base_width: default_base_width,
             template: ephemeris_core::PageTemplate::Blank,
@@ -378,10 +384,15 @@ pub struct EphemerisUi {
     // ── Ink state (interior-mutable so the callbacks can borrow independently) ─
     /// The ink engine: tracks the active stroke builder.
     engine: RefCell<InkEngine>,
+    /// Whole-stroke eraser (active when tool is [`Tool::Eraser`]).
+    eraser: RefCell<EraserEngine>,
     /// Rasterized committed strokes layer for the *current page* (canvas-sized,
     /// 8 bpp).  Aliased from `pages.current_page().committed`; updated live as
     /// strokes are drawn, then saved back on navigation.
     committed_layer: RefCell<PixelBuf>,
+    /// Surviving vector strokes for the *current page* (mirrors
+    /// `pages.current_page().strokes`).
+    strokes: RefCell<Vec<Stroke>>,
     /// Points of the currently in-progress stroke (canvas-relative).
     in_progress: RefCell<Vec<Point>>,
     /// `base_width` of the in-progress stroke (copied from `InkConfig` at
@@ -393,6 +404,9 @@ pub struct EphemerisUi {
     pages: RefCell<PageBook>,
     /// Default [`InkConfig::base_width`], kept for constructing blank pages.
     default_base_width: f32,
+    /// Set when ink strokes were added/removed since last check (See-text
+    /// invalidation). Cleared by [`take_strokes_dirty`].
+    strokes_dirty: Cell<bool>,
     /// Ink damage rects (full-buffer coordinates) accumulated since the last
     /// present.  Drained by [`render_frame`].  This lets ink-only updates drive
     /// a present even when Slint's UI is otherwise clean (Slint's own
@@ -454,7 +468,11 @@ impl EphemerisUi {
                 pixel_count
             ]),
             engine: RefCell::new(InkEngine::new(ink_cfg.clone())),
+            eraser: RefCell::new(EraserEngine::new(EraserConfig {
+                radius: ink_cfg.base_width.max(10.0),
+            })),
             committed_layer: RefCell::new(PixelBuf::new(width, canvas_h)),
+            strokes: RefCell::new(Vec::new()),
             in_progress: RefCell::new(Vec::new()),
             in_progress_base_width: RefCell::new(default_base_width),
             pages: RefCell::new(PageBook::new(width, canvas_h, default_base_width)),
@@ -464,6 +482,7 @@ impl EphemerisUi {
             // The first frame paints a fresh screen — treat it as a screen
             // change so the initial present is a full/clear refresh.
             screen_change: Cell::new(true),
+            strokes_dirty: Cell::new(false),
         })
     }
 
@@ -547,6 +566,10 @@ impl EphemerisUi {
         let mut engine = self.engine.borrow_mut();
         engine.set_tool(tool);
         engine.set_base_width(base_width);
+        drop(engine);
+        if tool == Tool::Eraser {
+            *self.eraser.borrow_mut() = EraserEngine::new(EraserConfig { radius: base_width });
+        }
     }
 
     /// Switch between start page (task list) and canvas (ink) view.
@@ -567,6 +590,10 @@ impl EphemerisUi {
                     priority_label: slint::SharedString::from(priority_label.as_str()),
                     due_label: slint::SharedString::from(due_label.as_str()),
                     overdue: *overdue,
+                    show_profile: false,
+                    profile_icon_char: slint::SharedString::new(),
+                    has_custom_profile_icon: false,
+                    custom_profile_icon: slint::Image::default(),
                 },
             )
             .collect();
@@ -703,6 +730,7 @@ impl EphemerisUi {
             && !c.get_show_profile_switcher()
             && !c.get_show_create_profile_picker()
             && !c.get_task_dialog_visible()
+            && !c.get_event_dialog_visible()
             && !c.get_note_rename_visible()
             && !c.get_note_move_visible()
             && !c.get_notebook_rename_visible()
@@ -832,6 +860,10 @@ impl EphemerisUi {
                         due_label: slint::SharedString::from(due_label.as_str()),
                         overdue: *overdue,
                         done: *done,
+                        show_profile: false,
+                        profile_icon_char: slint::SharedString::new(),
+                        has_custom_profile_icon: false,
+                        custom_profile_icon: slint::Image::default(),
                     }
                 },
             )
@@ -1198,6 +1230,24 @@ impl EphemerisUi {
         self.component.on_settings_browse_vault(handler);
     }
 
+    /// Persist export-subdir / git options from the Obsidian vault setup modal.
+    pub fn on_connect_vault_setup_confirm<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_connect_vault_setup_confirm(handler);
+    }
+
+    pub fn set_connect_setup_export_subdir(&self, subdir: &str) {
+        self.component
+            .set_connect_setup_export_subdir(slint::SharedString::from(subdir));
+    }
+
+    pub fn set_connect_setup_git_enabled(&self, enabled: bool) {
+        self.component.set_connect_setup_git_enabled(enabled);
+    }
+
+    pub fn set_connect_setup_git_detected(&self, detected: bool) {
+        self.component.set_connect_setup_git_detected(detected);
+    }
+
     /// Register a closure called when "Browse .ics..." is tapped.
     pub fn on_settings_browse_ics<F: FnMut() + 'static>(&self, handler: F) {
         self.component.on_settings_browse_ics(handler);
@@ -1210,6 +1260,16 @@ impl EphemerisUi {
     {
         self.component
             .on_settings_add_url(move |url| handler(url.to_string()));
+    }
+
+    pub fn on_settings_add_caldav<F>(&self, mut handler: F)
+    where
+        F: FnMut(String, String, String) + 'static,
+    {
+        self.component
+            .on_settings_add_caldav(move |url, user, pass| {
+                handler(url.to_string(), user.to_string(), pass.to_string())
+            });
     }
 
     /// Register a closure called when an "×" button is tapped on a cal source.
@@ -1238,6 +1298,22 @@ impl EphemerisUi {
 
     pub fn on_settings_whisper_delete<F: FnMut() + 'static>(&self, handler: F) {
         self.component.on_settings_whisper_delete(handler);
+    }
+
+    pub fn set_htr_model_installed(&self, v: bool) {
+        self.component.set_htr_model_installed(v);
+    }
+
+    pub fn set_htr_downloading(&self, v: bool) {
+        self.component.set_htr_downloading(v);
+    }
+
+    pub fn on_settings_htr_download<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_settings_htr_download(handler);
+    }
+
+    pub fn on_settings_htr_delete<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_settings_htr_delete(handler);
     }
 
     pub fn on_settings_profile_add<F>(&self, mut handler: F)
@@ -1751,19 +1827,63 @@ impl EphemerisUi {
             .set_cal_month_days(std::rc::Rc::new(slint::VecModel::from(items)).into());
     }
 
-    /// Push calendar events: `(title, time_label, all_day, col)`.
-    pub fn set_cal_events(&self, events: &[(String, String, bool, i32)]) {
+    /// Push calendar events: `(title, time_label, all_day, col, item_kind, item_id)`.
+    pub fn set_cal_events(&self, events: &[(String, String, bool, i32, String, String)]) {
         let items: Vec<CalDayEvent> = events
             .iter()
-            .map(|(title, time_label, all_day, col)| CalDayEvent {
+            .map(|(title, time_label, all_day, col, kind, id)| CalDayEvent {
                 title: slint::SharedString::from(title.as_str()),
                 time_label: slint::SharedString::from(time_label.as_str()),
                 all_day: *all_day,
                 col: *col,
+                item_kind: slint::SharedString::from(kind.as_str()),
+                item_id: slint::SharedString::from(id.as_str()),
             })
             .collect();
         self.component
             .set_cal_events(std::rc::Rc::new(slint::VecModel::from(items)).into());
+    }
+
+    /// Open the new-event dialog with defaults.
+    pub fn open_event_dialog(
+        &self,
+        title: &str,
+        date: &str,
+        start: &str,
+        end: &str,
+        all_day: bool,
+    ) {
+        self.component
+            .set_event_dialog_title(slint::SharedString::from(title));
+        self.component
+            .set_event_dialog_date(slint::SharedString::from(date));
+        self.component
+            .set_event_dialog_start(slint::SharedString::from(start));
+        self.component
+            .set_event_dialog_end(slint::SharedString::from(end));
+        self.component.set_event_dialog_all_day(all_day);
+        self.component.set_event_dialog_visible(true);
+    }
+
+    pub fn close_event_dialog(&self) {
+        self.component.set_event_dialog_visible(false);
+    }
+
+    pub fn on_event_confirm_add<
+        F: FnMut(SharedString, SharedString, SharedString, SharedString, bool) + 'static,
+    >(
+        &self,
+        handler: F,
+    ) {
+        self.component.on_event_confirm_add(handler);
+    }
+
+    pub fn on_event_dialog_cancel<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_event_dialog_cancel(handler);
+    }
+
+    pub fn on_cal_item_tapped<F: FnMut(SharedString, SharedString) + 'static>(&self, handler: F) {
+        self.component.on_cal_item_tapped(handler);
     }
 
     /// Push week column labels (7 entries, e.g. "Mon\n21").
@@ -1893,6 +2013,104 @@ impl EphemerisUi {
         self.committed_layer.borrow().data.clone()
     }
 
+    /// Surviving vector strokes for the current page (pen/highlighter only).
+    pub fn get_page_strokes(&self) -> Vec<Stroke> {
+        self.strokes.borrow().clone()
+    }
+
+    /// Replace the current page's stroke list and rebuild the committed raster.
+    ///
+    /// Used when loading persisted strokes from disk. Does not clear
+    /// `strokes_dirty` — callers that load from disk should call
+    /// [`clear_strokes_dirty`] afterward if needed.
+    pub fn restore_page_strokes(&self, page_idx: usize, strokes: Vec<Stroke>) {
+        let canvas_h = self.canvas_height();
+        {
+            let mut book = self.pages.borrow_mut();
+            while book.pages.len() <= page_idx {
+                book.pages.push(PageState::blank(
+                    self.width,
+                    canvas_h,
+                    self.default_base_width,
+                ));
+            }
+            book.pages[page_idx].strokes = strokes;
+            let stroke_list = book.pages[page_idx].strokes.clone();
+            Self::rebuild_committed_from_strokes(
+                &mut book.pages[page_idx].committed,
+                &stroke_list,
+                self.width,
+                canvas_h,
+            );
+        }
+        if self.pages.borrow().current_index() == page_idx {
+            let book = self.pages.borrow();
+            let ps = book.current_page();
+            *self.committed_layer.borrow_mut() = ps.committed.clone();
+            *self.strokes.borrow_mut() = ps.strokes.clone();
+            drop(book);
+            self.screen_change.set(true);
+        }
+    }
+
+    /// True if strokes were added/removed since the last [`take_strokes_dirty`].
+    pub fn take_strokes_dirty(&self) -> bool {
+        self.strokes_dirty.replace(false)
+    }
+
+    /// Clear the strokes-dirty flag without reading it.
+    pub fn clear_strokes_dirty(&self) {
+        self.strokes_dirty.set(false);
+    }
+
+    fn rebuild_committed_from_strokes(
+        committed: &mut PixelBuf,
+        strokes: &[Stroke],
+        width: u32,
+        canvas_h: u32,
+    ) {
+        *committed = PixelBuf::new(width, canvas_h);
+        for stroke in strokes {
+            if stroke.tool == Tool::Eraser || stroke.points.len() < 2 {
+                continue;
+            }
+            raster::rasterize_stroke(committed, stroke, 0, 0, width, canvas_h);
+        }
+    }
+
+    fn remove_strokes_by_id(&self, ids: &[StrokeId]) -> bool {
+        if ids.is_empty() {
+            return false;
+        }
+        let before = self.strokes.borrow().len();
+        self.strokes
+            .borrow_mut()
+            .retain(|s| !ids.iter().any(|id| *id == s.id));
+        let removed = self.strokes.borrow().len() != before;
+        if removed {
+            let canvas_h = self.canvas_height();
+            let remaining = self.strokes.borrow().clone();
+            {
+                let mut committed = self.committed_layer.borrow_mut();
+                Self::rebuild_committed_from_strokes(
+                    &mut committed,
+                    &remaining,
+                    self.width,
+                    canvas_h,
+                );
+            }
+            {
+                let mut book = self.pages.borrow_mut();
+                let page = book.current_page_mut();
+                page.strokes = remaining;
+                page.committed = self.committed_layer.borrow().clone();
+            }
+            self.strokes_dirty.set(true);
+            self.screen_change.set(true);
+        }
+        removed
+    }
+
     /// Full UI / window size in logical pixels `(width, height)`.
     pub fn size(&self) -> (u32, u32) {
         (self.width, self.height)
@@ -1907,6 +2125,10 @@ impl EphemerisUi {
     ///
     /// If the target page is currently displayed, the live committed_layer is
     /// also updated and a screen-change repaint is triggered.
+    ///
+    /// Does not clear the stroke list — call [`restore_page_strokes`] when
+    /// vector ink is available, or leave strokes empty for legacy raster-only
+    /// pages (See-text falls back to OCR).
     pub fn restore_page_pixels(&self, page_idx: usize, data: Vec<u8>) {
         let canvas_h = self.canvas_height();
         let expected = (self.width * canvas_h) as usize;
@@ -2092,35 +2314,35 @@ impl EphemerisUi {
 
     // ── Ink input API ─────────────────────────────────────────────────────
 
-    /// Feed one input event into the owned [`InkEngine`] and update the ink
-    /// layers accordingly.
+    /// Feed one input event into the owned [`InkEngine`] (or [`EraserEngine`]
+    /// when the active tool is eraser) and update the ink layers accordingly.
     ///
-    /// * `PenDown` — starts a new in-progress stroke; clears the in-progress
-    ///   point buffer.
-    /// * `PenMove` — appends a point to the in-progress buffer (no layer write;
-    ///   the in-progress layer is re-rasterized on every [`render_frame`]).
-    /// * `PenUp` — finalises the stroke: merges the finished [`Stroke`] into
-    ///   the committed layer and clears the in-progress buffer.
+    /// * Pen/highlighter `PenUp` — appends the finished [`Stroke`] to the
+    ///   page stroke list and rasterizes it into the committed layer.
+    /// * Eraser — whole-stroke removal via [`EraserEngine`]; rebuilds the
+    ///   committed raster from surviving strokes (no `Tool::Eraser` strokes
+    ///   are stored).
     ///
-    /// Returns the raw [`InkUpdate`] from the engine so the caller can track
-    /// damage rects for partial refresh optimisation.
+    /// Returns the raw [`InkUpdate`] from the ink engine so the caller can
+    /// track damage rects. Eraser gestures return [`InkUpdate::Idle`] (damage
+    /// is still queued via [`push_ink_damage`]).
     ///
     /// `x` and `y` on the `PenSample` must be **canvas-relative** logical
     /// pixels (i.e. the coordinate system reported by the `.slint`
     /// `canvas-touch` callback).
     pub fn feed_input(&self, event: &InputEvent, t_ms: u32) -> InkUpdate {
+        if self.engine.borrow().config().tool == Tool::Eraser {
+            return self.feed_eraser(event);
+        }
+
         let update = self.engine.borrow_mut().update(event, t_ms);
 
         match &update {
             InkUpdate::Started => {
-                // New stroke: snapshot current base_width from the engine's
-                // config.  We borrow the engine briefly to read config, then
-                // release before touching other RefCells.
                 let bw = self.engine.borrow().config().base_width;
                 *self.in_progress_base_width.borrow_mut() = bw;
                 self.in_progress.borrow_mut().clear();
 
-                // Record the PenDown anchor point from the event.
                 if let InputEvent::PenDown(s) = event {
                     self.in_progress.borrow_mut().push(Point {
                         x: s.x,
@@ -2129,8 +2351,6 @@ impl EphemerisUi {
                         tilt: s.tilt,
                         t_ms: 0,
                     });
-                    // The anchor dot is stamped on the next render; report a
-                    // small damage rect around it so the frame is presented.
                     let pad = bw + 1.0;
                     self.push_ink_damage(
                         ephemeris_core::geom::Rect::new(s.x, s.y, s.x, s.y).inflate(pad),
@@ -2138,7 +2358,6 @@ impl EphemerisUi {
                 }
             }
             InkUpdate::Extended { damage } => {
-                // Append the new sample to the in-progress buffer.
                 if let InputEvent::PenMove(s) = event {
                     self.in_progress.borrow_mut().push(Point {
                         x: s.x,
@@ -2151,17 +2370,24 @@ impl EphemerisUi {
                 self.push_ink_damage(*damage);
             }
             InkUpdate::Finished { stroke, damage } => {
-                // Commit the completed stroke to the permanent layer.
                 let canvas_h = self.canvas_height();
-                raster::rasterize_stroke(
-                    &mut self.committed_layer.borrow_mut(),
-                    stroke,
-                    0, // canvas X offset in the layer is always 0
-                    0, // layer Y=0 corresponds to canvas top (buf Y = STATUS_BAR_H)
-                    self.width,
-                    canvas_h,
-                );
-                // Clear the in-progress buffer.
+                // Never store eraser strokes — eraser is handled above.
+                if stroke.tool != Tool::Eraser && stroke.points.len() >= 2 {
+                    raster::rasterize_stroke(
+                        &mut self.committed_layer.borrow_mut(),
+                        stroke,
+                        0,
+                        0,
+                        self.width,
+                        canvas_h,
+                    );
+                    self.strokes.borrow_mut().push((**stroke).clone());
+                    self.pages.borrow_mut().current_page_mut().strokes =
+                        self.strokes.borrow().clone();
+                    self.pages.borrow_mut().current_page_mut().committed =
+                        self.committed_layer.borrow().clone();
+                    self.strokes_dirty.set(true);
+                }
                 self.in_progress.borrow_mut().clear();
                 self.push_ink_damage(*damage);
             }
@@ -2169,6 +2395,32 @@ impl EphemerisUi {
         }
 
         update
+    }
+
+    fn feed_eraser(&self, event: &InputEvent) -> InkUpdate {
+        let strokes_snapshot = self.strokes.borrow().clone();
+        let update = self.eraser.borrow_mut().update(event, &strokes_snapshot);
+        match update {
+            EraserUpdate::Started => {
+                self.in_progress.borrow_mut().clear();
+                if let InputEvent::PenDown(s) = event {
+                    let r = 10.0;
+                    self.push_ink_damage(
+                        ephemeris_core::geom::Rect::new(s.x, s.y, s.x, s.y).inflate(r),
+                    );
+                }
+            }
+            EraserUpdate::Hit { ids, damage } | EraserUpdate::Finished { ids, damage } => {
+                if self.remove_strokes_by_id(&ids) {
+                    self.push_ink_damage(damage);
+                }
+                if matches!(event, InputEvent::PenUp(_)) {
+                    self.in_progress.borrow_mut().clear();
+                }
+            }
+            EraserUpdate::Idle => {}
+        }
+        InkUpdate::Idle
     }
 
     /// Push externally-rasterized canvas pixels into the committed ink layer,
@@ -2219,15 +2471,18 @@ impl EphemerisUi {
         let canvas_h = self.canvas_height();
         let blank = PixelBuf::new(self.width, canvas_h);
         *self.committed_layer.borrow_mut() = blank.clone();
+        self.strokes.borrow_mut().clear();
         self.in_progress.borrow_mut().clear();
 
         // Persist the cleared state into the page roster.
-        self.pages.borrow_mut().current_page_mut().committed = blank;
-        self.pages
-            .borrow_mut()
-            .current_page_mut()
-            .in_progress
-            .clear();
+        {
+            let mut book = self.pages.borrow_mut();
+            let page = book.current_page_mut();
+            page.committed = blank;
+            page.strokes.clear();
+            page.in_progress.clear();
+        }
+        self.strokes_dirty.set(true);
 
         // The whole canvas went white; mark it dirty so the clear is presented.
         self.ink_damage
@@ -2502,13 +2757,14 @@ impl EphemerisUi {
 
     /// Capture the current live ink state into a [`PageState`] snapshot.
     ///
-    /// Clones `committed_layer`, `in_progress`, `in_progress_base_width`, and template.
+    /// Clones committed raster, stroke list, in-progress points, and template.
     fn snapshot_live_state(&self, _canvas_h: u32) -> PageState {
         let book = self.pages.borrow();
         let current_template = book.current_page().template;
         drop(book);
         PageState {
             committed: self.committed_layer.borrow().clone(),
+            strokes: self.strokes.borrow().clone(),
             in_progress: self.in_progress.borrow().clone(),
             in_progress_base_width: *self.in_progress_base_width.borrow(),
             template: current_template,
@@ -2521,11 +2777,12 @@ impl EphemerisUi {
     /// Must be called *after* `PageBook::navigate_to` or `push_blank_page` so
     /// that `book.current_index()` already reflects the target.
     fn load_page_state(&self, _page_index: usize) {
-        let (new_committed, new_ip, new_bw, new_cur, new_count) = {
+        let (new_committed, new_strokes, new_ip, new_bw, new_cur, new_count) = {
             let book = self.pages.borrow();
             let ps = book.current_page();
             (
                 ps.committed.clone(),
+                ps.strokes.clone(),
                 ps.in_progress.clone(),
                 ps.in_progress_base_width,
                 book.current_index(),
@@ -2535,6 +2792,7 @@ impl EphemerisUi {
 
         // Restore ink layers.
         *self.committed_layer.borrow_mut() = new_committed;
+        *self.strokes.borrow_mut() = new_strokes;
         *self.in_progress.borrow_mut() = new_ip;
         *self.in_progress_base_width.borrow_mut() = new_bw;
 
@@ -2543,6 +2801,7 @@ impl EphemerisUi {
             base_width: new_bw,
             ..InkConfig::default()
         });
+        *self.eraser.borrow_mut() = EraserEngine::new(EraserConfig::default());
 
         // Update the Slint status bar (1-based display index).
         self.component.set_page_index((new_cur + 1) as i32);
@@ -2608,6 +2867,14 @@ impl EphemerisUi {
     {
         self.component
             .on_rec_play_tapped(move |id| handler(id.to_string()));
+    }
+
+    pub fn on_rec_open_tapped<F>(&self, mut handler: F)
+    where
+        F: FnMut(String) + 'static,
+    {
+        self.component
+            .on_rec_open_tapped(move |id| handler(id.to_string()));
     }
 
     pub fn on_rec_transcribe_tapped<F>(&self, mut handler: F)
@@ -3088,6 +3355,33 @@ mod tests {
         assert!(
             ui.in_progress.borrow().is_empty(),
             "in-progress must be empty after clear"
+        );
+        assert!(
+            ui.get_page_strokes().is_empty(),
+            "stroke list must be empty after clear"
+        );
+    }
+
+    /// Finished pen strokes are kept in the page stroke list; eraser removes them.
+    #[test]
+    fn stroke_list_survives_commit_and_eraser_removes() {
+        let ui = EphemerisUi::new(800, 600).expect("UI construction failed");
+        ui.set_tool(Tool::Pen);
+        ui.feed_input(&InputEvent::PenDown(pen_sample(20.0, 40.0)), 0);
+        ui.feed_input(&InputEvent::PenMove(pen_sample(80.0, 40.0)), 5);
+        ui.feed_input(&InputEvent::PenUp(pen_sample(120.0, 40.0)), 10);
+        assert_eq!(ui.get_page_strokes().len(), 1);
+
+        ui.set_tool(Tool::Eraser);
+        ui.feed_input(&InputEvent::PenDown(pen_sample(60.0, 40.0)), 20);
+        ui.feed_input(&InputEvent::PenUp(pen_sample(60.0, 40.0)), 25);
+        assert!(
+            ui.get_page_strokes().is_empty(),
+            "whole-stroke eraser must remove hit strokes"
+        );
+        assert!(
+            ui.committed_layer.borrow().data.iter().all(|&v| v == 255),
+            "raster must rebuild empty after erase"
         );
     }
 

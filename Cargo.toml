@@ -61,3 +61,7 @@ evdev = "0.13"
 
 # HTTP client (opt-in; used by the `ics` feature for HTTPS feed fetch)
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+
+# Online stroke HTR (optional; ephemeris-core `htr` feature)
+rten = "0.27"
+rten-tensor = "0.27"

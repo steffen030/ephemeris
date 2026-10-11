@@ -27,7 +27,7 @@ Treat these as roadmap, not product claims:
 
 - Polished day-to-day UX on-device (refresh strategy, palm rejection, menus)
 - Broad calendar / task provider support (CalDAV, Todoist, etc. are incomplete or absent)
-- High-accuracy cursive handwriting HWR (v1 uses Tesseract print OCR; apt installs `tesseract-ocr`)
+- High-accuracy cursive handwriting HWR (See-text: local stroke HTR when model installed, else Tesseract; apt installs `tesseract-ocr`)
 - Multi-arch desktop packages (only `arm64` Linux debs are released)
 - Stable sync story for WebDAV / cloud drives
 

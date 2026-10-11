@@ -130,10 +130,18 @@ sudo apt install ephemeris
 ```
 
 The package pulls in **Tesseract** (`tesseract-ocr`, `tesseract-ocr-eng`) for
-handwriting See-text / searchable PDF export, and **bundles `whisper-cli`**
-(plus its shared libraries under `/usr/lib/ephemeris/whisper/`) because
-`whisper.cpp` is not in Debian trixie yet. Voice transcription still needs a
-model: open Settings → Transcription → Download after install.
+handwriting See-text / searchable PDF export (OCR cascade fallback), and
+**bundles `whisper-cli`** (plus its shared libraries under
+`/usr/lib/ephemeris/whisper/`) because `whisper.cpp` is not in Debian trixie
+yet. Voice transcription still needs a model: open Settings → Transcription →
+Download after install.
+
+**Stroke HTR** (preferred See-text path) is not shipped inside the `.deb`.
+Build/export a Carbune/OnlineHTR ONNX with `scripts/export-htr-model.sh`, upload
+`ephemeris-htr-v1.zip` as a GitHub Release asset under tag `htr-model-v1`, then
+users install via Settings → Handwriting → Download (or copy `model.onnx` +
+`charset.txt` into `~/.local/share/ephemeris/htr/`). Without the model, See-text
+falls back to Tesseract.
 
 Upgrades after later releases:
 

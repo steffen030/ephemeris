@@ -24,6 +24,9 @@ pub struct MarkdownTaskExtractor {
     profile_id: ProfileId,
     /// Vault-relative path where [`TaskProvider::create`] appends new tasks.
     inbox_rel: PathBuf,
+    /// When set, notebook export folders under this subdir are not walked for
+    /// tasks; the inbox file is still read even if it lives under the subdir.
+    exclude_export_subdir: Option<PathBuf>,
 }
 
 impl MarkdownTaskExtractor {
@@ -40,7 +43,14 @@ impl MarkdownTaskExtractor {
             vault_path: vault_path.into(),
             profile_id,
             inbox_rel: inbox_rel.into(),
+            exclude_export_subdir: None,
         }
+    }
+
+    /// Skip exported note folders under `subdir` when listing tasks.
+    pub fn with_exclude_export_subdir(mut self, subdir: impl Into<PathBuf>) -> Self {
+        self.exclude_export_subdir = Some(subdir.into());
+        self
     }
 
     /// Extract tasks from a single markdown file (vault-relative or absolute).
@@ -252,14 +262,30 @@ impl MarkdownTaskExtractor {
             return Ok(());
         }
 
+        // Inside the export tree: only read the configured inbox; skip note mirrors.
+        if let Some(ref ex) = self.exclude_export_subdir {
+            if crate::path_under_export_subdir(&self.vault_path, dir, ex) {
+                let inbox_abs = self.vault_path.join(&self.inbox_rel);
+                if inbox_abs.is_file()
+                    && crate::path_under_export_subdir(&self.vault_path, &inbox_abs, ex)
+                {
+                    if let Ok(file_tasks) = self.extract_from_file(&inbox_abs) {
+                        tasks.extend(file_tasks);
+                    }
+                }
+                return Ok(());
+            }
+        }
+
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
 
             if path.is_dir() {
-                if !is_hidden(&path) {
-                    self.collect_tasks_recursive(&path, tasks)?;
+                if is_hidden(&path) {
+                    continue;
                 }
+                self.collect_tasks_recursive(&path, tasks)?;
             } else if path.extension().map(|e| e == "md").unwrap_or(false) {
                 if let Ok(file_tasks) = self.extract_from_file(&path) {
                     tasks.extend(file_tasks);

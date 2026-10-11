@@ -106,6 +106,10 @@ export struct CalDayEvent {
     time-label: string,  // pre-formatted "09:30–10:00" or "All day"
     all-day: bool,
     col: int,            // 0–6 (day-of-week) for week view
+    /// "event" | "note" | "recording"
+    item-kind: string,
+    /// Opaque id for note/recording navigation (empty for plain events).
+    item-id: string,
 }
 
 /// One month summary for the year view.
@@ -123,6 +127,11 @@ export struct TaskEntry {
     priority-label: string,
     due-label: string,
     overdue: bool,
+    /// Show owning-profile badge (All aggregator view).
+    show-profile: bool,
+    profile-icon-char: string,
+    has-custom-profile-icon: bool,
+    custom-profile-icon: image,
 }
 
 /// A rendered markdown block for the vault note viewer.
@@ -147,6 +156,11 @@ export struct TaskViewEntry {
     due-label: string,
     overdue: bool,
     done: bool,
+    /// Show owning-profile badge (All aggregator view).
+    show-profile: bool,
+    profile-icon-char: string,
+    has-custom-profile-icon: bool,
+    custom-profile-icon: image,
 }
 
 /// A filesystem entry for the settings file browser.
@@ -170,6 +184,13 @@ export struct RecordingEntry {
     duration-label: string,
     date-label: string,
     has-transcription: bool,
+    /// True while whisper is queued or running for this recording.
+    is-transcribing: bool,
+    /// Show owning-profile badge (All aggregator view).
+    show-profile: bool,
+    profile-icon-char: string,
+    has-custom-profile-icon: bool,
+    custom-profile-icon: image,
 }
 
 /// A note entry in the note browser list / gallery.
@@ -334,6 +355,16 @@ export component EphemerisPage inherits Window {
     callback task-profile-filter-changed(string);
     callback task-search-changed(string);
 
+    // ── Event create dialog (action ring / quick add) ─────────────────────
+    in-out property <bool> event-dialog-visible: false;
+    in-out property <string> event-dialog-title: "";
+    in-out property <string> event-dialog-date: "";   // YYYY-MM-DD
+    in-out property <string> event-dialog-start: "09:00";
+    in-out property <string> event-dialog-end: "10:00";
+    in-out property <bool> event-dialog-all-day: false;
+    callback event-confirm-add(string, string, string, string, bool); // title, date, start, end, all-day
+    callback event-dialog-cancel();
+
     // ── Action ring ──────────────────────────────────────────────────────
     in property <bool> ring-visible: false;
     in property <float> ring-cx: 400;
@@ -414,13 +445,20 @@ export component EphemerisPage inherits Window {
     callback settings-browse-vault();
     callback settings-browse-ics();
     callback settings-add-url(string);
+    /// CalDAV: server URL, username, password.
+    callback settings-add-caldav(string, string, string);
     callback settings-remove-source(int);
     callback settings-whisper-download();
     callback settings-whisper-delete();
+    callback settings-htr-download();
+    callback settings-htr-delete();
 
     in property <bool> whisper-model-installed: false;
     in property <bool> whisper-downloading: false;
     in-out property <string> whisper-lang: "auto";
+
+    in property <bool> htr-model-installed: false;
+    in property <bool> htr-downloading: false;
 
     // ── File browser ─────────────────────────────────────────────────────
     // 0 = vault folder, 1 = ICS file, 2 = profile icon image
@@ -527,6 +565,7 @@ export component EphemerisPage inherits Window {
     in-out property <bool> rec-transcription-visible: false;
     in-out property <string> rec-transcription-text: "";
     in-out property <string> rec-active-id: "";
+    in-out property <string> rec-active-title: "";
 
     callback nav-rec-tapped();
     callback rec-new-tapped();
@@ -535,6 +574,9 @@ export component EphemerisPage inherits Window {
     callback rec-stop-tapped();
     callback rec-discard-tapped();
     callback rec-play-tapped(string);
+    /// Open recording detail (transcript + play). Primary row action.
+    callback rec-open-tapped(string);
+    /// Kept for compatibility; same as open (does not force a new whisper job).
     callback rec-transcribe-tapped(string);
     callback rec-delete-tapped(string);
     callback rec-rename-confirm(string, string);
@@ -561,6 +603,8 @@ export component EphemerisPage inherits Window {
     callback cal-next();
     callback cal-today();
     callback cal-day-tapped(int, int, int);   // year, month, day
+    /// kind = "note" | "recording" (calendar events are not navigable yet)
+    callback cal-item-tapped(string, string);
 
     // ── Calendar day-note link ────────────────────────────────────────────
     in property <bool> cal-day-note-exists: false;
@@ -640,14 +684,23 @@ export component EphemerisPage inherits Window {
     in property <int> connect-calendar-count: 0;
     in property <[ConnectionEntry]> connection-list: [];
 
-    // Setup modal: "vault" | "calendar"
+    // Setup modal: "vault" | "calendar" | "vault-git"
     in-out property <bool> connect-setup-visible: false;
     in-out property <string> connect-setup-kind: "";
     in-out property <string> connect-setup-url: "";
+    in-out property <string> connect-setup-user: "";
+    in-out property <string> connect-setup-pass: "";
+    /// Vault-relative folder for local PDF/MD note exports (default Ephemeris).
+    in-out property <string> connect-setup-export-subdir: "Ephemeris";
+    /// Offer / enable background git pull + autocommit/push for the vault.
+    in-out property <bool> connect-setup-git-enabled: false;
+    in-out property <bool> connect-setup-git-detected: false;
     // Coming-soon info modal
     in-out property <bool> connect-soon-visible: false;
     in-out property <string> connect-soon-title: "";
     in-out property <string> connect-soon-body: "";
+    /// Confirm vault setup options (export path / git) after browsing.
+    callback connect-vault-setup-confirm();
 
     callback connect-profile-changed(string);  // selected profile for Connect tab
     callback connection-add(string, string, string, bool);        // kind, display, value, allow_agg
@@ -829,6 +882,18 @@ export component EphemerisPage inherits Window {
                             TouchArea {
                                 width: parent.width; height: parent.height;
                                 clicked => { root.task-complete-toggled(item.id); }
+                            }
+                        }
+
+                        if item.show-profile: Rectangle {
+                            width: 22px; height: 26px;
+                            y: 15px;
+                            background: transparent;
+                            ProfileIcon {
+                                icon-char: item.profile-icon-char;
+                                has-custom: item.has-custom-profile-icon;
+                                custom-icon: item.custom-profile-icon;
+                                size: 18px; fg: EinkTheme.btn-fg;
                             }
                         }
 
@@ -1268,7 +1333,7 @@ export component EphemerisPage inherits Window {
                     spacing: 0px;
                     width: root.width - root.nav-w;
 
-                    // check | prio chip | wrapping title | due | edit
+                    // check | profile | prio chip | wrapping title | due | edit
                     for item[i] in root.full-task-list: Rectangle {
                         height: 64px;
                         width: root.width - root.nav-w;
@@ -1276,12 +1341,14 @@ export component EphemerisPage inherits Window {
 
                         property <length> pad: 12px;
                         property <length> check-w: 26px;
+                        property <length> profile-w: item.show-profile ? 22px : 0px;
                         property <length> prio-w: 28px;
                         property <length> due-w: 56px;
                         property <length> edit-w: 32px;
                         property <length> gap: 8px;
                         property <length> x-check: self.pad;
-                        property <length> x-prio: self.pad + self.check-w + self.gap;
+                        property <length> x-profile: self.pad + self.check-w + self.gap;
+                        property <length> x-prio: self.x-profile + self.profile-w + (item.show-profile ? self.gap : 0px);
                         property <length> x-title: self.x-prio + self.prio-w + self.gap;
                         property <length> x-edit: self.width - self.pad - self.edit-w;
                         property <length> x-due: self.x-edit - self.gap - self.due-w;
@@ -1302,6 +1369,18 @@ export component EphemerisPage inherits Window {
                                 width: parent.width; height: parent.height;
                             }
                             TouchArea { clicked => { root.task-complete-toggled(item.id); } }
+                        }
+
+                        if item.show-profile: Rectangle {
+                            x: x-profile; y: 20px;
+                            width: 22px; height: 22px;
+                            background: transparent;
+                            ProfileIcon {
+                                icon-char: item.profile-icon-char;
+                                has-custom: item.has-custom-profile-icon;
+                                custom-icon: item.custom-profile-icon;
+                                size: 18px; fg: EinkTheme.btn-fg;
+                            }
                         }
 
                         Rectangle {
@@ -1385,8 +1464,13 @@ export component EphemerisPage inherits Window {
         background: EinkTheme.canvas-bg;
         clip: true;
 
-        property <length> gallery-col-w: (self.width - 24px) / 2;
-        property <length> gallery-row-h: 180px;
+        // 3-up on PineNote portrait; preview pane matches note frame (~3∶4).
+        property <int> gallery-cols: 3;
+        property <length> gallery-gap: 8px;
+        property <length> gallery-col-w: (self.width - gallery-gap * (gallery-cols + 1)) / gallery-cols;
+        property <length> gallery-preview-h: gallery-col-w * 4 / 3;
+        property <length> gallery-caption-h: 40px;
+        property <length> gallery-row-h: gallery-preview-h + gallery-caption-h + gallery-gap;
 
         VerticalLayout {
             padding: 0px; spacing: 0px;
@@ -1816,15 +1900,22 @@ export component EphemerisPage inherits Window {
                     // ── Notes: gallery view ───────────────────────────────
                     if root.notes-view-mode == "gallery": Rectangle {
                         width: notebook-list-view.width;
-                        height: ((root.note-list.length + 1) / 2) * notebook-list-view.gallery-row-h
+                        height: ((root.note-list.length + notebook-list-view.gallery-cols - 1)
+                                / notebook-list-view.gallery-cols)
+                            * notebook-list-view.gallery-row-h
                             + (root.note-list.length == 0 ? 80px : 8px);
                         background: EinkTheme.canvas-bg;
 
                         for note[i] in root.note-list: Rectangle {
-                            x: 8px + Math.mod(i, 2) * (notebook-list-view.gallery-col-w + 8px);
-                            y: 8px + Math.floor(i / 2) * notebook-list-view.gallery-row-h;
+                            x: notebook-list-view.gallery-gap
+                                + Math.mod(i, notebook-list-view.gallery-cols)
+                                    * (notebook-list-view.gallery-col-w + notebook-list-view.gallery-gap);
+                            y: notebook-list-view.gallery-gap
+                                + Math.floor(i / notebook-list-view.gallery-cols)
+                                    * notebook-list-view.gallery-row-h;
                             width: notebook-list-view.gallery-col-w;
-                            height: notebook-list-view.gallery-row-h - 8px;
+                            height: notebook-list-view.gallery-preview-h
+                                + notebook-list-view.gallery-caption-h;
                             background: EinkTheme.canvas-bg;
                             border-radius: 6px;
                             border-width: 2px;
@@ -1835,14 +1926,14 @@ export component EphemerisPage inherits Window {
                                 padding: 0px; spacing: 0px;
 
                                 Rectangle {
-                                    height: parent.height - 64px;
+                                    height: notebook-list-view.gallery-preview-h;
                                     background: EinkTheme.btn-bg;
                                     clip: true;
                                     Image {
                                         visible: note.has-preview;
                                         source: note.preview;
                                         width: parent.width; height: parent.height;
-                                        image-fit: cover;
+                                        image-fit: contain;
                                     }
                                     Text {
                                         visible: !note.has-preview;
@@ -1871,33 +1962,33 @@ export component EphemerisPage inherits Window {
                                 }
 
                                 Rectangle {
-                                    height: 32px;
+                                    height: notebook-list-view.gallery-caption-h;
                                     background: EinkTheme.canvas-bg;
                                     HorizontalLayout {
-                                        padding-left: 8px; padding-right: 4px;
+                                        padding-left: 6px; padding-right: 2px;
                                         spacing: 2px;
                                         VerticalLayout {
                                             horizontal-stretch: 1;
                                             spacing: 0px; alignment: center;
                                             Text {
                                                 text: note.title;
-                                                font-size: 12px; font-weight: 600;
+                                                font-size: 11px; font-weight: 600;
                                                 color: EinkTheme.btn-fg;
                                                 overflow: elide;
                                             }
                                             Text {
                                                 text: note.date-label;
-                                                font-size: 10px; color: EinkTheme.text-secondary;
+                                                font-size: 9px; color: EinkTheme.text-secondary;
                                                 overflow: elide;
                                             }
                                         }
                                         Rectangle {
-                                            width: 32px; height: 28px;
+                                            width: 28px; height: 28px;
                                             background: transparent;
                                             Text {
                                                 text: Icons.rename;
                                                 font-family: "Material Icons";
-                                                font-size: 18px; color: EinkTheme.btn-fg;
+                                                font-size: 16px; color: EinkTheme.btn-fg;
                                                 horizontal-alignment: center; vertical-alignment: center;
                                                 width: parent.width; height: parent.height;
                                             }
@@ -1911,12 +2002,12 @@ export component EphemerisPage inherits Window {
                                             }
                                         }
                                         Rectangle {
-                                            width: 32px; height: 28px;
+                                            width: 28px; height: 28px;
                                             background: transparent;
                                             Text {
                                                 text: Icons.delete;
                                                 font-family: "Material Icons";
-                                                font-size: 18px; color: EinkTheme.btn-fg;
+                                                font-size: 16px; color: EinkTheme.btn-fg;
                                                 horizontal-alignment: center; vertical-alignment: center;
                                                 width: parent.width; height: parent.height;
                                             }
@@ -2002,7 +2093,7 @@ export component EphemerisPage inherits Window {
             Rectangle { height: 2px; background: EinkTheme.chrome-border; }
 
             for rec[i] in root.recording-list: Rectangle {
-                height: 60px;
+                height: 64px;
                 background: EinkTheme.canvas-bg;
 
                 HorizontalLayout {
@@ -2010,6 +2101,18 @@ export component EphemerisPage inherits Window {
                     padding-top: 8px; padding-bottom: 8px;
                     spacing: 4px;
 
+                    if rec.show-profile: Rectangle {
+                        width: 22px; height: parent.height;
+                        background: transparent;
+                        ProfileIcon {
+                            icon-char: rec.profile-icon-char;
+                            has-custom: rec.has-custom-profile-icon;
+                            custom-icon: rec.custom-profile-icon;
+                            size: 18px; fg: EinkTheme.btn-fg;
+                        }
+                    }
+
+                    // Primary: open detail (transcript + play).
                     Rectangle {
                         horizontal-stretch: 1;
                         background: transparent;
@@ -2021,7 +2124,7 @@ export component EphemerisPage inherits Window {
                                 overflow: elide;
                             }
                             HorizontalLayout {
-                                spacing: 8px;
+                                spacing: 10px;
                                 Text {
                                     text: rec.duration-label;
                                     font-size: 11px; color: EinkTheme.text-secondary;
@@ -2030,57 +2133,21 @@ export component EphemerisPage inherits Window {
                                     text: rec.date-label;
                                     font-size: 11px; color: EinkTheme.text-secondary;
                                 }
+                                if rec.is-transcribing: Text {
+                                    text: "Transcribing…";
+                                    font-size: 11px; color: EinkTheme.btn-fg;
+                                }
+                                if !rec.is-transcribing && rec.has-transcription: Text {
+                                    text: "Transcribed";
+                                    font-size: 11px; color: EinkTheme.text-secondary;
+                                }
                             }
                         }
+                        TouchArea { clicked => { root.rec-open-tapped(rec.id); } }
                     }
 
                     Rectangle {
-                        width: 36px; height: parent.height;
-                        background: transparent;
-                        Text {
-                            text: Icons.play;
-                            font-family: "Material Icons"; font-size: 22px;
-                            color: EinkTheme.btn-fg;
-                            horizontal-alignment: center; vertical-alignment: center;
-                            width: parent.width; height: parent.height;
-                        }
-                        TouchArea { clicked => { root.rec-play-tapped(rec.id); } }
-                    }
-
-                    Rectangle {
-                        width: 36px; height: parent.height;
-                        background: transparent;
-                        Text {
-                            text: rec.has-transcription ? Icons.done : Icons.edit;
-                            font-family: "Material Icons"; font-size: 20px;
-                            color: rec.has-transcription ? EinkTheme.btn-fg : EinkTheme.text-secondary;
-                            horizontal-alignment: center; vertical-alignment: center;
-                            width: parent.width; height: parent.height;
-                        }
-                        TouchArea { clicked => { root.rec-transcribe-tapped(rec.id); } }
-                    }
-
-                    Rectangle {
-                        width: 36px; height: parent.height;
-                        background: transparent;
-                        Text {
-                            text: Icons.rename;
-                            font-family: "Material Icons"; font-size: 20px;
-                            color: EinkTheme.text-secondary;
-                            horizontal-alignment: center; vertical-alignment: center;
-                            width: parent.width; height: parent.height;
-                        }
-                        TouchArea {
-                            clicked => {
-                                root.rec-rename-id = rec.id;
-                                root.rec-rename-title = rec.title;
-                                root.rec-rename-visible = true;
-                            }
-                        }
-                    }
-
-                    Rectangle {
-                        width: 36px; height: parent.height;
+                        width: 40px; height: parent.height;
                         background: transparent;
                         Text {
                             text: Icons.delete;
@@ -2357,12 +2424,32 @@ export component EphemerisPage inherits Window {
                                     width: 1px; background: EinkTheme.chrome-border;
                                     vertical-stretch: 1;
                                 }
+                                if event.item-kind == "note": Text {
+                                    text: Icons.notes;
+                                    font-family: "Material Icons";
+                                    font-size: 18px; color: EinkTheme.btn-fg;
+                                    vertical-alignment: center;
+                                    width: 22px;
+                                }
+                                if event.item-kind == "recording": Text {
+                                    text: Icons.mic;
+                                    font-family: "Material Icons";
+                                    font-size: 18px; color: EinkTheme.btn-fg;
+                                    vertical-alignment: center;
+                                    width: 22px;
+                                }
                                 Text {
                                     text: event.title;
                                     font-size: 14px; color: EinkTheme.btn-fg;
                                     vertical-alignment: center;
                                     overflow: elide;
                                     horizontal-stretch: 1;
+                                }
+                            }
+                            TouchArea {
+                                visible: event.item-kind == "note" || event.item-kind == "recording";
+                                clicked => {
+                                    root.cal-item-tapped(event.item-kind, event.item-id);
                                 }
                             }
                         }
@@ -2409,12 +2496,32 @@ export component EphemerisPage inherits Window {
                                         vertical-alignment: center;
                                         width: 72px;
                                     }
+                                    if event.item-kind == "note": Text {
+                                        text: Icons.notes;
+                                        font-family: "Material Icons";
+                                        font-size: 14px; color: EinkTheme.btn-fg;
+                                        vertical-alignment: center;
+                                        width: 18px;
+                                    }
+                                    if event.item-kind == "recording": Text {
+                                        text: Icons.mic;
+                                        font-family: "Material Icons";
+                                        font-size: 14px; color: EinkTheme.btn-fg;
+                                        vertical-alignment: center;
+                                        width: 18px;
+                                    }
                                     Text {
                                         text: event.title;
                                         font-size: 12px; color: EinkTheme.btn-fg;
                                         vertical-alignment: center;
                                         overflow: elide;
                                         horizontal-stretch: 1;
+                                    }
+                                }
+                                TouchArea {
+                                    visible: event.item-kind == "note" || event.item-kind == "recording";
+                                    clicked => {
+                                        root.cal-item-tapped(event.item-kind, event.item-id);
                                     }
                                 }
                             }
@@ -3855,6 +3962,62 @@ export component EphemerisPage inherits Window {
                                 Rectangle { horizontal-stretch: 1; }
                             }
                         }
+
+                        Rectangle {
+                            height: 36px;
+                            background: EinkTheme.canvas-bg;
+                            HorizontalLayout {
+                                padding-left: 16px; padding-top: 4px; padding-bottom: 4px;
+                                Text {
+                                    text: "Handwriting";
+                                    font-size: 14px; font-weight: 700; color: EinkTheme.btn-fg;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+
+                        Rectangle {
+                            height: 48px;
+                            background: EinkTheme.canvas-bg;
+                            HorizontalLayout {
+                                padding-left: 16px; padding-right: 16px;
+                                padding-top: 6px; padding-bottom: 6px;
+                                spacing: 8px;
+
+                                Text {
+                                    text: "HTR model";
+                                    font-size: 14px; color: EinkTheme.btn-fg;
+                                    vertical-alignment: center; width: 110px;
+                                }
+
+                                Text {
+                                    text: root.htr-downloading ? "Downloading…"
+                                        : root.htr-model-installed ? "Installed (stroke HTR)"
+                                        : "Not installed (OCR fallback)";
+                                    font-size: 12px;
+                                    color: root.htr-model-installed ? EinkTheme.btn-fg : EinkTheme.text-secondary;
+                                    vertical-alignment: center; horizontal-stretch: 1;
+                                }
+
+                                if !root.htr-downloading && !root.htr-model-installed: Rectangle {
+                                    width: 84px; height: 32px;
+                                    background: EinkTheme.btn-bg;
+                                    border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                                    Text { text: "Download"; font-size: 12px; color: EinkTheme.btn-fg;
+                                           horizontal-alignment: center; vertical-alignment: center; }
+                                    TouchArea { clicked => { root.settings-htr-download(); } }
+                                }
+
+                                if !root.htr-downloading && root.htr-model-installed: Rectangle {
+                                    width: 60px; height: 32px;
+                                    background: EinkTheme.btn-bg;
+                                    border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                                    Text { text: "Delete"; font-size: 12px; color: EinkTheme.danger-fg;
+                                           horizontal-alignment: center; vertical-alignment: center; }
+                                    TouchArea { clicked => { root.settings-htr-delete(); } }
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -4206,12 +4369,15 @@ export component EphemerisPage inherits Window {
                                                     font-size: 11px; color: EinkTheme.text-secondary;
                                                 }
                                             }
-                                            if !root.connect-has-vault: Rectangle {
-                                                width: 72px; height: 32px;
+                                            Rectangle {
+                                                width: 88px; height: 32px;
                                                 background: EinkTheme.btn-active-bg;
                                                 border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
-                                                Text { text: "Set up"; font-size: 12px; color: EinkTheme.btn-active-fg;
-                                                       horizontal-alignment: center; vertical-alignment: center; }
+                                                Text {
+                                                    text: root.connect-has-vault ? "Configure" : "Set up";
+                                                    font-size: 12px; color: EinkTheme.btn-active-fg;
+                                                    horizontal-alignment: center; vertical-alignment: center;
+                                                }
                                                 TouchArea {
                                                     clicked => {
                                                         root.connect-setup-kind = "vault";
@@ -4442,7 +4608,7 @@ export component EphemerisPage inherits Window {
                                 }
 
                                 for conn[i] in root.connection-list: Rectangle {
-                                    visible: conn.kind == "calendar" && conn.profile-id == root.connect-profile-id;
+                                    visible: (conn.kind == "calendar" || conn.kind == "caldav") && conn.profile-id == root.connect-profile-id;
                                     height: self.visible ? 72px : 0px;
                                     background: EinkTheme.canvas-bg;
                                     clip: true;
@@ -4469,7 +4635,10 @@ export component EphemerisPage inherits Window {
                                             VerticalLayout {
                                                 spacing: 2px; alignment: center; horizontal-stretch: 1;
                                                 Text { text: conn.display; font-size: 13px; font-weight: 700; color: EinkTheme.btn-fg; overflow: elide; }
-                                                Text { text: conn.value; font-size: 10px; color: EinkTheme.text-secondary; overflow: elide; }
+                                                Text {
+                                                    text: conn.kind == "caldav" ? "CalDAV · " + conn.value : conn.value;
+                                                    font-size: 10px; color: EinkTheme.text-secondary; overflow: elide;
+                                                }
                                             }
                                             Rectangle {
                                                 width: 28px; height: 28px;
@@ -4720,55 +4889,163 @@ export component EphemerisPage inherits Window {
         opacity: 0.97;
 
         Rectangle {
-            x: (parent.width - 460px) / 2;
-            y: (parent.height - (root.connect-setup-kind == "calendar" ? 320px : 240px)) / 2;
-            width: 460px;
-            height: root.connect-setup-kind == "calendar" ? 320px : 240px;
+            x: (parent.width - 480px) / 2;
+            y: (parent.height - (root.connect-setup-kind == "calendar" ? 580px : root.connect-setup-kind == "vault-git" ? 280px : 420px)) / 2;
+            width: 480px;
+            height: root.connect-setup-kind == "calendar" ? 580px : root.connect-setup-kind == "vault-git" ? 280px : 420px;
             background: EinkTheme.canvas-bg;
             border-radius: 8px;
             border-width: 3px;
             border-color: EinkTheme.chrome-border;
 
             VerticalLayout {
-                padding: 20px; spacing: 14px;
+                padding: 20px; spacing: 12px;
 
                 Text {
-                    text: root.connect-setup-kind == "vault" ? "Set up Obsidian Vault" : "Add Calendar";
+                    text: root.connect-setup-kind == "vault" ? "Set up Obsidian Vault"
+                        : root.connect-setup-kind == "vault-git" ? "Vault git sync"
+                        : "Add Calendar";
                     font-size: 16px; font-weight: 700; color: EinkTheme.btn-fg;
                     horizontal-alignment: center;
                 }
 
                 Text {
                     text: root.connect-setup-kind == "vault"
-                        ? "Choose the vault folder for this profile. Tasks and notes will be read from it."
-                        : "Add an ICS calendar file or a subscribe URL for this profile.";
+                        ? "Choose the vault folder for this profile. Notes export as PDF (with transcribed text) under the folder below; vault search skips that folder."
+                        : root.connect-setup-kind == "vault-git"
+                        ? "This vault is a git repository. Enable automatic pull before search/updates and autocommit + push after note exports."
+                        : "ICS subscribe link, local .ics file, or CalDAV server with credentials.";
                     font-size: 12px; color: EinkTheme.text-secondary;
                     horizontal-alignment: center;
                     wrap: word-wrap;
                 }
 
-                if root.connect-setup-kind == "vault": Rectangle {
-                    height: 44px;
-                    background: EinkTheme.btn-active-bg;
-                    border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                if root.connect-setup-kind == "vault": VerticalLayout {
+                    spacing: 8px;
+
                     Text {
-                        text: "Browse for vault folder…";
-                        font-size: 14px; color: EinkTheme.btn-active-fg;
-                        horizontal-alignment: center; vertical-alignment: center;
+                        text: "Notes export folder (inside vault)";
+                        font-size: 11px; color: EinkTheme.text-secondary;
                     }
-                    TouchArea {
-                        clicked => {
-                            root.connect-setup-visible = false;
-                            root.settings-browse-vault();
+                    Rectangle {
+                        height: 40px;
+                        border-radius: 4px; border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        background: EinkTheme.canvas-bg;
+                        TextInput {
+                            x: 10px; y: 0;
+                            width: parent.width - 20px; height: parent.height;
+                            font-size: 13px; color: EinkTheme.btn-fg;
+                            text <=> root.connect-setup-export-subdir;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    if root.settings-vault-path != "": Text {
+                        text: "Vault: " + root.settings-vault-path;
+                        font-size: 11px; color: EinkTheme.text-secondary;
+                        wrap: word-wrap;
+                    }
+
+                    if root.connect-setup-git-detected: Rectangle {
+                        height: 40px;
+                        background: root.connect-setup-git-enabled ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+                        border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                        Text {
+                            text: root.connect-setup-git-enabled
+                                ? "Git sync: on (pull / autocommit / push)"
+                                : "Git sync: off — tap to enable";
+                            font-size: 13px;
+                            color: root.connect-setup-git-enabled ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                            horizontal-alignment: center; vertical-alignment: center;
+                        }
+                        TouchArea {
+                            clicked => {
+                                root.connect-setup-git-enabled = !root.connect-setup-git-enabled;
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        height: 44px;
+                        background: EinkTheme.btn-active-bg;
+                        border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                        Text {
+                            text: root.connect-has-vault ? "Browse to change vault…" : "Browse for vault folder…";
+                            font-size: 14px; color: EinkTheme.btn-active-fg;
+                            horizontal-alignment: center; vertical-alignment: center;
+                        }
+                        TouchArea {
+                            clicked => {
+                                root.connect-setup-visible = false;
+                                root.settings-browse-vault();
+                            }
+                        }
+                    }
+
+                    if root.connect-has-vault: Rectangle {
+                        height: 44px;
+                        background: EinkTheme.btn-bg;
+                        border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                        Text {
+                            text: "Save export & git settings";
+                            font-size: 14px; color: EinkTheme.btn-fg;
+                            horizontal-alignment: center; vertical-alignment: center;
+                        }
+                        TouchArea {
+                            clicked => {
+                                root.connect-vault-setup-confirm();
+                                root.connect-setup-visible = false;
+                            }
+                        }
+                    }
+                }
+
+                if root.connect-setup-kind == "vault-git": VerticalLayout {
+                    spacing: 10px;
+
+                    Rectangle {
+                        height: 44px;
+                        background: EinkTheme.btn-active-bg;
+                        border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                        Text {
+                            text: "Enable git sync";
+                            font-size: 14px; color: EinkTheme.btn-active-fg;
+                            horizontal-alignment: center; vertical-alignment: center;
+                        }
+                        TouchArea {
+                            clicked => {
+                                root.connect-setup-git-enabled = true;
+                                root.connect-vault-setup-confirm();
+                                root.connect-setup-visible = false;
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        height: 44px;
+                        background: EinkTheme.btn-bg;
+                        border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                        Text {
+                            text: "Not now";
+                            font-size: 14px; color: EinkTheme.btn-fg;
+                            horizontal-alignment: center; vertical-alignment: center;
+                        }
+                        TouchArea {
+                            clicked => {
+                                root.connect-setup-git-enabled = false;
+                                root.connect-vault-setup-confirm();
+                                root.connect-setup-visible = false;
+                            }
                         }
                     }
                 }
 
                 if root.connect-setup-kind == "calendar": VerticalLayout {
-                    spacing: 10px;
+                    spacing: 8px;
 
                     Rectangle {
-                        height: 44px;
+                        height: 40px;
                         background: EinkTheme.btn-bg;
                         border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
                         HorizontalLayout {
@@ -4793,13 +5070,12 @@ export component EphemerisPage inherits Window {
                     }
 
                     Text {
-                        text: "or paste a calendar URL";
+                        text: "ICS subscribe URL";
                         font-size: 11px; color: EinkTheme.text-secondary;
-                        horizontal-alignment: center;
                     }
 
                     Rectangle {
-                        height: 44px;
+                        height: 40px;
                         border-radius: 4px; border-width: 2px;
                         border-color: EinkTheme.btn-border;
                         background: EinkTheme.canvas-bg;
@@ -4809,6 +5085,111 @@ export component EphemerisPage inherits Window {
                             font-size: 13px; color: EinkTheme.btn-fg;
                             text <=> root.settings-new-url;
                             vertical-alignment: center;
+                        }
+                    }
+
+                    Rectangle {
+                        height: 40px;
+                        background: EinkTheme.btn-active-bg;
+                        border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                        Text {
+                            text: "Add ICS URL";
+                            font-size: 14px; color: EinkTheme.btn-active-fg;
+                            horizontal-alignment: center; vertical-alignment: center;
+                        }
+                        TouchArea {
+                            clicked => {
+                                if (root.settings-new-url != "") {
+                                    root.settings-add-url(root.settings-new-url);
+                                    root.settings-new-url = "";
+                                    root.connect-setup-visible = false;
+                                }
+                            }
+                        }
+                    }
+
+                    Rectangle { height: 1px; background: EinkTheme.chrome-border; }
+
+                    Text {
+                        text: "CalDAV server URL";
+                        font-size: 11px; color: EinkTheme.text-secondary;
+                    }
+
+                    Rectangle {
+                        height: 40px;
+                        border-radius: 4px; border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        background: EinkTheme.canvas-bg;
+                        TextInput {
+                            x: 10px; y: 0;
+                            width: parent.width - 20px; height: parent.height;
+                            font-size: 13px; color: EinkTheme.btn-fg;
+                            text <=> root.connect-setup-url;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    Text {
+                        text: "Username";
+                        font-size: 11px; color: EinkTheme.text-secondary;
+                    }
+
+                    Rectangle {
+                        height: 40px;
+                        border-radius: 4px; border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        background: EinkTheme.canvas-bg;
+                        TextInput {
+                            x: 10px; y: 0;
+                            width: parent.width - 20px; height: parent.height;
+                            font-size: 13px; color: EinkTheme.btn-fg;
+                            text <=> root.connect-setup-user;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    Text {
+                        text: "Password or app token";
+                        font-size: 11px; color: EinkTheme.text-secondary;
+                    }
+
+                    Rectangle {
+                        height: 40px;
+                        border-radius: 4px; border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        background: EinkTheme.canvas-bg;
+                        TextInput {
+                            x: 10px; y: 0;
+                            width: parent.width - 20px; height: parent.height;
+                            font-size: 13px; color: EinkTheme.btn-fg;
+                            text <=> root.connect-setup-pass;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    Rectangle {
+                        height: 40px;
+                        background: EinkTheme.btn-active-bg;
+                        border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                        Text {
+                            text: "Add CalDAV";
+                            font-size: 14px; color: EinkTheme.btn-active-fg;
+                            horizontal-alignment: center; vertical-alignment: center;
+                        }
+                        TouchArea {
+                            clicked => {
+                                if (root.connect-setup-url != "" && root.connect-setup-user != "") {
+                                    root.settings-add-caldav(
+                                        root.connect-setup-url,
+                                        root.connect-setup-user,
+                                        root.connect-setup-pass
+                                    );
+                                    root.connect-setup-url = "";
+                                    root.connect-setup-user = "";
+                                    root.connect-setup-pass = "";
+                                    root.connect-setup-visible = false;
+                                }
+                            }
                         }
                     }
                 }
@@ -4826,22 +5207,9 @@ export component EphemerisPage inherits Window {
                             clicked => {
                                 root.connect-setup-visible = false;
                                 root.settings-new-url = "";
-                            }
-                        }
-                    }
-
-                    if root.connect-setup-kind == "calendar": Rectangle {
-                        width: 120px; height: 44px;
-                        background: EinkTheme.btn-active-bg;
-                        border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
-                        Text { text: "Add URL"; font-size: 14px; color: EinkTheme.btn-active-fg;
-                               horizontal-alignment: center; vertical-alignment: center; }
-                        TouchArea {
-                            clicked => {
-                                if (root.settings-new-url != "") {
-                                    root.settings-add-url(root.settings-new-url);
-                                    root.connect-setup-visible = false;
-                                }
+                                root.connect-setup-url = "";
+                                root.connect-setup-user = "";
+                                root.connect-setup-pass = "";
                             }
                         }
                     }
@@ -5295,6 +5663,173 @@ export component EphemerisPage inherits Window {
                                         root.task-dialog-due,
                                         root.task-dialog-tags);
                                 }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Event create dialog ──────────────────────────────────────────────
+    event-dialog := Rectangle {
+        visible: root.event-dialog-visible;
+        x: 0; y: 0;
+        width: parent.width;
+        height: parent.height;
+        background: EinkTheme.chrome-bg;
+        opacity: 0.95;
+
+        Rectangle {
+            x: (parent.width - 440px) / 2;
+            y: (parent.height - 400px) / 2;
+            width: 440px; height: 400px;
+            background: EinkTheme.canvas-bg;
+            border-radius: 8px;
+            border-width: 3px;
+            border-color: EinkTheme.chrome-border;
+
+            VerticalLayout {
+                padding: 20px; spacing: 12px;
+
+                Text {
+                    text: "New Event";
+                    font-size: 16px; font-weight: 700;
+                    color: EinkTheme.btn-fg;
+                    horizontal-alignment: center;
+                }
+
+                Text {
+                    text: "Title";
+                    font-size: 11px; color: EinkTheme.text-secondary;
+                }
+                Rectangle {
+                    height: 44px;
+                    border-radius: 4px; border-width: 2px;
+                    border-color: EinkTheme.btn-border;
+                    background: EinkTheme.canvas-bg;
+                    TextInput {
+                        x: 8px; y: 0px;
+                        width: parent.width - 16px;
+                        height: parent.height;
+                        font-size: 14px; color: EinkTheme.btn-fg;
+                        text <=> root.event-dialog-title;
+                        vertical-alignment: center;
+                        single-line: true;
+                    }
+                }
+
+                Text {
+                    text: "Date (YYYY-MM-DD)";
+                    font-size: 11px; color: EinkTheme.text-secondary;
+                }
+                Rectangle {
+                    height: 40px;
+                    border-radius: 4px; border-width: 2px;
+                    border-color: EinkTheme.btn-border;
+                    background: EinkTheme.canvas-bg;
+                    TextInput {
+                        x: 8px; y: 0px;
+                        width: parent.width - 16px;
+                        height: parent.height;
+                        font-size: 14px; color: EinkTheme.btn-fg;
+                        text <=> root.event-dialog-date;
+                        vertical-alignment: center;
+                        single-line: true;
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 12px;
+                    VerticalLayout {
+                        spacing: 4px; horizontal-stretch: 1;
+                        Text {
+                            text: "Start (HH:MM)";
+                            font-size: 11px; color: EinkTheme.text-secondary;
+                        }
+                        Rectangle {
+                            height: 40px;
+                            border-radius: 4px; border-width: 2px;
+                            border-color: EinkTheme.btn-border;
+                            background: EinkTheme.canvas-bg;
+                            opacity: root.event-dialog-all-day ? 0.4 : 1.0;
+                            TextInput {
+                                x: 8px; y: 0px;
+                                width: parent.width - 16px;
+                                height: parent.height;
+                                font-size: 14px; color: EinkTheme.btn-fg;
+                                text <=> root.event-dialog-start;
+                                vertical-alignment: center;
+                                single-line: true;
+                                enabled: !root.event-dialog-all-day;
+                            }
+                        }
+                    }
+                    VerticalLayout {
+                        spacing: 4px; horizontal-stretch: 1;
+                        Text {
+                            text: "End (HH:MM)";
+                            font-size: 11px; color: EinkTheme.text-secondary;
+                        }
+                        Rectangle {
+                            height: 40px;
+                            border-radius: 4px; border-width: 2px;
+                            border-color: EinkTheme.btn-border;
+                            background: EinkTheme.canvas-bg;
+                            opacity: root.event-dialog-all-day ? 0.4 : 1.0;
+                            TextInput {
+                                x: 8px; y: 0px;
+                                width: parent.width - 16px;
+                                height: parent.height;
+                                font-size: 14px; color: EinkTheme.btn-fg;
+                                text <=> root.event-dialog-end;
+                                vertical-alignment: center;
+                                single-line: true;
+                                enabled: !root.event-dialog-all-day;
+                            }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    height: 36px;
+                    background: root.event-dialog-all-day ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+                    border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                    Text {
+                        text: root.event-dialog-all-day ? "All day ✓" : "All day";
+                        font-size: 13px;
+                        color: root.event-dialog-all-day ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                        horizontal-alignment: center; vertical-alignment: center;
+                    }
+                    TouchArea {
+                        clicked => { root.event-dialog-all-day = !root.event-dialog-all-day; }
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 16px; alignment: center;
+                    Rectangle {
+                        width: 120px; height: 48px;
+                        background: EinkTheme.btn-bg;
+                        border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                        Text { text: "Cancel"; font-size: 15px; color: EinkTheme.btn-fg;
+                               horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea { clicked => { root.event-dialog-cancel(); } }
+                    }
+                    Rectangle {
+                        width: 120px; height: 48px;
+                        background: EinkTheme.btn-active-bg;
+                        border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                        Text { text: "Save"; font-size: 15px; color: EinkTheme.btn-active-fg;
+                               horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea {
+                            clicked => {
+                                root.event-confirm-add(
+                                    root.event-dialog-title,
+                                    root.event-dialog-date,
+                                    root.event-dialog-start,
+                                    root.event-dialog-end,
+                                    root.event-dialog-all-day);
                             }
                         }
                     }
@@ -5765,6 +6300,133 @@ export component EphemerisPage inherits Window {
         }
     }
 
+    // ── Recording detail modal (transcript + play; title editable inline) ───
+    rec-transcription-dialog := Rectangle {
+        visible: root.rec-transcription-visible;
+        x: 0; y: 0; width: parent.width; height: parent.height;
+        background: #00000040;
+
+        // Dismiss on backdrop tap (saves current text + title).
+        TouchArea {
+            width: parent.width; height: parent.height;
+            clicked => { root.rec-transcription-save(root.rec-transcription-text); }
+        }
+
+        Rectangle {
+            x: (parent.width - Math.min(parent.width - 32px, 520px)) / 2;
+            y: (parent.height - Math.min(parent.height - 48px, 560px)) / 2;
+            width: Math.min(parent.width - 32px, 520px);
+            height: Math.min(parent.height - 48px, 560px);
+            background: EinkTheme.canvas-bg;
+            border-radius: 8px;
+            border-width: 3px;
+            border-color: EinkTheme.chrome-border;
+            clip: true;
+
+            // Swallow taps so backdrop dismiss doesn't fire from the card.
+            TouchArea { width: parent.width; height: parent.height; }
+
+            VerticalLayout {
+                padding: 0px; spacing: 0px;
+
+                Rectangle {
+                    height: 52px;
+                    background: EinkTheme.canvas-bg;
+                    HorizontalLayout {
+                        padding-left: 12px; padding-right: 12px;
+                        padding-top: 8px; padding-bottom: 8px;
+                        spacing: 8px;
+
+                        Rectangle {
+                            width: 36px; height: 36px;
+                            background: transparent;
+                            Text {
+                                text: Icons.close;
+                                font-family: "Material Icons"; font-size: 22px;
+                                color: EinkTheme.btn-fg;
+                                horizontal-alignment: center; vertical-alignment: center;
+                                width: parent.width; height: parent.height;
+                            }
+                            TouchArea { clicked => { root.rec-transcription-save(root.rec-transcription-text); } }
+                        }
+
+                        Rectangle {
+                            horizontal-stretch: 1;
+                            height: 36px;
+                            border-radius: 4px; border-width: 2px;
+                            border-color: EinkTheme.btn-border;
+                            background: EinkTheme.canvas-bg;
+                            TextInput {
+                                x: 8px; y: 0;
+                                width: parent.width - 16px; height: parent.height;
+                                font-size: 15px; font-weight: 700;
+                                color: EinkTheme.btn-fg;
+                                text <=> root.rec-active-title;
+                                vertical-alignment: center;
+                                single-line: true;
+                            }
+                        }
+
+                        Rectangle {
+                            width: 36px; height: 36px;
+                            background: EinkTheme.btn-bg;
+                            border-radius: 4px; border-width: 2px;
+                            border-color: EinkTheme.btn-border;
+                            Text {
+                                text: Icons.play;
+                                font-family: "Material Icons"; font-size: 20px;
+                                color: EinkTheme.btn-fg;
+                                horizontal-alignment: center; vertical-alignment: center;
+                                width: parent.width; height: parent.height;
+                            }
+                            TouchArea { clicked => { root.rec-play-tapped(root.rec-active-id); } }
+                        }
+
+                        Rectangle {
+                            width: 36px; height: 36px;
+                            background: transparent;
+                            Text {
+                                text: Icons.refresh;
+                                font-family: "Material Icons"; font-size: 20px;
+                                color: EinkTheme.btn-fg;
+                                horizontal-alignment: center; vertical-alignment: center;
+                                width: parent.width; height: parent.height;
+                            }
+                            TouchArea { clicked => { root.rec-transcription-retranscribe(); } }
+                        }
+
+                        Rectangle {
+                            width: 56px; height: 36px;
+                            background: EinkTheme.btn-active-bg;
+                            border-radius: 4px; border-width: 2px;
+                            border-color: EinkTheme.btn-border;
+                            Text { text: "Save"; font-size: 13px; color: EinkTheme.btn-active-fg;
+                                   horizontal-alignment: center; vertical-alignment: center; }
+                            TouchArea { clicked => { root.rec-transcription-save(root.rec-transcription-text); } }
+                        }
+                    }
+                }
+
+                Rectangle { height: 2px; background: EinkTheme.chrome-border; }
+
+                Flickable {
+                    vertical-stretch: 1;
+                    interactive: true;
+                    content-height: txn-input.preferred-height + 24px;
+
+                    txn-input := TextInput {
+                        x: 16px; y: 12px;
+                        width: parent.width - 32px;
+                        text <=> root.rec-transcription-text;
+                        font-size: 14px; color: EinkTheme.btn-fg;
+                        wrap: word-wrap;
+                        single-line: false;
+                    }
+                }
+            }
+        }
+    }
+
     // ── Recording rename dialog ──────────────────────────────────────────────
     rec-rename-dialog := Rectangle {
         visible: root.rec-rename-visible;
@@ -5824,90 +6486,6 @@ export component EphemerisPage inherits Window {
                             }
                         }
                     }
-                }
-            }
-        }
-    }
-
-    // ── Recording transcription editor ───────────────────────────────────────
-    rec-transcription-dialog := Rectangle {
-        visible: root.rec-transcription-visible;
-        x: 0; y: 0; width: parent.width; height: parent.height;
-        background: EinkTheme.canvas-bg;
-        clip: true;
-
-        VerticalLayout {
-            padding: 0px; spacing: 0px;
-
-            Rectangle {
-                height: 44px;
-                background: EinkTheme.canvas-bg;
-                HorizontalLayout {
-                    padding-left: 12px; padding-right: 12px;
-                    padding-top: 6px; padding-bottom: 6px;
-                    spacing: 8px;
-
-                    Rectangle {
-                        width: 40px; height: 32px;
-                        background: transparent;
-                        Text {
-                            text: Icons.back;
-                            font-family: "Material Icons"; font-size: 22px;
-                            color: EinkTheme.btn-fg;
-                            horizontal-alignment: center; vertical-alignment: center;
-                            width: parent.width; height: parent.height;
-                        }
-                        TouchArea { clicked => { root.rec-transcription-save(root.rec-transcription-text); } }
-                    }
-
-                    Text {
-                        text: "Transcription";
-                        font-size: 16px; font-weight: 700;
-                        color: EinkTheme.btn-fg;
-                        vertical-alignment: center;
-                        horizontal-stretch: 1;
-                        horizontal-alignment: center;
-                    }
-
-                    Rectangle {
-                        width: 36px; height: 32px;
-                        background: transparent;
-                        Text {
-                            text: Icons.refresh;
-                            font-family: "Material Icons"; font-size: 22px;
-                            color: EinkTheme.btn-fg;
-                            horizontal-alignment: center; vertical-alignment: center;
-                            width: parent.width; height: parent.height;
-                        }
-                        TouchArea { clicked => { root.rec-transcription-retranscribe(); } }
-                    }
-
-                    Rectangle {
-                        width: 52px; height: 32px;
-                        background: EinkTheme.btn-active-bg;
-                        border-radius: 4px; border-width: 2px;
-                        border-color: EinkTheme.btn-border;
-                        Text { text: "Save"; font-size: 13px; color: EinkTheme.btn-active-fg;
-                               horizontal-alignment: center; vertical-alignment: center; }
-                        TouchArea { clicked => { root.rec-transcription-save(root.rec-transcription-text); } }
-                    }
-                }
-            }
-
-            Rectangle { height: 2px; background: EinkTheme.chrome-border; }
-
-            Flickable {
-                vertical-stretch: 1;
-                interactive: true;
-                content-height: txn-input.preferred-height + 24px;
-
-                txn-input := TextInput {
-                    x: 16px; y: 12px;
-                    width: parent.width - 32px;
-                    text <=> root.rec-transcription-text;
-                    font-size: 14px; color: EinkTheme.btn-fg;
-                    wrap: word-wrap;
-                    single-line: false;
                 }
             }
         }

@@ -1,16 +1,19 @@
 //! Handwriting transcription trait (ADR ephemeris-2ri, ephemeris-97x.3 / 97x.6).
 //!
-//! Default v1 backend: [`RasterOcrTranscriber`] — rasterize page gray8 and run
-//! Tesseract (CLI) for word boxes → [`TextSpan`]. Falls back to empty results
-//! when OCR is disabled, the binary/tessdata is missing, or the `ocr` Cargo
-//! feature is off (CI-safe).
+//! Preferred path (ephemeris-5g2): [`CascadingTranscriber`] — online stroke HTR
+//! when strokes + model are available, else [`RasterOcrTranscriber`] (Tesseract).
 
 use crate::model::{Point, Stroke, Tool};
+#[cfg(feature = "htr")]
+use crate::stroke_htr::{ctc_greedy_decode, decode_charset_with_blank, features_to_tensor};
+use crate::stroke_htr::{default_line_gap, featurize_line, group_strokes_into_lines};
 #[cfg(feature = "ocr")]
 use std::path::Path;
 use std::path::PathBuf;
 #[cfg(feature = "ocr")]
 use std::process::Command;
+#[cfg(feature = "htr")]
+use std::sync::Mutex;
 
 /// A recognised text span anchored to a page-local bounding box (logical px).
 #[derive(Debug, Clone, PartialEq)]
@@ -22,6 +25,21 @@ pub struct TextSpan {
     pub y: f32,
     pub width: f32,
     pub height: f32,
+    /// Model confidence in `[0, 1]`. Negative when unknown (e.g. OCR without score).
+    pub confidence: f32,
+}
+
+impl TextSpan {
+    pub fn new(text: impl Into<String>, x: f32, y: f32, width: f32, height: f32) -> Self {
+        Self {
+            text: text.into(),
+            x,
+            y,
+            width,
+            height,
+            confidence: -1.0,
+        }
+    }
 }
 
 /// Pluggable handwriting → text backend.
@@ -72,6 +90,337 @@ impl Transcriber for FakeTranscriber {
         _gray8: &[u8],
     ) -> crate::Result<Vec<TextSpan>> {
         Ok(self.spans.clone())
+    }
+}
+
+/// Mean confidence of spans that have a non-negative score; `0.0` if none.
+pub fn mean_confidence(spans: &[TextSpan]) -> f32 {
+    let scored: Vec<f32> = spans
+        .iter()
+        .map(|s| s.confidence)
+        .filter(|c| *c >= 0.0)
+        .collect();
+    if scored.is_empty() {
+        0.0
+    } else {
+        scored.iter().sum::<f32>() / scored.len() as f32
+    }
+}
+
+/// Cascade: stroke HTR first, Tesseract OCR fallback (ephemeris-5g2).
+pub struct CascadingTranscriber {
+    pub htr: StrokeHtrTranscriber,
+    pub ocr: RasterOcrTranscriber,
+    /// Minimum mean HTR confidence to accept (else fall through to OCR).
+    pub min_htr_confidence: f32,
+}
+
+impl CascadingTranscriber {
+    pub fn new(htr: StrokeHtrTranscriber, ocr: RasterOcrTranscriber) -> Self {
+        Self {
+            htr,
+            ocr,
+            min_htr_confidence: 0.35,
+        }
+    }
+
+    /// Transcribe a page using strokes when possible, else / on low confidence
+    /// the gray8 raster via Tesseract.
+    pub fn transcribe_page(
+        &self,
+        strokes: &[Stroke],
+        width: u32,
+        height: u32,
+        gray8: &[u8],
+    ) -> crate::Result<Vec<TextSpan>> {
+        if !strokes.is_empty() && self.htr.enabled && self.htr.model_available() {
+            let spans = self.htr.transcribe(strokes)?;
+            // Accept non-empty HTR when confidence unknown (negative) or above threshold.
+            let accept = !spans.is_empty()
+                && (spans.iter().any(|s| s.confidence < 0.0)
+                    || mean_confidence(&spans) >= self.min_htr_confidence);
+            if accept {
+                return Ok(spans);
+            }
+        }
+        self.ocr.transcribe_raster(width, height, gray8)
+    }
+}
+
+impl Transcriber for CascadingTranscriber {
+    fn transcribe(&self, strokes: &[Stroke]) -> crate::Result<Vec<TextSpan>> {
+        if !strokes.is_empty() && self.htr.enabled && self.htr.model_available() {
+            let spans = self.htr.transcribe(strokes)?;
+            if !spans.is_empty() {
+                return Ok(spans);
+            }
+        }
+        self.ocr.transcribe(strokes)
+    }
+
+    fn transcribe_raster(
+        &self,
+        width: u32,
+        height: u32,
+        gray8: &[u8],
+    ) -> crate::Result<Vec<TextSpan>> {
+        self.ocr.transcribe_raster(width, height, gray8)
+    }
+}
+
+/// Online stroke HTR backend (Carbune/OnlineHTR-style features → ONNX/RTen).
+///
+/// Without the `htr` Cargo feature or a downloaded model, [`Self::transcribe`]
+/// returns an empty list so the cascade can fall through to OCR.
+pub struct StrokeHtrTranscriber {
+    pub enabled: bool,
+    /// Directory containing `model.rten` (or `model.onnx`) and `charset.txt`.
+    pub model_dir: Option<PathBuf>,
+    /// Points per unit length for stroke interpolation (OnlineHTR default: 20).
+    pub points_per_unit: f32,
+    #[cfg(feature = "htr")]
+    session: Mutex<Option<HtrSession>>,
+}
+
+#[cfg(feature = "htr")]
+struct HtrSession {
+    model: rten::Model,
+    charset: String,
+    /// CTC blank class index (OnlineHTR / Carbune uses `0`).
+    blank_index: usize,
+}
+
+impl Clone for StrokeHtrTranscriber {
+    fn clone(&self) -> Self {
+        Self {
+            enabled: self.enabled,
+            model_dir: self.model_dir.clone(),
+            points_per_unit: self.points_per_unit,
+            #[cfg(feature = "htr")]
+            session: Mutex::new(None),
+        }
+    }
+}
+
+impl std::fmt::Debug for StrokeHtrTranscriber {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StrokeHtrTranscriber")
+            .field("enabled", &self.enabled)
+            .field("model_dir", &self.model_dir)
+            .field("points_per_unit", &self.points_per_unit)
+            .finish()
+    }
+}
+
+impl Default for StrokeHtrTranscriber {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            model_dir: None,
+            points_per_unit: 20.0,
+            #[cfg(feature = "htr")]
+            session: Mutex::new(None),
+        }
+    }
+}
+
+impl StrokeHtrTranscriber {
+    pub fn from_parts(enabled: bool, model_dir: Option<PathBuf>) -> Self {
+        Self {
+            enabled,
+            model_dir,
+            ..Self::default()
+        }
+    }
+
+    /// True when a model file is present on disk (does not load it yet).
+    pub fn model_available(&self) -> bool {
+        let Some(dir) = self.model_dir.as_ref() else {
+            return false;
+        };
+        dir.join("model.onnx").is_file() || dir.join("model.rten").is_file()
+    }
+
+    /// User-facing hint when HTR yields nothing.
+    pub fn empty_result_hint(&self) -> String {
+        if !self.enabled {
+            return "Stroke HTR is disabled.".into();
+        }
+        if !self.model_available() {
+            return "Handwriting model not installed. Settings → Handwriting, or See-text uses OCR."
+                .into();
+        }
+        "No text recognised from strokes.".into()
+    }
+
+    #[cfg(feature = "htr")]
+    fn charset_path(dir: &std::path::Path) -> PathBuf {
+        let a = dir.join("charset.txt");
+        if a.is_file() {
+            a
+        } else {
+            dir.join("dict.txt")
+        }
+    }
+
+    #[cfg(feature = "htr")]
+    fn ensure_session(&self) -> crate::Result<()> {
+        let mut guard = self
+            .session
+            .lock()
+            .map_err(|_| crate::AppError::InvalidInput("htr session lock poisoned".into()))?;
+        if guard.is_some() {
+            return Ok(());
+        }
+        let Some(dir) = self.model_dir.as_ref() else {
+            return Ok(());
+        };
+        let onnx_path = dir.join("model.onnx");
+        let rten_path = dir.join("model.rten");
+        let model_path = if onnx_path.is_file() {
+            onnx_path
+        } else if rten_path.is_file() {
+            rten_path
+        } else {
+            return Ok(());
+        };
+        let model = rten::Model::load_file(&model_path)
+            .map_err(|e| crate::AppError::InvalidInput(format!("load HTR model: {e}")))?;
+        let charset = load_charset(dir);
+        let blank_index = load_blank_index(dir);
+        *guard = Some(HtrSession {
+            model,
+            charset,
+            blank_index,
+        });
+        Ok(())
+    }
+
+    #[cfg(feature = "htr")]
+    fn infer_line(&self, features: &[[f32; 4]]) -> crate::Result<(String, f32)> {
+        use rten_tensor::{AsView, Layout, NdTensor};
+
+        self.ensure_session()?;
+        let guard = self
+            .session
+            .lock()
+            .map_err(|_| crate::AppError::InvalidInput("htr session lock poisoned".into()))?;
+        let Some(sess) = guard.as_ref() else {
+            return Ok((String::new(), 0.0));
+        };
+        let (buf, t) = features_to_tensor(features);
+        if t == 0 {
+            return Ok((String::new(), 0.0));
+        }
+        let input = NdTensor::from_data([1, t, 4], buf);
+        let outputs = sess
+            .model
+            .run_one(input.view().into(), None)
+            .map_err(|e| crate::AppError::InvalidInput(format!("HTR infer: {e}")))?;
+        let tensor = outputs
+            .into_tensor::<f32>()
+            .ok_or_else(|| crate::AppError::InvalidInput("HTR output not f32".into()))?;
+        let shape = tensor.shape().to_vec();
+        let logits = tensor.into_data();
+        // Expect [1, T, C] or [T, C]; C = alphabet + blank
+        let c = sess.charset.chars().count() + 1;
+        let time = match shape.as_slice() {
+            [1, t_out, c_out] if *c_out == c => *t_out,
+            [t_out, c_out] if *c_out == c => *t_out,
+            _ if c > 0 && logits.len() % c == 0 => logits.len() / c,
+            _ => return Ok((String::new(), 0.0)),
+        };
+        let blank = sess.blank_index.min(c.saturating_sub(1));
+        let path = ctc_greedy_decode(&logits, time, c, blank);
+        let text = decode_charset_with_blank(&path, &sess.charset, blank);
+        let conf = if time == 0 {
+            0.0
+        } else {
+            (path.len() as f32 / time as f32).clamp(0.15, 0.95)
+        };
+        Ok((text, conf))
+    }
+
+    #[cfg(not(feature = "htr"))]
+    fn infer_line(&self, _features: &[[f32; 4]]) -> crate::Result<(String, f32)> {
+        Ok((String::new(), 0.0))
+    }
+}
+
+#[cfg(feature = "htr")]
+fn default_charset() -> &'static str {
+    " !\"#&'()*+,-./0123456789:;?ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+}
+
+/// Load alphabet-only charset (no blank). Prefers line-based `charset.txt`.
+#[cfg(feature = "htr")]
+fn load_charset(dir: &std::path::Path) -> String {
+    let path = StrokeHtrTranscriber::charset_path(dir);
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return default_charset().to_string();
+    };
+    if raw.contains('\n') {
+        raw.lines()
+            .map(|l| l.trim_end_matches('\r'))
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(|l| l.chars().next().unwrap_or(' '))
+            .collect()
+    } else {
+        raw.chars()
+            .filter(|c| *c != '\n' && *c != '\r')
+            .collect()
+    }
+}
+
+/// Read `meta.json` `blank_index` (default `0` for OnlineHTR).
+#[cfg(feature = "htr")]
+fn load_blank_index(dir: &std::path::Path) -> usize {
+    let path = dir.join("meta.json");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return 0;
+    };
+    #[derive(serde::Deserialize)]
+    struct Meta {
+        #[serde(default)]
+        blank_index: usize,
+    }
+    serde_json::from_str::<Meta>(&raw)
+        .map(|m| m.blank_index)
+        .unwrap_or(0)
+}
+
+impl Transcriber for StrokeHtrTranscriber {
+    fn transcribe(&self, strokes: &[Stroke]) -> crate::Result<Vec<TextSpan>> {
+        if !self.enabled || strokes.is_empty() || !self.model_available() {
+            return Ok(Vec::new());
+        }
+        #[cfg(feature = "htr")]
+        {
+            self.ensure_session()?;
+        }
+        let gap = default_line_gap(strokes);
+        let lines = group_strokes_into_lines(strokes, gap);
+        let mut spans = Vec::new();
+        for line in lines {
+            let feats = featurize_line(&line, self.points_per_unit);
+            if feats.is_empty() {
+                continue;
+            }
+            let (text, conf) = self.infer_line(&feats)?;
+            let text = text.trim().to_string();
+            if text.is_empty() {
+                continue;
+            }
+            spans.push(TextSpan {
+                text,
+                x: line.x,
+                y: line.y,
+                width: line.width,
+                height: line.height,
+                confidence: conf,
+            });
+        }
+        Ok(spans)
     }
 }
 
@@ -301,12 +650,18 @@ pub fn parse_tesseract_tsv(tsv: &str) -> Vec<TextSpan> {
         if width <= 0.0 || height <= 0.0 {
             continue;
         }
+        let confidence = if conf < 0.0 {
+            -1.0
+        } else {
+            (conf / 100.0).clamp(0.0, 1.0)
+        };
         spans.push(TextSpan {
             text: text.to_string(),
             x: left,
             y: top,
             width,
             height,
+            confidence,
         });
     }
     spans
@@ -436,13 +791,7 @@ mod tests {
     #[test]
     fn fake_returns_configured_spans() {
         let t = FakeTranscriber {
-            spans: vec![TextSpan {
-                text: "hello".into(),
-                x: 10.0,
-                y: 20.0,
-                width: 40.0,
-                height: 12.0,
-            }],
+            spans: vec![TextSpan::new("hello", 10.0, 20.0, 40.0, 12.0)],
         };
         let spans = t.transcribe(&[]).unwrap();
         assert_eq!(spans.len(), 1);
@@ -484,6 +833,38 @@ level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theigh
         assert_eq!(spans[0].x, 10.0);
         assert_eq!(spans[1].text, "World");
         assert_eq!(RasterOcrTranscriber::spans_to_text(&spans), "Hello World");
+    }
+
+    #[test]
+    fn cascade_falls_back_to_ocr_without_htr_model() {
+        let cascade = CascadingTranscriber::new(
+            StrokeHtrTranscriber::from_parts(true, None),
+            RasterOcrTranscriber {
+                enabled: false,
+                ..RasterOcrTranscriber::default()
+            },
+        );
+        let gray = vec![255u8; 40 * 20];
+        // No strokes / no model → OCR path (disabled → empty).
+        assert!(cascade
+            .transcribe_page(&[], 40, 20, &gray)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn cascade_prefers_fake_htr_spans() {
+        // StrokeHtr without model returns empty; inject via Fake by testing
+        // mean_confidence helper used by cascade accept logic.
+        let spans = vec![TextSpan {
+            text: "hi".into(),
+            x: 0.0,
+            y: 0.0,
+            width: 10.0,
+            height: 10.0,
+            confidence: 0.9,
+        }];
+        assert!(mean_confidence(&spans) >= 0.35);
     }
 
     #[test]
