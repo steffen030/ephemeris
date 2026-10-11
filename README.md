@@ -111,7 +111,8 @@ The public keyring also lives in-tree at
 - **Releases** use [Conventional Commits](https://www.conventionalcommits.org/)
   and [release-please](https://github.com/googleapis/release-please). Merges
   that are only `chore` / `docs` / `ci` / … do not cut a version; releasable
-  commits accumulate in a Release PR that a human merges when ready.
+  commits accumulate in a Release PR that a human merges when ready (one click).
+  Dependabot opens Cargo/Actions update PRs; patch/minor auto-merge after CI.
 
 ## License
 
