@@ -67,7 +67,7 @@ jobs:
       - name: Build aarch64 release binary
         run: cross build --target aarch64-unknown-linux-gnu -p ephemeris-app --release
       - name: Upload aarch64 artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ephemeris-aarch64-linux
           path: target/aarch64-unknown-linux-gnu/release/ephemeris
