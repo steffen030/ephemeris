@@ -1,0 +1,43 @@
+# https://docs.github.com/en/code-security/dependabot/dependabot-version-updates
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+      - rust
+    # fix(deps): so patched crates show up as a patch bump in the Release PR.
+    commit-message:
+      prefix: fix
+      include: scope
+    groups:
+      cargo-patch:
+        applies-to: version-updates
+        update-types:
+          - patch
+      cargo-minor:
+        applies-to: version-updates
+        update-types:
+          - minor
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - github-actions
+    commit-message:
+      prefix: ci
+      include: scope
+    groups:
+      actions:
+        applies-to: version-updates
+        update-types:
+          - patch
+          - minor

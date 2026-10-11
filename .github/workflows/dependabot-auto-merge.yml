@@ -1,0 +1,44 @@
+name: Dependabot auto-merge
+
+# Approve + auto-merge routine Dependabot PRs after CI is green.
+# Branch protection requires a review; Actions can approve when
+# "Allow GitHub Actions to create and approve pull requests" is enabled.
+# Majors stay manual. App releases still require merging the Release Please PR.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+  actions: read
+
+jobs:
+  auto-merge:
+    name: Approve and auto-merge
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Wait for CI, approve, enable auto-merge (patch / minor)
+        if: >
+          steps.metadata.outputs.update-type == 'version-update:semver-patch' ||
+          steps.metadata.outputs.update-type == 'version-update:semver-minor' ||
+          contains(fromJSON('["cargo-patch","cargo-minor","actions"]'), steps.metadata.outputs.dependency-group)
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Wait until CI jobs on this PR finish (works even if they are not
+          # listed as required status checks on the branch).
+          gh pr checks "$PR_URL" --watch --interval 15
+          gh pr review --approve "$PR_URL" \
+            --body "Auto-approved Dependabot patch/minor update (CI green)."
+          gh pr merge --auto --squash "$PR_URL"
