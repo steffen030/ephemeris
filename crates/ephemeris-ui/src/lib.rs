@@ -2083,9 +2083,7 @@ impl EphemerisUi {
             return false;
         }
         let before = self.strokes.borrow().len();
-        self.strokes
-            .borrow_mut()
-            .retain(|s| !ids.contains(&s.id));
+        self.strokes.borrow_mut().retain(|s| !ids.contains(&s.id));
         let removed = self.strokes.borrow().len() != before;
         if removed {
             let canvas_h = self.canvas_height();
