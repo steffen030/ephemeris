@@ -45,7 +45,7 @@ reqwest_dav = { version = "0.3", default-features = false, features = ["rustls-t
 bytes = "1"
 
 # PDF export (note pages → searchable PDF)
-printpdf = "0.7"
+printpdf = "0.12"
 
 # ICS calendar parsing
 icalendar = "0.16"
