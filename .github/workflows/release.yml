@@ -37,7 +37,7 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
       deb_name: ${{ steps.meta.outputs.deb_name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag_name }}
 
@@ -104,7 +104,7 @@ jobs:
     needs: build-deb
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Download deb artifact
         uses: actions/download-artifact@v8
@@ -120,7 +120,7 @@ jobs:
       - name: Checkout existing gh-pages tree
         id: pages
         continue-on-error: true
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: gh-pages
           path: apt-site
