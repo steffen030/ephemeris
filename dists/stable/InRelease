@@ -8,20 +8,20 @@ Codename: stable
 Architectures: arm64
 Components: main
 Description: Ephemeris apt repository
-Date: Sun, 11 Oct 2026 19:22:36 UTC
+Date: Sun, 11 Oct 2026 20:35:06 UTC
 MD5Sum:
- dade918dff41aba3902f61ba7aca5a39     4802 main/binary-arm64/Packages
- fe585b12c9b9a7778cd722f8969e6105     1232 main/binary-arm64/Packages.gz
+ 81c73d4eb2a923ec6f7fe68fb053fcec     5765 main/binary-arm64/Packages
+ ad9c0c2c6a16921241fdb15d79bb6627     1345 main/binary-arm64/Packages.gz
 SHA1:
- 14dec533eeb4ab53116d8aa0ac94f0cc9793d03d     4802 main/binary-arm64/Packages
- cd2be3b11482e72293e5356af98dd76ecab5f6c1     1232 main/binary-arm64/Packages.gz
+ 769a6c19740fd5323347d0b3b85231815feb6ab2     5765 main/binary-arm64/Packages
+ 09e0b27e89bf106d7f3608abbd63a5b6c5aa83dd     1345 main/binary-arm64/Packages.gz
 SHA256:
- 64add5f9e1bb0038cb6aaecaa1e76d99a03a9cce2f3e4f89e3a9f109b7624f8d     4802 main/binary-arm64/Packages
- 64caebce59c27bc0bd9b06bd3bb4123884e58cff49ade901d11ce532baa3feda     1232 main/binary-arm64/Packages.gz
+ ecce525df783d8900074db2440a1c54a9a7c763e5d4f94e59fa5ef4a667b6e79     5765 main/binary-arm64/Packages
+ a3eea7c5291ba5c73d2e15da71b3256ceb97870cdbff43437d12d43752fffffb     1345 main/binary-arm64/Packages.gz
 -----BEGIN PGP SIGNATURE-----
 
-iIoEARYKADIWIQTUbcNcxT6pU3P5PpanV7mDAtfMgAUCasvh/BQcYXB0QGVwaGVt
-ZXJpcy5sb2NhbAAKCRCnV7mDAtfMgBBhAQCgwAznI3thSv+XVQPJfnZGlnSVQTKN
-HRUfBFHaC5PU6wD/fyzdZ+fslHZfzVDsIR5Kn+rxW5CZzZOfVSuB2j0t2g0=
-=rXc0
+iIoEARYKADIWIQTUbcNcxT6pU3P5PpanV7mDAtfMgAUCasvy+hQcYXB0QGVwaGVt
+ZXJpcy5sb2NhbAAKCRCnV7mDAtfMgJpzAQDWB0AActVLcT4u6B0WLTOHmzrXZP7/
+OVitO/70nCEA3gEAscWXQvulvHY19ECULrYTlZcU43Xo9kgUub3GT8vmUgU=
+=ZMFV
 -----END PGP SIGNATURE-----
