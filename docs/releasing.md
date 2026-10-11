@@ -55,6 +55,8 @@ root `Cargo.toml`. release-please bumps that field and updates `CHANGELOG.md`.
 2. When you want to ship, open the **Release Please** PR, approve if required,
    and merge it. No separate lockfile workflow to approve.
 3. CI runs on the merge commit; once it passes, packaging and apt publish run.
+   If packaging is skipped (empty GitHub Release assets), re-run the **Release**
+   workflow with `workflow_dispatch` and the tag (e.g. `v0.1.7`).
 
 To rebuild packaging for an existing tag without a new Release PR, run the
 **Release** workflow manually (`workflow_dispatch`) and pass the tag
