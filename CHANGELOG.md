@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.6](https://github.com/steffen030/ephemeris/compare/v0.1.5...v0.1.6) (2026-10-11)
+
+
+### Features
+
+* local stroke HTR cascade, vault git sync, and CalDAV ([50d28e6](https://github.com/steffen030/ephemeris/commit/50d28e65b179d6ace2cef0ea8536ca3d1b400d8b))
+
 ## [0.1.5](https://github.com/steffen030/ephemeris/compare/v0.1.4...v0.1.5) (2026-10-09)
 
 
