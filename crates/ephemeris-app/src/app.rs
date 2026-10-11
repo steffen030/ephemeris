@@ -5376,6 +5376,7 @@ fn whisper_ready() -> bool {
 }
 
 /// Queue a recording for background whisper and kick the worker if idle.
+#[allow(clippy::too_many_arguments)]
 fn enqueue_transcription(
     rec_id: u32,
     queue: &Arc<Mutex<VecDeque<u32>>>,
@@ -5407,6 +5408,7 @@ fn enqueue_transcription(
 }
 
 /// Start the next queued whisper job if none is running.
+#[allow(clippy::too_many_arguments)]
 fn pump_transcription_queue(
     queue: &Arc<Mutex<VecDeque<u32>>>,
     active: &Arc<AtomicBool>,
@@ -6183,8 +6185,8 @@ fn note_preview_from_gray(w: u32, h: u32, gray: &[u8]) -> (bool, slint::Image) {
     }
     let (sx0, sy0, sw, sh) = if found && x1 > x0 && y1 > y0 {
         // Pad ~4% so strokes aren't clipped at the edge.
-        let pad_x = ((x1 - x0) / 25).max(4).min(24);
-        let pad_y = ((y1 - y0) / 25).max(4).min(24);
+        let pad_x = ((x1 - x0) / 25).clamp(4, 24);
+        let pad_y = ((y1 - y0) / 25).clamp(4, 24);
         let x0 = x0.saturating_sub(pad_x);
         let y0 = y0.saturating_sub(pad_y);
         let x1 = (x1 + pad_x).min(w);
@@ -7814,12 +7816,10 @@ fn filter_tasks_by_query(tasks: &[Task], query: &str) -> Vec<Task> {
 /// Completed tasks older than this are hidden from the "all" filter.
 const CLOSED_TASK_RETENTION_SECS: u64 = 14 * 86_400;
 
-fn build_full_task_list(
-    tasks: &[Task],
-    now: u64,
-    filter: &str,
-    sort: &str,
-) -> Vec<(String, String, String, i32, String, bool, bool, String)> {
+/// Slint task-list row: id, title, priority label, priority int, due, overdue, done, profile.
+type TaskListRow = (String, String, String, i32, String, bool, bool, String);
+
+fn build_full_task_list(tasks: &[Task], now: u64, filter: &str, sort: &str) -> Vec<TaskListRow> {
     let mut v: Vec<_> = tasks
         .iter()
         .filter(|t| match filter {
