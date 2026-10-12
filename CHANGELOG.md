@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.8](https://github.com/steffen030/ephemeris/compare/v0.1.7...v0.1.8) (2026-10-12)
+
+
+### Bug Fixes
+
+* tune See-text OCR and route note create through profile picker ([#22](https://github.com/steffen030/ephemeris/issues/22)) ([9e81427](https://github.com/steffen030/ephemeris/commit/9e814275bc4d8dce4f85db02f029c407e856cb96))
+
 ## [0.1.7](https://github.com/steffen030/ephemeris/compare/v0.1.6...v0.1.7) (2026-10-11)
 
 
