@@ -184,6 +184,8 @@ export struct RecordingEntry {
     duration-label: string,
     date-label: string,
     has-transcription: bool,
+    /// Short preview of transcript body (empty when none / still pending).
+    transcript-preview: string,
     /// True while whisper is queued or running for this recording.
     is-transcribing: bool,
     /// Show owning-profile badge (All aggregator view).
@@ -269,6 +271,7 @@ export global EinkTheme {
 }
 
 /// Renders a profile icon — Material glyph or custom image.
+/// Clipped so Material Icons’ tall em-box cannot push the glyph above siblings.
 component ProfileIcon inherits Rectangle {
     in property <string> icon-char: Icons.profile-person;
     in property <bool> has-custom: false;
@@ -278,6 +281,7 @@ component ProfileIcon inherits Rectangle {
     width: size;
     height: size;
     background: transparent;
+    clip: true;
 
     if !has-custom: Text {
         width: parent.width; height: parent.height;
@@ -291,6 +295,57 @@ component ProfileIcon inherits Rectangle {
     if has-custom: Image {
         width: parent.width; height: parent.height;
         source: root.custom-icon;
+    }
+}
+
+/// Icon + label on one baseline row (Tasks chips, Connect picker, home filter).
+/// Absolute placement avoids HorizontalLayout + Material Icons stacking the glyph above text.
+component ProfileChip inherits Rectangle {
+    in property <string> label;
+    in property <string> icon-char: Icons.profile-person;
+    in property <bool> has-custom: false;
+    in property <image> custom-icon;
+    in property <bool> selected: false;
+    in property <bool> pill: true;
+    in property <length> chip-width: 100px;
+    in property <length> icon-size: 16px;
+    in property <length> label-size: 11px;
+
+    width: chip-width;
+    height: 32px;
+    background: selected ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+    border-radius: pill ? 16px : 4px;
+    border-width: 2px;
+    border-color: EinkTheme.btn-border;
+    clip: true;
+
+    property <length> pad-x: 8px;
+    property <length> gap: 6px;
+    property <length> icon-x: pad-x;
+    property <length> icon-y: (self.height - icon-size) / 2;
+    property <length> label-x: pad-x + icon-size + gap;
+    property <length> label-w: self.width - label-x - pad-x;
+
+    ProfileIcon {
+        x: root.icon-x;
+        y: root.icon-y;
+        icon-char: root.icon-char;
+        has-custom: root.has-custom;
+        custom-icon: root.custom-icon;
+        size: root.icon-size;
+        fg: root.selected ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+    }
+
+    Text {
+        x: root.label-x;
+        y: 0;
+        width: root.label-w > 24px ? root.label-w : 24px;
+        height: parent.height;
+        text: root.label;
+        font-size: root.label-size;
+        color: root.selected ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+        vertical-alignment: center;
+        overflow: elide;
     }
 }
 
@@ -452,6 +507,8 @@ export component EphemerisPage inherits Window {
     callback settings-whisper-delete();
     callback settings-htr-download();
     callback settings-htr-delete();
+    callback settings-line-htr-download();
+    callback settings-line-htr-delete();
 
     in property <bool> whisper-model-installed: false;
     in property <bool> whisper-downloading: false;
@@ -459,6 +516,8 @@ export component EphemerisPage inherits Window {
 
     in property <bool> htr-model-installed: false;
     in property <bool> htr-downloading: false;
+    in property <bool> line-htr-model-installed: false;
+    in property <bool> line-htr-downloading: false;
 
     // ── File browser ─────────────────────────────────────────────────────
     // 0 = vault folder, 1 = ICS file, 2 = profile icon image
@@ -553,6 +612,8 @@ export component EphemerisPage inherits Window {
     in property <bool> has-mic: false;
     in property <bool> show-recording-list: false;
     in property <[RecordingEntry]> recording-list: [];
+    in-out property <string> rec-search-query: "";
+    in-out property <string> rec-sort: "date";  // date | title | duration
 
     // 0 = idle, 1 = recording, 2 = paused
     in property <int> rec-state: 0;
@@ -584,6 +645,8 @@ export component EphemerisPage inherits Window {
     callback rec-transcription-close();
     callback rec-transcription-save(string);
     callback rec-transcription-retranscribe();
+    callback rec-search-changed(string);
+    callback rec-sort-changed(string);
 
     // ── Calendar view ─────────────────────────────────────────────────────
     in property <bool> show-calendar: false;
@@ -836,24 +899,16 @@ export component EphemerisPage inherits Window {
                             }
                         }
 
-                        for p in root.profile-list: Rectangle {
-                            property <bool> sel: root.task-profile-filter == p.id;
-                            width: 100px; height: 32px;
-                            background: sel ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
-                            border-radius: 16px; border-width: 2px;
-                            border-color: EinkTheme.btn-border;
-                            HorizontalLayout {
-                                padding-left: 6px; padding-right: 8px;
-                                spacing: 4px; alignment: center;
-                                ProfileIcon {
-                                    icon-char: p.icon-char; has-custom: p.has-custom-icon; custom-icon: p.custom-icon;
-                                    size: 16px; fg: sel ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
-                                }
-                                Text { text: p.name; font-size: 11px;
-                                       color: sel ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
-                                       vertical-alignment: center; overflow: elide; }
-                            }
+                        for p in root.profile-list: ProfileChip {
+                            label: p.name;
+                            icon-char: p.icon-char;
+                            has-custom: p.has-custom-icon;
+                            custom-icon: p.custom-icon;
+                            selected: root.task-profile-filter == p.id;
+                            pill: true;
+                            chip-width: 100px;
                             TouchArea {
+                                width: parent.width; height: parent.height;
                                 clicked => {
                                     root.task-profile-filter = p.id;
                                     root.task-profile-filter-changed(p.id);
@@ -1297,24 +1352,16 @@ export component EphemerisPage inherits Window {
                         }
                     }
 
-                    for p in root.profile-list: Rectangle {
-                        property <bool> sel: root.task-profile-filter == p.id;
-                        width: 100px; height: 32px;
-                        background: sel ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
-                        border-radius: 16px; border-width: 2px;
-                        border-color: EinkTheme.btn-border;
-                        HorizontalLayout {
-                            padding-left: 6px; padding-right: 8px;
-                            spacing: 4px; alignment: center;
-                            ProfileIcon {
-                                icon-char: p.icon-char; has-custom: p.has-custom-icon; custom-icon: p.custom-icon;
-                                size: 16px; fg: sel ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
-                            }
-                            Text { text: p.name; font-size: 11px;
-                                   color: sel ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
-                                   vertical-alignment: center; overflow: elide; }
-                        }
+                    for p in root.profile-list: ProfileChip {
+                        label: p.name;
+                        icon-char: p.icon-char;
+                        has-custom: p.has-custom-icon;
+                        custom-icon: p.custom-icon;
+                        selected: root.task-profile-filter == p.id;
+                        pill: true;
+                        chip-width: 100px;
                         TouchArea {
+                            width: parent.width; height: parent.height;
                             clicked => {
                                 root.task-profile-filter = p.id;
                                 root.task-profile-filter-changed(p.id);
@@ -1412,12 +1459,23 @@ export component EphemerisPage inherits Window {
                             vertical-alignment: top;
                         }
 
+                        // Scratch-out for completed items (closure cue; stays visible for the day).
+                        if item.done: Rectangle {
+                            x: x-title;
+                            y: 16px;
+                            width: title-w > 40px ? title-w : 40px;
+                            height: 1.5px;
+                            background: EinkTheme.text-secondary;
+                            opacity: 0.85;
+                        }
+
                         Text {
                             x: x-due; y: 12px;
                             width: due-w;
                             text: item.due-label;
                             font-size: 11px;
-                            color: item.overdue ? EinkTheme.danger-fg : EinkTheme.text-secondary;
+                            color: item.done ? EinkTheme.text-secondary
+                                : (item.overdue ? EinkTheme.danger-fg : EinkTheme.text-secondary);
                             horizontal-alignment: right;
                         }
 
@@ -2050,6 +2108,7 @@ export component EphemerisPage inherits Window {
 
         VerticalLayout {
             padding: 0px; spacing: 0px;
+            alignment: stretch;
 
             Rectangle {
                 height: 44px;
@@ -2092,88 +2151,216 @@ export component EphemerisPage inherits Window {
 
             Rectangle { height: 2px; background: EinkTheme.chrome-border; }
 
-            for rec[i] in root.recording-list: Rectangle {
-                height: 64px;
+            // Search (mirrors Tasks)
+            Rectangle {
+                height: 44px;
                 background: EinkTheme.canvas-bg;
-
                 HorizontalLayout {
-                    padding-left: 16px; padding-right: 8px;
-                    padding-top: 8px; padding-bottom: 8px;
-                    spacing: 4px;
+                    padding-left: 12px; padding-right: 12px;
+                    padding-top: 6px; padding-bottom: 6px;
+                    spacing: 8px;
 
-                    if rec.show-profile: Rectangle {
-                        width: 22px; height: parent.height;
-                        background: transparent;
-                        ProfileIcon {
-                            icon-char: rec.profile-icon-char;
-                            has-custom: rec.has-custom-profile-icon;
-                            custom-icon: rec.custom-profile-icon;
-                            size: 18px; fg: EinkTheme.btn-fg;
-                        }
-                    }
-
-                    // Primary: open detail (transcript + play).
                     Rectangle {
                         horizontal-stretch: 1;
-                        background: transparent;
-                        VerticalLayout {
-                            spacing: 4px; alignment: center;
-                            Text {
-                                text: rec.title;
-                                font-size: 14px; color: EinkTheme.btn-fg;
-                                overflow: elide;
-                            }
-                            HorizontalLayout {
-                                spacing: 10px;
-                                Text {
-                                    text: rec.duration-label;
-                                    font-size: 11px; color: EinkTheme.text-secondary;
-                                }
-                                Text {
-                                    text: rec.date-label;
-                                    font-size: 11px; color: EinkTheme.text-secondary;
-                                }
-                                if rec.is-transcribing: Text {
-                                    text: "Transcribing…";
-                                    font-size: 11px; color: EinkTheme.btn-fg;
-                                }
-                                if !rec.is-transcribing && rec.has-transcription: Text {
-                                    text: "Transcribed";
-                                    font-size: 11px; color: EinkTheme.text-secondary;
-                                }
-                            }
+                        height: 32px;
+                        border-radius: 4px; border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        background: EinkTheme.canvas-bg;
+                        rec-search-input := TextInput {
+                            x: 8px; width: parent.width - 16px; height: parent.height;
+                            text <=> root.rec-search-query;
+                            font-size: 13px; color: EinkTheme.btn-fg;
+                            single-line: true;
+                            vertical-alignment: center;
+                            edited => { root.rec-search-changed(self.text); }
+                            accepted => { root.rec-search-changed(self.text); }
                         }
-                        TouchArea { clicked => { root.rec-open-tapped(rec.id); } }
                     }
-
                     Rectangle {
-                        width: 40px; height: parent.height;
-                        background: transparent;
+                        width: 56px; height: 32px;
+                        background: EinkTheme.btn-active-bg;
+                        border-radius: 4px; border-width: 2px;
+                        border-color: EinkTheme.btn-border;
                         Text {
-                            text: Icons.delete;
-                            font-family: "Material Icons"; font-size: 20px;
-                            color: EinkTheme.text-secondary;
+                            text: "Go";
+                            font-size: 13px; color: EinkTheme.btn-active-fg;
                             horizontal-alignment: center; vertical-alignment: center;
                             width: parent.width; height: parent.height;
                         }
-                        TouchArea { clicked => { root.rec-delete-tapped(rec.id); } }
+                        TouchArea {
+                            clicked => { root.rec-search-changed(rec-search-input.text); }
+                        }
                     }
-                }
-
-                Rectangle {
-                    x: 0; y: parent.height - 1px;
-                    width: parent.width; height: 1px;
-                    background: EinkTheme.chrome-border; opacity: 0.3;
                 }
             }
 
-            if root.recording-list.length == 0: Rectangle {
-                height: 80px;
+            // Sort bar
+            Rectangle {
+                height: 36px;
                 background: EinkTheme.canvas-bg;
-                Text {
-                    text: "No recordings yet — tap the mic to start";
-                    font-size: 14px; color: EinkTheme.text-secondary;
-                    horizontal-alignment: center; vertical-alignment: center;
+                HorizontalLayout {
+                    padding-left: 12px; padding-right: 12px;
+                    padding-top: 2px; padding-bottom: 2px;
+                    spacing: 4px;
+
+                    Text {
+                        text: "Sort:";
+                        font-size: 12px; color: EinkTheme.text-secondary;
+                        vertical-alignment: center;
+                        width: 34px;
+                    }
+
+                    for s in ["date", "title", "duration"]: Rectangle {
+                        property <bool> sel: root.rec-sort == s;
+                        property <string> lbl: s == "date" ? "Date"
+                            : s == "title" ? "Title" : "Length";
+                        height: 28px; width: lbl == "Length" ? 56px : 52px;
+                        background: sel ? EinkTheme.btn-active-bg : transparent;
+                        border-radius: 4px; border-width: sel ? 2px : 1px;
+                        border-color: EinkTheme.btn-border;
+                        Text { text: lbl; font-size: 11px;
+                               color: sel ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                               horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea { clicked => {
+                            root.rec-sort = s;
+                            root.rec-sort-changed(s);
+                        } }
+                    }
+
+                    Rectangle { horizontal-stretch: 1; }
+                }
+            }
+
+            Rectangle { height: 2px; background: EinkTheme.chrome-border; }
+
+            Flickable {
+                vertical-stretch: 1;
+                content-width: root.width - root.nav-w;
+                content-height: rec-list-col.preferred-height;
+
+                rec-list-col := VerticalLayout {
+                    spacing: 0px;
+                    width: root.width - root.nav-w;
+
+                    for rec[i] in root.recording-list: Rectangle {
+                        // Taller when a transcript line is present so preview breathes.
+                        height: (rec.is-transcribing || rec.transcript-preview != "") ? 88px : 68px;
+                        width: root.width - root.nav-w;
+                        background: EinkTheme.canvas-bg;
+
+                        // Fixed columns so aggregator profile badges don't shift title/meta.
+                        property <length> pad: 14px;
+                        property <length> profile-w: root.active-profile-id == "" ? 26px : 0px;
+                        property <length> delete-w: 40px;
+                        property <length> gap: 8px;
+                        property <length> meta-dur-w: 52px;
+                        property <length> meta-date-w: 110px;
+                        property <length> x-profile: self.pad;
+                        property <length> x-body: self.pad + self.profile-w + (root.active-profile-id == "" ? self.gap : 0px);
+                        property <length> x-delete: self.width - self.pad - self.delete-w;
+                        property <length> body-w: self.x-delete - self.x-body - self.gap;
+
+                        if root.active-profile-id == "": Rectangle {
+                            x: x-profile;
+                            y: (parent.height - 20px) / 2;
+                            width: 22px; height: 22px;
+                            background: transparent;
+                            ProfileIcon {
+                                icon-char: rec.profile-icon-char;
+                                has-custom: rec.has-custom-profile-icon;
+                                custom-icon: rec.custom-profile-icon;
+                                size: 18px; fg: EinkTheme.btn-fg;
+                            }
+                        }
+
+                        // Primary body: title → transcript preview → meta columns
+                        Rectangle {
+                            x: x-body; y: 0;
+                            width: body-w > 40px ? body-w : 40px;
+                            height: parent.height;
+                            background: transparent;
+
+                            VerticalLayout {
+                                padding-top: 10px; padding-bottom: 10px;
+                                spacing: 3px; alignment: start;
+
+                                Text {
+                                    text: rec.title;
+                                    font-size: 14px; font-weight: 700;
+                                    color: EinkTheme.btn-fg;
+                                    overflow: elide;
+                                }
+
+                                if rec.is-transcribing: Text {
+                                    text: "Transcribing…";
+                                    font-size: 12px;
+                                    color: EinkTheme.btn-fg;
+                                    overflow: elide;
+                                }
+
+                                if !rec.is-transcribing && rec.transcript-preview != "": Text {
+                                    text: rec.transcript-preview;
+                                    font-size: 12px;
+                                    color: EinkTheme.text-secondary;
+                                    overflow: elide;
+                                }
+
+                                HorizontalLayout {
+                                    spacing: 0px;
+                                    Text {
+                                        width: meta-dur-w;
+                                        text: rec.duration-label;
+                                        font-size: 11px; color: EinkTheme.text-secondary;
+                                    }
+                                    Text {
+                                        width: meta-date-w;
+                                        text: rec.date-label;
+                                        font-size: 11px; color: EinkTheme.text-secondary;
+                                    }
+                                    Rectangle { horizontal-stretch: 1; }
+                                }
+                            }
+
+                            TouchArea {
+                                width: parent.width; height: parent.height;
+                                clicked => { root.rec-open-tapped(rec.id); }
+                            }
+                        }
+
+                        Rectangle {
+                            x: x-delete; y: 0;
+                            width: delete-w; height: parent.height;
+                            background: transparent;
+                            Text {
+                                text: Icons.delete;
+                                font-family: "Material Icons"; font-size: 20px;
+                                color: EinkTheme.text-secondary;
+                                horizontal-alignment: center; vertical-alignment: center;
+                                width: parent.width; height: parent.height;
+                            }
+                            TouchArea { clicked => { root.rec-delete-tapped(rec.id); } }
+                        }
+
+                        Rectangle {
+                            x: 0; y: parent.height - 1px;
+                            width: parent.width; height: 1px;
+                            background: EinkTheme.chrome-border; opacity: 0.3;
+                        }
+                    }
+
+                    if root.recording-list.length == 0: Rectangle {
+                        height: 100px;
+                        width: root.width - root.nav-w;
+                        background: EinkTheme.canvas-bg;
+                        Text {
+                            text: root.rec-search-query != ""
+                                ? "No recordings match your search"
+                                : "No recordings yet — tap the mic to start";
+                            font-size: 14px; color: EinkTheme.text-secondary;
+                            horizontal-alignment: center; vertical-alignment: center;
+                            width: parent.width; height: parent.height;
+                        }
+                    }
                 }
             }
         }
@@ -4018,6 +4205,49 @@ export component EphemerisPage inherits Window {
                                 }
                             }
                         }
+
+                        Rectangle {
+                            height: 48px;
+                            background: EinkTheme.canvas-bg;
+                            HorizontalLayout {
+                                padding-left: 16px; padding-right: 16px;
+                                padding-top: 6px; padding-bottom: 6px;
+                                spacing: 8px;
+
+                                Text {
+                                    text: "Line model";
+                                    font-size: 14px; color: EinkTheme.btn-fg;
+                                    vertical-alignment: center; width: 110px;
+                                }
+
+                                Text {
+                                    text: root.line-htr-downloading ? "Downloading…"
+                                        : root.line-htr-model-installed ? "Installed (DE·HTR ~10MB)"
+                                        : "Optional image HTR (DE+Latin)";
+                                    font-size: 12px;
+                                    color: root.line-htr-model-installed ? EinkTheme.btn-fg : EinkTheme.text-secondary;
+                                    vertical-alignment: center; horizontal-stretch: 1;
+                                }
+
+                                if !root.line-htr-downloading && !root.line-htr-model-installed: Rectangle {
+                                    width: 84px; height: 32px;
+                                    background: EinkTheme.btn-bg;
+                                    border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                                    Text { text: "Download"; font-size: 12px; color: EinkTheme.btn-fg;
+                                           horizontal-alignment: center; vertical-alignment: center; }
+                                    TouchArea { clicked => { root.settings-line-htr-download(); } }
+                                }
+
+                                if !root.line-htr-downloading && root.line-htr-model-installed: Rectangle {
+                                    width: 60px; height: 32px;
+                                    background: EinkTheme.btn-bg;
+                                    border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                                    Text { text: "Delete"; font-size: 12px; color: EinkTheme.danger-fg;
+                                           horizontal-alignment: center; vertical-alignment: center; }
+                                    TouchArea { clicked => { root.settings-line-htr-delete(); } }
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -4250,25 +4480,17 @@ export component EphemerisPage inherits Window {
                                     vertical-alignment: center; width: 48px;
                                 }
 
-                                for p in root.profile-list: Rectangle {
-                                    property <bool> sel: root.connect-profile-id == p.id;
-                                    // icon via p.icon-char / ProfileIcon
-                                    min-width: 88px; height: 32px;
-                                    background: sel ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
-                                    border-radius: 4px; border-width: 2px;
-                                    border-color: EinkTheme.btn-border;
-                                    HorizontalLayout {
-                                        padding-left: 8px; padding-right: 10px;
-                                        spacing: 4px; alignment: center;
-                                        ProfileIcon {
-                                            icon-char: p.icon-char; has-custom: p.has-custom-icon; custom-icon: p.custom-icon;
-                                            size: 16px; fg: sel ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
-                                        }
-                                        Text { text: p.name; font-size: 12px;
-                                               color: sel ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
-                                               vertical-alignment: center; overflow: elide; }
-                                    }
+                                for p in root.profile-list: ProfileChip {
+                                    label: p.name;
+                                    icon-char: p.icon-char;
+                                    has-custom: p.has-custom-icon;
+                                    custom-icon: p.custom-icon;
+                                    selected: root.connect-profile-id == p.id;
+                                    pill: false;
+                                    chip-width: 100px;
+                                    label-size: 12px;
                                     TouchArea {
+                                        width: parent.width; height: parent.height;
                                         clicked => {
                                             root.connect-profile-id = p.id;
                                             root.connect-profile-changed(p.id);

@@ -46,6 +46,7 @@ pub fn init_tracing() {
 #[cfg(feature = "caldav")]
 pub mod caldav;
 pub mod calendar_cache;
+pub mod line_htr;
 pub mod markdown_tasks;
 pub mod note_search;
 pub mod obsidian;
@@ -65,6 +66,10 @@ pub use aggregation::AggregationService;
 #[cfg(feature = "caldav")]
 pub use caldav::{default_sync_window, CalDavCalendar, CalDavClient, CalDavConfig};
 pub use calendar_cache::CalendarCache;
+pub use line_htr::{
+    prepare_line_htr_input, split_ink_line_bands, ImageLineBand, LineHtrInput, DE_HTR_V2_ALPHABET,
+    LINE_HTR_HEIGHT, LINE_HTR_MAX_WIDTH,
+};
 pub use markdown_tasks::{MarkdownTaskExtractor, DEFAULT_TASKS_INBOX};
 pub use note_search::{
     markdown_to_blocks, markdown_to_plain, search_events, search_local_notes, search_tasks,
@@ -76,16 +81,18 @@ pub use pdf_export::{
 };
 pub use prioritizer::{rank_tasks, task_score};
 pub use stroke_htr::{
-    ctc_greedy_decode, decode_charset, default_line_gap, featurize_line, group_strokes_into_lines,
-    StrokeLine,
+    ctc_decode_with_lm, ctc_greedy_decode, ctc_prefix_beam_decode, decode_charset,
+    default_htr_language_context, default_line_gap, featurize_line, group_strokes_into_lines,
+    CharBigramLm, CtcBeamConfig, CtcFrame, HtrLexicon, StrokeLine,
 };
 pub use task_cache::TaskCache;
 #[cfg(feature = "sqlite")]
 pub use task_provider::LocalTaskProvider;
 pub use task_provider::{ProviderCapabilities, TaskProvider};
 pub use transcriber::{
-    mean_confidence, parse_tesseract_tsv, CascadingTranscriber, FakeTranscriber, NoOpTranscriber,
-    RasterOcrTranscriber, StrokeHtrTranscriber, TextSpan, Transcriber,
+    mean_confidence, parse_tesseract_tsv, CascadingTranscriber, FakeTranscriber,
+    LineImageHtrTranscriber, NoOpTranscriber, RasterOcrTranscriber, StrokeHtrTranscriber, TextSpan,
+    Transcriber,
 };
 pub use vault_export::{
     export_note_markdown, notebook_export_dir, notebook_export_rel, path_under_export_subdir,

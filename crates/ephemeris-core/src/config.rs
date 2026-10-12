@@ -120,6 +120,16 @@ pub struct Config {
     #[serde(default)]
     pub htr_model_dir: Option<PathBuf>,
 
+    /// When true, See-text may use a downloaded line-image HTR model
+    /// (DE·HTR-class CTC) as a cascade peer with stroke HTR and Tesseract.
+    #[serde(default = "default_line_htr_enabled")]
+    pub line_htr_enabled: bool,
+
+    /// Directory for line-image HTR (`model.onnx` + `charset.txt` + `meta.json`).
+    /// When unset, defaults to `$XDG_DATA_HOME/ephemeris/line-htr`.
+    #[serde(default)]
+    pub line_htr_model_dir: Option<PathBuf>,
+
     /// When true, only pen (and desktop mouse) can leave ink on the note canvas;
     /// finger/hand touch is ignored for drawing so a resting palm does not make
     /// artifacts. Finger touch still drives UI chrome and page-swipe gestures.
@@ -167,6 +177,10 @@ fn default_htr_enabled() -> bool {
     true
 }
 
+fn default_line_htr_enabled() -> bool {
+    true
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -184,6 +198,8 @@ impl Default for Config {
             ocr_tessdata: None,
             htr_enabled: default_htr_enabled(),
             htr_model_dir: None,
+            line_htr_enabled: default_line_htr_enabled(),
+            line_htr_model_dir: None,
             pen_only_drawing: default_pen_only_drawing(),
             custom: HashMap::new(),
         }
@@ -329,6 +345,18 @@ fn apply_env_overrides(config: &mut Config) {
     if let Ok(v) = std::env::var("EPHEMERIS_HTR_MODEL_DIR") {
         if !v.trim().is_empty() {
             config.htr_model_dir = Some(PathBuf::from(v));
+        }
+    }
+    if let Ok(v) = std::env::var("EPHEMERIS_LINE_HTR") {
+        match v.to_lowercase().as_str() {
+            "0" | "false" | "off" | "no" => config.line_htr_enabled = false,
+            "1" | "true" | "on" | "yes" => config.line_htr_enabled = true,
+            _ => tracing::warn!("EPHEMERIS_LINE_HTR={v:?} not recognised; ignoring"),
+        }
+    }
+    if let Ok(v) = std::env::var("EPHEMERIS_LINE_HTR_MODEL_DIR") {
+        if !v.trim().is_empty() {
+            config.line_htr_model_dir = Some(PathBuf::from(v));
         }
     }
 }

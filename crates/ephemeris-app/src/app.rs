@@ -8,9 +8,9 @@ use ephemeris_core::{
     export_raster_pages_to_pdf, filter_agenda, markdown_to_blocks, markdown_to_plain,
     search_events, search_local_notes, search_tasks, strip_inline_markdown, sync_notes_to_vault,
     to_agenda_entries, AgendaRange, CalendarEvent, CascadingTranscriber, Config, EventId,
-    MarkdownTaskExtractor, PdfExportOptions, ProfileId, RasterOcrTranscriber, RasterPage,
-    SearchHit, StrokeHtrTranscriber, Task, TaskPriority, TaskProvider, VaultFtsIndex,
-    VaultNoteExport,
+    LineImageHtrTranscriber, MarkdownTaskExtractor, PdfExportOptions, ProfileId,
+    RasterOcrTranscriber, RasterPage, SearchHit, StrokeHtrTranscriber, Task, TaskPriority,
+    TaskProvider, VaultFtsIndex, VaultNoteExport,
 };
 #[cfg(target_os = "linux")]
 use ephemeris_pal::input::{EvdevPenSource, PenTarget};
@@ -44,6 +44,17 @@ const CHROME_SWIPE_MIN_DY: f32 = 20.0;
 
 /// Debounce flag for background vault git commit/push.
 static VAULT_GIT_PUSH_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Completed See-text recognition job (drained on the UI thread).
+struct SeeTextJobResult {
+    /// Generation counter — ignore if the overlay was closed/re-opened.
+    gen: u64,
+    note_id: Option<u32>,
+    display: String,
+    /// `Some(text)` replaces stored transcription; `None` keeps the prior value
+    /// (empty/failed passes must not wipe a previous good result).
+    persist: Option<String>,
+}
 
 /// Wakes the event loop when the Linux evdev pen thread has samples ready.
 #[derive(Debug, Clone, Copy)]
@@ -459,6 +470,13 @@ impl App {
         let htr_download_result: Arc<Mutex<Option<Result<(), String>>>> =
             Arc::new(Mutex::new(None));
         let htr_download_active = Arc::new(AtomicBool::new(false));
+        let line_htr_download_result: Arc<Mutex<Option<Result<(), String>>>> =
+            Arc::new(Mutex::new(None));
+        let line_htr_download_active = Arc::new(AtomicBool::new(false));
+        // See-text OCR/HTR results drained on the UI thread (never block toggle).
+        let see_text_result: Arc<Mutex<Option<SeeTextJobResult>>> = Arc::new(Mutex::new(None));
+        let see_text_active = Arc::new(AtomicBool::new(false));
+        let see_text_gen = Arc::new(AtomicU64::new(0));
         // Completed CalDAV sync batches waiting to merge into the agenda.
         let caldav_pending: Arc<Mutex<Vec<CalendarEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let caldav_active = Arc::new(AtomicBool::new(false));
@@ -586,7 +604,9 @@ impl App {
                 let filter = filter_rc.borrow().clone();
                 let ria = ria_rc.borrow();
                 let inflight = inflight_rc.borrow();
-                let visible: Vec<AppRecording> = recs_rc
+                let search = ui2.get_rec_search_query().to_string();
+                let sort = ui2.get_rec_sort().to_string();
+                let mut visible: Vec<AppRecording> = recs_rc
                     .borrow()
                     .iter()
                     .filter(|r| {
@@ -601,6 +621,8 @@ impl App {
                     .cloned()
                     .collect();
                 drop(ria);
+                visible = filter_recordings_by_query(&visible, &search);
+                sort_recordings(&mut visible, &sort);
                 push_recording_list_comp(
                     &ui2,
                     &visible,
@@ -1332,66 +1354,79 @@ impl App {
         {
             let ui_rc = ui.clone();
             let ui2 = ui.clone_component();
-            let notes2 = notes.clone();
-            let notebooks2 = notebooks.clone();
-            let seq2 = note_id_seq.clone();
-            let nb_seq2 = notebook_id_seq.clone();
-            let data_dir2 = data_dir.clone();
             let cfg2 = config.clone();
+            let mailbox = see_text_result.clone();
+            let active_flag = see_text_active.clone();
+            let gen_counter = see_text_gen.clone();
+            let notes_prior = notes.clone();
             ui.on_note_see_text_toggled(move |show| {
                 if show {
-                    // Clear stale cached text immediately so a prior OCR result
-                    // cannot linger while we re-run recognition on new ink.
+                    // Invalidate any in-flight job; show placeholder immediately
+                    // so the UI stays responsive while HTR/OCR run off-thread.
+                    let gen = gen_counter.fetch_add(1, Ordering::AcqRel) + 1;
+                    active_flag.store(true, Ordering::Release);
                     ui_rc.set_note_text_content("Recognising…");
+
                     let active_id = ui2.get_active_note_id().to_string();
+                    let note_id = active_id.parse::<u32>().ok();
+                    let prior_text = note_id.and_then(|id| {
+                        notes_prior
+                            .borrow()
+                            .iter()
+                            .find(|n| n.id == id)
+                            .and_then(|n| n.text_content.clone())
+                    });
                     let (w, h) = ui_rc.canvas_size();
                     let pixels = ui_rc.get_committed_pixels();
                     let strokes = ui_rc.get_page_strokes();
-                    let cfg = cfg2.borrow();
-                    let cascade = build_cascading_transcriber(&cfg);
-                    let htr_hint = cascade.htr.empty_result_hint();
-                    let ocr_hint = cascade.ocr.empty_result_hint();
-                    drop(cfg);
-                    let (display, persist) = match cascade.transcribe_page(&strokes, w, h, &pixels)
-                    {
-                        Ok(spans) => {
-                            let joined = RasterOcrTranscriber::spans_to_text(&spans);
-                            if joined.is_empty() {
-                                let hint = if !strokes.is_empty() && !cascade.htr.model_available()
-                                {
-                                    htr_hint
-                                } else {
-                                    ocr_hint
-                                };
-                                (hint, None)
-                            } else {
-                                (joined.clone(), Some(joined))
-                            }
+                    let cascade = build_cascading_transcriber(&cfg2.borrow());
+                    let mailbox2 = mailbox.clone();
+                    let active2 = active_flag.clone();
+
+                    std::thread::spawn(move || {
+                        let htr_hint = cascade.htr.empty_result_hint();
+                        let ocr_hint = cascade.ocr.empty_result_hint();
+                        let htr_ready = cascade.htr.model_available();
+                        let (display, persist) =
+                            match cascade.transcribe_page(&strokes, w, h, &pixels) {
+                                Ok(spans) => {
+                                    let joined = RasterOcrTranscriber::spans_to_text(&spans);
+                                    if joined.is_empty() {
+                                        let hint = if !strokes.is_empty() && !htr_ready {
+                                            htr_hint
+                                        } else {
+                                            ocr_hint
+                                        };
+                                        // Keep last good transcription — never wipe on empty.
+                                        match prior_text {
+                                            Some(prev) if !prev.is_empty() => (prev, None),
+                                            _ => (hint, None),
+                                        }
+                                    } else {
+                                        (joined.clone(), Some(joined))
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!("See-text transcription failed: {e}");
+                                    match prior_text {
+                                        Some(prev) if !prev.is_empty() => (prev, None),
+                                        _ => (format!("Transcription failed: {e}"), None),
+                                    }
+                                }
+                            };
+                        if let Ok(mut guard) = mailbox2.lock() {
+                            *guard = Some(SeeTextJobResult {
+                                gen,
+                                note_id,
+                                display,
+                                persist,
+                            });
                         }
-                        Err(e) => {
-                            tracing::warn!("See-text transcription failed: {e}");
-                            (format!("Transcription failed: {e}"), None)
-                        }
-                    };
-                    ui_rc.set_note_text_content(&display);
-                    if !active_id.is_empty() {
-                        if let Ok(id) = active_id.parse::<u32>() {
-                            let mut ns = notes2.borrow_mut();
-                            if let Some(note) = ns.iter_mut().find(|n| n.id == id) {
-                                note.text_content = persist;
-                                note.updated_at = now_secs();
-                            }
-                            drop(ns);
-                            save_notes_index_and_sync_vault(
-                                &data_dir2,
-                                &notes2.borrow(),
-                                &notebooks2.borrow(),
-                                seq2.get(),
-                                nb_seq2.get(),
-                                &cfg2.borrow(),
-                            );
-                        }
-                    }
+                        active2.store(false, Ordering::Release);
+                    });
+                } else {
+                    // Discard late results from a cancelled overlay.
+                    gen_counter.fetch_add(1, Ordering::AcqRel);
                 }
                 // Force a clear refresh so ink disappears under see-text (or
                 // reappears when returning to ink) without eink ghosting.
@@ -2850,6 +2885,20 @@ impl App {
             });
         }
 
+        // ── Recording search / sort → rebuild list ───────────────────────────
+        {
+            let push_recs = push_recordings.clone();
+            ui.on_rec_search_changed(move |_q| {
+                push_recs();
+            });
+        }
+        {
+            let push_recs = push_recordings.clone();
+            ui.on_rec_sort_changed(move |_s| {
+                push_recs();
+            });
+        }
+
         // ── Task filter / sort / profile-chip / search → rebuild list ─────────
         {
             let mgr_tasklist_1 = profile_mgr.clone();
@@ -3159,6 +3208,7 @@ impl App {
                 ui2.set_settings_new_url("".into());
                 ui2.set_whisper_model_installed(find_whisper_model().is_some());
                 ui2.set_htr_model_installed(find_htr_model_installed(&cfg));
+                ui2.set_line_htr_model_installed(find_line_htr_model_installed(&cfg));
                 drop(cfg);
                 ui2.set_show_start_page(false);
                 ui2.set_show_task_view(false);
@@ -3890,6 +3940,38 @@ impl App {
             });
         }
 
+        // ── Settings → line-image HTR download (DE·HTR v2) ────────────────────
+        {
+            let ui2 = ui.clone_component();
+            let cfg2 = config.clone();
+            let dl_result2 = line_htr_download_result.clone();
+            let dl_active2 = line_htr_download_active.clone();
+            ui.on_settings_line_htr_download(move || {
+                if dl_active2.swap(true, Ordering::AcqRel) {
+                    return;
+                }
+                ui2.set_line_htr_downloading(true);
+                let mailbox = dl_result2.clone();
+                let active_flag = dl_active2.clone();
+                let cfg = cfg2.borrow().clone();
+                std::thread::spawn(move || {
+                    let result = download_line_htr_model(&cfg);
+                    if let Ok(mut guard) = mailbox.lock() {
+                        *guard = Some(result);
+                    }
+                    active_flag.store(false, Ordering::Release);
+                });
+            });
+        }
+        {
+            let ui2 = ui.clone_component();
+            let cfg2 = config.clone();
+            ui.on_settings_line_htr_delete(move || {
+                delete_line_htr_model(&cfg2.borrow());
+                ui2.set_line_htr_model_installed(false);
+            });
+        }
+
         // ── File browser → navigate ───────────────────────────────────────────
         {
             let ui2 = ui.clone_component();
@@ -4285,6 +4367,8 @@ impl App {
             data_dir,
             notes: notes.clone(),
             notebooks: notebooks.clone(),
+            note_id_seq: note_id_seq.clone(),
+            notebook_id_seq: notebook_id_seq.clone(),
             config: config.clone(),
             rec_handle,
             recordings: recordings.clone(),
@@ -4298,6 +4382,11 @@ impl App {
             download_active,
             htr_download_result,
             htr_download_active,
+            line_htr_download_result,
+            line_htr_download_active,
+            see_text_result,
+            see_text_active,
+            see_text_gen,
             caldav_pending,
             caldav_active,
             calendar_events: calendar_events.clone(),
@@ -4376,6 +4465,8 @@ struct WinitHandler {
     /// Shared note list — used to map page_idx → note_id for persistence.
     notes: Rc<RefCell<Vec<AppNote>>>,
     notebooks: Rc<RefCell<Vec<AppNotebook>>>,
+    note_id_seq: Rc<Cell<u32>>,
+    notebook_id_seq: Rc<Cell<u32>>,
     config: Rc<RefCell<Config>>,
     /// Active recording handle (Some while recording is in progress).
     rec_handle: Rc<RefCell<Option<RecordingHandle>>>,
@@ -4399,6 +4490,16 @@ struct WinitHandler {
     htr_download_result: Arc<Mutex<Option<Result<(), String>>>>,
     /// True while an HTR model download thread is running.
     htr_download_active: Arc<AtomicBool>,
+    /// Result of a line-image HTR model download.
+    line_htr_download_result: Arc<Mutex<Option<Result<(), String>>>>,
+    /// True while a line-image HTR download thread is running.
+    line_htr_download_active: Arc<AtomicBool>,
+    /// Completed See-text recognition waiting to apply on the UI thread.
+    see_text_result: Arc<Mutex<Option<SeeTextJobResult>>>,
+    /// True while a See-text HTR/OCR worker is running.
+    see_text_active: Arc<AtomicBool>,
+    /// Bumped on each See-text open/close so stale jobs are ignored.
+    see_text_gen: Arc<AtomicU64>,
     /// CalDAV events finished syncing off-thread.
     caldav_pending: Arc<Mutex<Vec<CalendarEvent>>>,
     /// True while a CalDAV sync thread is running.
@@ -4842,6 +4943,80 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
             }
         }
 
+        // --- Drain line-image HTR download result ---
+        if let Ok(mut guard) = self.line_htr_download_result.lock() {
+            if let Some(result) = guard.take() {
+                drop(guard);
+                match result {
+                    Ok(()) => {
+                        self.ui.set_line_htr_downloading(false);
+                        self.ui.set_line_htr_model_installed(true);
+                    }
+                    Err(msg) => {
+                        tracing::error!("Line HTR download failed: {msg}");
+                        self.ui.set_line_htr_downloading(false);
+                        self.ui
+                            .set_line_htr_model_installed(find_line_htr_model_installed(
+                                &self.config.borrow(),
+                            ));
+                    }
+                }
+                if let Some(d) = &self.display {
+                    d.request_redraw();
+                }
+            }
+        }
+
+        // --- Drain See-text recognition ---
+        if let Ok(mut guard) = self.see_text_result.lock() {
+            if let Some(job) = guard.take() {
+                drop(guard);
+                let current_gen = self.see_text_gen.load(Ordering::Acquire);
+                let see_text_open = self.ui.clone_component().get_note_see_text();
+                let active_id = self
+                    .ui
+                    .clone_component()
+                    .get_active_note_id()
+                    .to_string()
+                    .parse::<u32>()
+                    .ok();
+                let still_relevant = see_text_open
+                    && job.gen == current_gen
+                    && match (job.note_id, active_id) {
+                        (Some(a), Some(b)) => a == b,
+                        (None, None) => true,
+                        _ => false,
+                    };
+                if still_relevant {
+                    self.ui.set_note_text_content(&job.display);
+                    if let Some(id) = job.note_id {
+                        let mut did_persist = false;
+                        {
+                            let mut ns = self.notes.borrow_mut();
+                            if let Some(note) = ns.iter_mut().find(|n| n.id == id) {
+                                if let Some(text) = job.persist {
+                                    note.text_content = Some(text);
+                                    note.updated_at = now_secs();
+                                    did_persist = true;
+                                }
+                            }
+                        }
+                        if did_persist {
+                            save_notes_index_and_sync_vault(
+                                &self.data_dir,
+                                &self.notes.borrow(),
+                                &self.notebooks.borrow(),
+                                self.note_id_seq.get(),
+                                self.notebook_id_seq.get(),
+                                &self.config.borrow(),
+                            );
+                        }
+                    }
+                    self.ui.request_screen_change();
+                }
+            }
+        }
+
         // --- Drain completed transcriptions ---
         if let Ok(mut pending) = self.transcription_pending.lock() {
             if !pending.is_empty() {
@@ -4911,9 +5086,11 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
         } else if self.transcription_active.load(Ordering::Relaxed)
             || self.download_active.load(Ordering::Relaxed)
             || self.htr_download_active.load(Ordering::Relaxed)
+            || self.line_htr_download_active.load(Ordering::Relaxed)
+            || self.see_text_active.load(Ordering::Relaxed)
             || self.caldav_active.load(Ordering::Relaxed)
         {
-            // Keep waking while whisper / model download / CalDAV sync runs.
+            // Keep waking while whisper / model download / See-text / CalDAV runs.
             drop(h_opt);
             event_loop.set_control_flow(ControlFlow::WaitUntil(
                 Instant::now() + Duration::from_millis(500),
@@ -5322,12 +5499,18 @@ fn build_recording_list(
         .map(|r| {
             let (show_profile, profile_icon_char, has_custom_profile_icon, custom_profile_icon) =
                 profile_badge_for(&r.profile_id, show_badges, mgr);
+            let preview = r
+                .transcription
+                .as_deref()
+                .map(transcript_preview)
+                .unwrap_or_default();
             ephemeris_ui::RecordingEntry {
                 id: r.id.to_string().as_str().into(),
                 title: r.title.as_str().into(),
                 duration_label: format_rec_duration(r.duration_secs as u64).as_str().into(),
                 date_label: format_rec_date(r.created_at, now_secs()).as_str().into(),
                 has_transcription: r.transcription.is_some(),
+                transcript_preview: preview.as_str().into(),
                 is_transcribing: transcribing.contains(&r.id),
                 show_profile,
                 profile_icon_char: profile_icon_char.as_str().into(),
@@ -5336,6 +5519,61 @@ fn build_recording_list(
             }
         })
         .collect()
+}
+
+/// Collapse whitespace and ellipsize for the recordings list preview line.
+fn transcript_preview(text: &str) -> String {
+    const MAX_CHARS: usize = 110;
+    let collapsed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return String::new();
+    }
+    let count = collapsed.chars().count();
+    if count <= MAX_CHARS {
+        collapsed
+    } else {
+        let truncated: String = collapsed
+            .chars()
+            .take(MAX_CHARS.saturating_sub(1))
+            .collect();
+        format!("{truncated}…")
+    }
+}
+
+fn filter_recordings_by_query(recordings: &[AppRecording], query: &str) -> Vec<AppRecording> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return recordings.to_vec();
+    }
+    recordings
+        .iter()
+        .filter(|r| {
+            r.title.to_lowercase().contains(&q)
+                || r.transcription
+                    .as_deref()
+                    .map(|t| t.to_lowercase().contains(&q))
+                    .unwrap_or(false)
+        })
+        .cloned()
+        .collect()
+}
+
+fn sort_recordings(recordings: &mut [AppRecording], sort: &str) {
+    match sort {
+        "title" => recordings.sort_by(|a, b| {
+            a.title
+                .to_lowercase()
+                .cmp(&b.title.to_lowercase())
+                .then(b.created_at.cmp(&a.created_at))
+        }),
+        "duration" => recordings.sort_by(|a, b| {
+            b.duration_secs
+                .cmp(&a.duration_secs)
+                .then(b.created_at.cmp(&a.created_at))
+        }),
+        // Newest first
+        _ => recordings.sort_by_key(|r| std::cmp::Reverse(r.created_at)),
+    }
 }
 
 fn push_recording_list_comp(
@@ -5651,17 +5889,102 @@ fn resolve_htr_model_dir(config: &ephemeris_core::Config) -> PathBuf {
 fn build_cascading_transcriber(config: &ephemeris_core::Config) -> CascadingTranscriber {
     let htr =
         StrokeHtrTranscriber::from_parts(config.htr_enabled, Some(resolve_htr_model_dir(config)));
+    let line_htr = LineImageHtrTranscriber::from_parts(
+        config.line_htr_enabled,
+        Some(resolve_line_htr_model_dir(config)),
+    );
     let ocr = RasterOcrTranscriber::from_parts(
         config.ocr_enabled,
         config.ocr_languages.clone(),
         config.ocr_tessdata.clone(),
     );
-    CascadingTranscriber::new(htr, ocr)
+    CascadingTranscriber::with_line_htr(htr, line_htr, ocr)
 }
 
 fn find_htr_model_installed(config: &ephemeris_core::Config) -> bool {
     let dir = resolve_htr_model_dir(config);
     dir.join("model.onnx").is_file() || dir.join("model.rten").is_file()
+}
+
+fn default_line_htr_model_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let base = std::env::var("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(home).join(".local").join("share"));
+    base.join("ephemeris").join("line-htr")
+}
+
+fn resolve_line_htr_model_dir(config: &ephemeris_core::Config) -> PathBuf {
+    config
+        .line_htr_model_dir
+        .clone()
+        .unwrap_or_else(default_line_htr_model_dir)
+}
+
+fn find_line_htr_model_installed(config: &ephemeris_core::Config) -> bool {
+    let dir = resolve_line_htr_model_dir(config);
+    dir.join("model.onnx").is_file() || dir.join("model.rten").is_file()
+}
+
+/// Download DE·HTR v2 int8 ONNX (~10.4 MB) from Hugging Face + write charset/meta.
+fn download_line_htr_model(config: &ephemeris_core::Config) -> Result<(), String> {
+    const MODEL_URL: &str = "https://huggingface.co/naeyn/de-htr-web-v2/resolve/main/model.onnx";
+    let dest_dir = resolve_line_htr_model_dir(config);
+    std::fs::create_dir_all(&dest_dir).map_err(|e| format!("mkdir failed: {e}"))?;
+    let model_path = dest_dir.join("model.onnx");
+    let mut resp =
+        reqwest::blocking::get(MODEL_URL).map_err(|e| format!("download failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "HTTP {} fetching line HTR model from Hugging Face",
+            resp.status()
+        ));
+    }
+    {
+        let mut f =
+            std::fs::File::create(&model_path).map_err(|e| format!("create model failed: {e}"))?;
+        std::io::copy(&mut resp, &mut f).map_err(|e| format!("write failed: {e}"))?;
+    }
+    // charset.txt — one char per line for load_line_htr_meta
+    let alphabet = ephemeris_core::DE_HTR_V2_ALPHABET;
+    let mut charset = String::new();
+    for ch in alphabet.chars() {
+        charset.push(ch);
+        charset.push('\n');
+    }
+    std::fs::write(dest_dir.join("charset.txt"), charset)
+        .map_err(|e| format!("write charset failed: {e}"))?;
+    let meta = serde_json::json!({
+        "blank_index": 0,
+        "alphabet": alphabet,
+        "input_name": "image",
+        "output_name": "logits",
+        "image_height": 64,
+        "max_width": 1024,
+        "source": "naeyn/de-htr-web-v2",
+        "license": "Apache-2.0",
+        "notes": "German-focused modern handwriting CTC; Latin+digits also covered. PineNote: ~0.2–1s/line on A55 typical.",
+    });
+    std::fs::write(
+        dest_dir.join("meta.json"),
+        serde_json::to_string_pretty(&meta).unwrap_or_else(|_| "{}".into()),
+    )
+    .map_err(|e| format!("write meta failed: {e}"))?;
+    if find_line_htr_model_installed(config) {
+        Ok(())
+    } else {
+        Err(format!(
+            "download finished but model.onnx missing in {}",
+            dest_dir.display()
+        ))
+    }
+}
+
+fn delete_line_htr_model(config: &ephemeris_core::Config) {
+    let dir = resolve_line_htr_model_dir(config);
+    for name in ["model.onnx", "model.rten", "charset.txt", "meta.json"] {
+        let _ = std::fs::remove_file(dir.join(name));
+    }
 }
 
 fn download_htr_model(config: &ephemeris_core::Config) -> Result<(), String> {
@@ -7806,11 +8129,32 @@ const CLOSED_TASK_RETENTION_SECS: u64 = 14 * 86_400;
 /// Slint task-list row: id, title, priority label, priority int, due, overdue, done, profile.
 type TaskListRow = (String, String, String, i32, String, bool, bool, String);
 
+/// True when `ts` falls on the same local calendar day as `now`.
+fn same_local_day(ts: u64, now: u64) -> bool {
+    use chrono::{DateTime, Local, Utc};
+    let a = DateTime::<Utc>::from_timestamp(ts as i64, 0).map(|u| u.with_timezone(&Local));
+    let b = DateTime::<Utc>::from_timestamp(now as i64, 0).map(|u| u.with_timezone(&Local));
+    match (a, b) {
+        (Some(a), Some(b)) => a.date_naive() == b.date_naive(),
+        _ => false,
+    }
+}
+
 fn build_full_task_list(tasks: &[Task], now: u64, filter: &str, sort: &str) -> Vec<TaskListRow> {
     let mut v: Vec<_> = tasks
         .iter()
         .filter(|t| match filter {
-            "active" => !t.done,
+            // Active keeps today's completions scratched-out (Zeigarnik closure)
+            // until local midnight; older done items leave the working list.
+            "active" => {
+                if !t.done {
+                    true
+                } else {
+                    t.completed_at
+                        .map(|ts| same_local_day(ts, now))
+                        .unwrap_or(false)
+                }
+            }
             "done" => t.done,
             // "all": hide long-closed items so the list stays usable
             _ => {
@@ -7839,15 +8183,23 @@ fn build_full_task_list(tasks: &[Task], now: u64, filter: &str, sort: &str) -> V
         .collect();
     match sort {
         "due" => v.sort_by(|a, b| {
-            // tasks with no due date sort last
-            let due_a = if a.4.is_empty() { u64::MAX } else { 0 };
-            let due_b = if b.4.is_empty() { u64::MAX } else { 0 };
-            due_a.cmp(&due_b).then(a.5.cmp(&b.5))
+            // open before done, then tasks with no due date sort last
+            a.6.cmp(&b.6).then({
+                let due_a = if a.4.is_empty() { u64::MAX } else { 0 };
+                let due_b = if b.4.is_empty() { u64::MAX } else { 0 };
+                due_a.cmp(&due_b).then(a.5.cmp(&b.5))
+            })
         }),
-        "title" => v.sort_by_key(|a| a.1.to_lowercase()),
-        "added" => {} // preserve original order
+        "title" => v.sort_by(|a, b| {
+            a.6.cmp(&b.6)
+                .then(a.1.to_lowercase().cmp(&b.1.to_lowercase()))
+        }),
+        "added" => {
+            // preserve original order but keep open tasks above today's done
+            v.sort_by_key(|a| a.6)
+        }
         _ => {
-            // priority, with open tasks before closed when mixed ("all")
+            // priority, with open tasks before closed when mixed
             v.sort_by(|a, b| a.6.cmp(&b.6).then(a.3.cmp(&b.3)))
         }
     }
@@ -8236,5 +8588,87 @@ mod tests {
         assert_eq!(by_tag.len(), 1);
         assert_eq!(by_tag[0].title, "Write docs");
         assert_eq!(filter_tasks_by_query(&tasks, "").len(), 2);
+    }
+
+    #[test]
+    fn active_filter_keeps_completed_today_scratched() {
+        use chrono::{Duration, Local, TimeZone};
+        let pid = ProfileId::new();
+        let today = Local::now().date_naive();
+        let noon_today = today.and_hms_opt(12, 0, 0).expect("noon");
+        let noon_yesterday = (today - Duration::days(1))
+            .and_hms_opt(12, 0, 0)
+            .expect("noon");
+        let now = Local
+            .from_local_datetime(&noon_today)
+            .single()
+            .expect("local")
+            .timestamp() as u64;
+        let yesterday_ts = Local
+            .from_local_datetime(&noon_yesterday)
+            .single()
+            .expect("local")
+            .timestamp() as u64;
+
+        let open = Task::new("Still open", pid);
+        let mut done_today = Task::new("Done today", pid);
+        done_today.set_done(true);
+        done_today.completed_at = Some(now - 3600);
+        let mut done_yesterday = Task::new("Done yesterday", pid);
+        done_yesterday.set_done(true);
+        done_yesterday.completed_at = Some(yesterday_ts);
+
+        let tasks = vec![open, done_today, done_yesterday];
+        let rows = build_full_task_list(&tasks, now, "active", "priority");
+        let titles: Vec<_> = rows.iter().map(|r| r.1.as_str()).collect();
+        assert!(titles.contains(&"Still open"));
+        assert!(titles.contains(&"Done today"));
+        assert!(!titles.contains(&"Done yesterday"));
+        // Open tasks sort before scratched-out done
+        assert_eq!(rows[0].1, "Still open");
+        assert!(rows.iter().any(|r| r.1 == "Done today" && r.6));
+    }
+
+    #[test]
+    fn transcript_preview_collapses_and_ellipsizes() {
+        assert_eq!(transcript_preview("  hello   world  "), "hello world");
+        let long = "word ".repeat(40);
+        let preview = transcript_preview(&long);
+        assert!(preview.ends_with('…'));
+        assert!(preview.chars().count() <= 110);
+    }
+
+    #[test]
+    fn filter_and_sort_recordings() {
+        let a = AppRecording {
+            id: 1,
+            title: "Alpha meeting".into(),
+            duration_secs: 30,
+            created_at: 100,
+            audio_filename: "a.wav".into(),
+            transcription: Some("talk about milk".into()),
+            profile_id: String::new(),
+        };
+        let b = AppRecording {
+            id: 2,
+            title: "Beta notes".into(),
+            duration_secs: 90,
+            created_at: 200,
+            audio_filename: "b.wav".into(),
+            transcription: None,
+            profile_id: String::new(),
+        };
+        let all = vec![a, b];
+        let milk = filter_recordings_by_query(&all, "milk");
+        assert_eq!(milk.len(), 1);
+        assert_eq!(milk[0].id, 1);
+
+        let mut by_date = all.clone();
+        sort_recordings(&mut by_date, "date");
+        assert_eq!(by_date[0].id, 2);
+
+        let mut by_len = all.clone();
+        sort_recordings(&mut by_len, "duration");
+        assert_eq!(by_len[0].id, 2);
     }
 }

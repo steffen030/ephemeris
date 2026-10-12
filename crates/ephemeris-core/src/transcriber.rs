@@ -3,10 +3,17 @@
 //! Preferred path (ephemeris-5g2): [`CascadingTranscriber`] — online stroke HTR
 //! when strokes + model are available, else [`RasterOcrTranscriber`] (Tesseract).
 
+#[cfg(feature = "htr")]
+use crate::line_htr::{
+    ctc_greedy_decode_logits, decode_line_alphabet, line_logits_confidence, DE_HTR_V2_ALPHABET,
+};
+use crate::line_htr::{prepare_line_htr_input, split_ink_line_bands};
 use crate::model::{Point, Stroke, Tool};
 #[cfg(feature = "htr")]
 use crate::stroke_htr::{
-    ctc_greedy_decode, ctc_softmax_confidence, decode_charset_with_blank, features_to_tensor,
+    ctc_decode_with_lm, ctc_softmax_confidence, decode_charset_with_blank,
+    default_htr_language_context, features_to_tensor, CharBigramLm, CtcBeamConfig, CtcFrame,
+    HtrLexicon,
 };
 use crate::stroke_htr::{default_line_gap, featurize_line, group_strokes_into_lines};
 #[cfg(feature = "ocr")]
@@ -29,6 +36,9 @@ pub struct TextSpan {
     pub height: f32,
     /// Model confidence in `[0, 1]`. Negative when unknown (e.g. OCR without score).
     pub confidence: f32,
+    /// Tesseract / layout line index when known (`>= 0`); `-1` when unknown
+    /// (e.g. stroke HTR line spans — treat each span as its own line).
+    pub line: i32,
 }
 
 impl TextSpan {
@@ -40,6 +50,7 @@ impl TextSpan {
             width,
             height,
             confidence: -1.0,
+            line: -1,
         }
     }
 }
@@ -109,31 +120,37 @@ pub fn mean_confidence(spans: &[TextSpan]) -> f32 {
     }
 }
 
-/// Cascade: stroke HTR first, Tesseract OCR fallback (ephemeris-5g2).
+/// Cascade: stroke HTR + line-image HTR + Tesseract (ephemeris-5g2 / 9hh.1).
 pub struct CascadingTranscriber {
     pub htr: StrokeHtrTranscriber,
+    pub line_htr: LineImageHtrTranscriber,
     pub ocr: RasterOcrTranscriber,
-    /// Minimum mean HTR confidence to accept (else fall through to OCR).
+    /// Minimum mean neural confidence to prefer over empty OCR.
     pub min_htr_confidence: f32,
 }
 
 impl CascadingTranscriber {
     pub fn new(htr: StrokeHtrTranscriber, ocr: RasterOcrTranscriber) -> Self {
+        Self::with_line_htr(htr, LineImageHtrTranscriber::default(), ocr)
+    }
+
+    pub fn with_line_htr(
+        htr: StrokeHtrTranscriber,
+        line_htr: LineImageHtrTranscriber,
+        ocr: RasterOcrTranscriber,
+    ) -> Self {
         Self {
             htr,
+            line_htr,
             ocr,
             // Slightly stricter than the old 0.35 so weak OnlineHTR guesses
-            // fall through to preprocessed Tesseract (better for print / letters).
+            // fall through to preprocessed Tesseract / line HTR.
             min_htr_confidence: 0.45,
         }
     }
 
-    /// Transcribe a page using strokes when possible, else / on low confidence
-    /// the gray8 raster via Tesseract.
-    ///
-    /// When both backends return text, pick the higher mean-confidence result
-    /// (OCR wins ties by +0.05 so print/block letters are not stuck on a weak
-    /// HTR decode).
+    /// Transcribe a page: stroke HTR, line-image HTR, and Tesseract in parallel;
+    /// keep the highest mean-confidence non-empty result.
     pub fn transcribe_page(
         &self,
         strokes: &[Stroke],
@@ -141,17 +158,46 @@ impl CascadingTranscriber {
         height: u32,
         gray8: &[u8],
     ) -> crate::Result<Vec<TextSpan>> {
-        let htr_spans = if !strokes.is_empty() && self.htr.enabled && self.htr.model_available() {
-            self.htr.transcribe(strokes)?
-        } else {
-            Vec::new()
-        };
-        let ocr_spans = self.ocr.transcribe_raster(width, height, gray8)?;
-        Ok(pick_cascade_spans(
-            &htr_spans,
-            &ocr_spans,
+        let run_stroke = !strokes.is_empty() && self.htr.enabled && self.htr.model_available();
+        let run_line = self.line_htr.enabled && self.line_htr.model_available();
+        let (stroke_r, line_r, ocr_r) = std::thread::scope(|scope| {
+            let stroke_h = scope.spawn(|| {
+                if run_stroke {
+                    self.htr.transcribe(strokes)
+                } else {
+                    Ok(Vec::new())
+                }
+            });
+            let line_h = scope.spawn(|| {
+                if run_line {
+                    self.line_htr.transcribe_raster(width, height, gray8)
+                } else {
+                    Ok(Vec::new())
+                }
+            });
+            let ocr_h = scope.spawn(|| self.ocr.transcribe_raster(width, height, gray8));
+            (stroke_h.join(), line_h.join(), ocr_h.join())
+        });
+        let stroke_spans = join_worker(stroke_r, "stroke HTR")?;
+        let line_spans = join_worker(line_r, "line HTR")?;
+        let ocr_spans = join_worker(ocr_r, "OCR")?;
+        Ok(pick_best_cascade_spans(
+            &[&stroke_spans, &line_spans, &ocr_spans],
             self.min_htr_confidence,
         ))
+    }
+}
+
+fn join_worker(
+    result: Result<crate::Result<Vec<TextSpan>>, Box<dyn std::any::Any + Send>>,
+    label: &str,
+) -> crate::Result<Vec<TextSpan>> {
+    match result {
+        Ok(Ok(s)) => Ok(s),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(crate::AppError::InvalidInput(format!(
+            "{label} worker thread panicked"
+        ))),
     }
 }
 
@@ -161,32 +207,37 @@ fn pick_cascade_spans(
     ocr_spans: &[TextSpan],
     min_htr_confidence: f32,
 ) -> Vec<TextSpan> {
-    let htr_scored = !htr_spans.is_empty()
-        && (htr_spans.iter().any(|s| s.confidence < 0.0)
-            || mean_confidence(htr_spans) >= min_htr_confidence);
-    let ocr_ok = !ocr_spans.is_empty();
-    match (htr_scored, ocr_ok) {
-        (true, true) => {
-            let hc = mean_confidence(htr_spans);
-            let oc = mean_confidence(ocr_spans);
-            // Prefer OCR when it is clearly more confident (print / letters).
-            if oc + 0.05 >= hc {
-                ocr_spans.to_vec()
-            } else {
-                htr_spans.to_vec()
-            }
+    pick_best_cascade_spans(&[htr_spans, ocr_spans], min_htr_confidence)
+}
+
+fn effective_cascade_score(spans: &[TextSpan]) -> f32 {
+    let m = mean_confidence(spans);
+    if m < 0.0 {
+        0.5
+    } else {
+        m
+    }
+}
+
+/// Pick the highest mean-confidence non-empty candidate.
+///
+/// Unknown confidences (`< 0`) count as `0.5`. When a neural result is below
+/// `min_htr_confidence` and another candidate scores higher, the stronger one
+/// wins (same spirit as the old HTR→OCR gate).
+fn pick_best_cascade_spans(candidates: &[&[TextSpan]], min_htr_confidence: f32) -> Vec<TextSpan> {
+    let mut best: Option<(f32, &[TextSpan])> = None;
+    for spans in candidates.iter().copied().filter(|s| !s.is_empty()) {
+        let mut score = effective_cascade_score(spans);
+        // Soft-penalise very weak neural guesses so OCR/line peers can win.
+        if score < min_htr_confidence && spans.iter().all(|s| s.confidence >= 0.0) {
+            score *= 0.85;
         }
-        (true, false) => htr_spans.to_vec(),
-        (false, true) => ocr_spans.to_vec(),
-        (false, false) => {
-            // Last resort: any non-empty HTR even if below threshold.
-            if !htr_spans.is_empty() {
-                htr_spans.to_vec()
-            } else {
-                ocr_spans.to_vec()
-            }
+        match best {
+            Some((bs, _)) if bs >= score => {}
+            _ => best = Some((score, spans)),
         }
     }
+    best.map(|(_, s)| s.to_vec()).unwrap_or_default()
 }
 
 impl Transcriber for CascadingTranscriber {
@@ -210,7 +261,16 @@ impl Transcriber for CascadingTranscriber {
         height: u32,
         gray8: &[u8],
     ) -> crate::Result<Vec<TextSpan>> {
-        self.ocr.transcribe_raster(width, height, gray8)
+        let line = if self.line_htr.enabled && self.line_htr.model_available() {
+            self.line_htr.transcribe_raster(width, height, gray8)?
+        } else {
+            Vec::new()
+        };
+        let ocr = self.ocr.transcribe_raster(width, height, gray8)?;
+        Ok(pick_best_cascade_spans(
+            &[&line, &ocr],
+            self.min_htr_confidence,
+        ))
     }
 }
 
@@ -234,6 +294,10 @@ struct HtrSession {
     charset: String,
     /// CTC blank class index (OnlineHTR / Carbune uses `0`).
     blank_index: usize,
+    /// Character bigram LM + note lexicon for beam rescoring (ephemeris-9hh).
+    lm: CharBigramLm,
+    lexicon: HtrLexicon,
+    beam: CtcBeamConfig,
 }
 
 impl Clone for StrokeHtrTranscriber {
@@ -334,10 +398,14 @@ impl StrokeHtrTranscriber {
             .map_err(|e| crate::AppError::InvalidInput(format!("load HTR model: {e}")))?;
         let charset = load_charset(dir);
         let blank_index = load_blank_index(dir);
+        let (lm, lexicon) = default_htr_language_context(&charset, blank_index);
         *guard = Some(HtrSession {
             model,
             charset,
             blank_index,
+            lm,
+            lexicon,
+            beam: CtcBeamConfig::default(),
         });
         Ok(())
     }
@@ -377,7 +445,19 @@ impl StrokeHtrTranscriber {
             _ => return Ok((String::new(), 0.0)),
         };
         let blank = sess.blank_index.min(c.saturating_sub(1));
-        let path = ctc_greedy_decode(&logits, time, c, blank);
+        // Prefix beam + char LM / lexicon (ASR-style context on device).
+        let path = ctc_decode_with_lm(
+            CtcFrame {
+                log_probs: &logits,
+                time_steps: time,
+                num_classes: c,
+                blank,
+                charset: &sess.charset,
+            },
+            sess.beam,
+            Some(&sess.lm),
+            Some(&sess.lexicon),
+        );
         let text = decode_charset_with_blank(&path, &sess.charset, blank);
         let conf = ctc_softmax_confidence(&logits, time, c, blank);
         Ok((text, conf))
@@ -458,6 +538,313 @@ impl Transcriber for StrokeHtrTranscriber {
                 width: line.width,
                 height: line.height,
                 confidence: conf,
+                // Each HTR decode is one handwritten line.
+                line: spans.len() as i32,
+            });
+        }
+        Ok(spans)
+    }
+}
+
+/// Line-image CTC HTR (ephemeris-9hh.1) — DE·HTR v2-class ONNX via RTen.
+///
+/// Segments the page gray8 into ink bands, resizes each to 64×W, and runs a
+/// downloaded line model. Without the `htr` feature or model files, returns
+/// empty spans so the cascade falls through to Tesseract.
+pub struct LineImageHtrTranscriber {
+    pub enabled: bool,
+    /// Directory with `model.onnx` (or `model.rten`) + `charset.txt` + `meta.json`.
+    pub model_dir: Option<PathBuf>,
+    #[cfg(feature = "htr")]
+    session: Mutex<Option<LineHtrSession>>,
+}
+
+#[cfg(feature = "htr")]
+struct LineHtrSession {
+    model: rten::Model,
+    alphabet: String,
+    blank_index: usize,
+    input_name: String,
+    output_name: String,
+}
+
+impl Clone for LineImageHtrTranscriber {
+    fn clone(&self) -> Self {
+        Self {
+            enabled: self.enabled,
+            model_dir: self.model_dir.clone(),
+            #[cfg(feature = "htr")]
+            session: Mutex::new(None),
+        }
+    }
+}
+
+impl std::fmt::Debug for LineImageHtrTranscriber {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LineImageHtrTranscriber")
+            .field("enabled", &self.enabled)
+            .field("model_dir", &self.model_dir)
+            .finish()
+    }
+}
+
+impl Default for LineImageHtrTranscriber {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            model_dir: None,
+            #[cfg(feature = "htr")]
+            session: Mutex::new(None),
+        }
+    }
+}
+
+impl LineImageHtrTranscriber {
+    pub fn from_parts(enabled: bool, model_dir: Option<PathBuf>) -> Self {
+        Self {
+            enabled,
+            model_dir,
+            #[cfg(feature = "htr")]
+            session: Mutex::new(None),
+        }
+    }
+
+    pub fn model_available(&self) -> bool {
+        let Some(dir) = self.model_dir.as_ref() else {
+            return false;
+        };
+        dir.join("model.onnx").is_file() || dir.join("model.rten").is_file()
+    }
+
+    pub fn empty_result_hint(&self) -> String {
+        if !self.enabled {
+            return "Line handwriting model is disabled.".into();
+        }
+        if !self.model_available() {
+            return "Line HTR model not installed. Settings → Handwriting → Line model.".into();
+        }
+        "No text recognised from line image HTR.".into()
+    }
+
+    #[cfg(feature = "htr")]
+    fn ensure_session(&self) -> crate::Result<()> {
+        let mut guard = self
+            .session
+            .lock()
+            .map_err(|_| crate::AppError::InvalidInput("line HTR session lock poisoned".into()))?;
+        if guard.is_some() {
+            return Ok(());
+        }
+        let Some(dir) = self.model_dir.as_ref() else {
+            return Ok(());
+        };
+        let onnx_path = dir.join("model.onnx");
+        let rten_path = dir.join("model.rten");
+        let model_path = if onnx_path.is_file() {
+            onnx_path
+        } else if rten_path.is_file() {
+            rten_path
+        } else {
+            return Ok(());
+        };
+        let model = rten::Model::load_file(&model_path)
+            .map_err(|e| crate::AppError::InvalidInput(format!("load line HTR model: {e}")))?;
+        let (alphabet, blank_index, input_name, output_name) = load_line_htr_meta(dir);
+        *guard = Some(LineHtrSession {
+            model,
+            alphabet,
+            blank_index,
+            input_name,
+            output_name,
+        });
+        Ok(())
+    }
+
+    #[cfg(feature = "htr")]
+    fn infer_line_image(
+        &self,
+        input: &crate::line_htr::LineHtrInput,
+    ) -> crate::Result<(String, f32)> {
+        use rten_tensor::{AsView, Layout, NdTensor};
+
+        self.ensure_session()?;
+        let guard = self
+            .session
+            .lock()
+            .map_err(|_| crate::AppError::InvalidInput("line HTR session lock poisoned".into()))?;
+        let Some(sess) = guard.as_ref() else {
+            return Ok((String::new(), 0.0));
+        };
+        let w = input.width as usize;
+        let h = input.height as usize;
+        if w == 0 || h == 0 || input.pixels.len() < w * h {
+            return Ok((String::new(), 0.0));
+        }
+        // NCHW: [1, 1, H, W] — DE·HTR v2 single I/O; prefer named nodes when present.
+        let tensor = NdTensor::from_data([1, 1, h, w], input.pixels.clone());
+        let outputs = {
+            let in_id = sess
+                .model
+                .node_id(&sess.input_name)
+                .ok()
+                .or_else(|| sess.model.input_ids().first().copied());
+            let out_id = sess
+                .model
+                .node_id(&sess.output_name)
+                .ok()
+                .or_else(|| sess.model.output_ids().first().copied());
+            match (in_id, out_id) {
+                (Some(iin), Some(oout)) => sess
+                    .model
+                    .run(vec![(iin, tensor.view().into())], &[oout], None)
+                    .map_err(|e| crate::AppError::InvalidInput(format!("line HTR infer: {e}")))?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| crate::AppError::InvalidInput("line HTR: no outputs".into()))?,
+                _ => sess
+                    .model
+                    .run_one(tensor.view().into(), None)
+                    .map_err(|e| crate::AppError::InvalidInput(format!("line HTR infer: {e}")))?,
+            }
+        };
+        let out = outputs
+            .into_tensor::<f32>()
+            .ok_or_else(|| crate::AppError::InvalidInput("line HTR output not f32".into()))?;
+        let shape = out.shape().to_vec();
+        let logits = out.into_data();
+        let c = sess.alphabet.chars().count() + 1;
+        let time = match shape.as_slice() {
+            [1, t_out, c_out] if *c_out == c => *t_out,
+            [t_out, c_out] if *c_out == c => *t_out,
+            [1, c_out, t_out] if *c_out == c => *t_out, // NCT
+            _ if c > 0 && logits.len() % c == 0 => logits.len() / c,
+            _ => return Ok((String::new(), 0.0)),
+        };
+        // If layout was NCT, transpose would be needed — DE·HTR v2 is T×C in
+        // docs as logits; RTen typically keeps export order. Prefer T×C.
+        let logits = match shape.as_slice() {
+            [1, c_out, t_out] if *c_out == c => {
+                // Transpose NCT → NTC flat T*C
+                let mut ntc = vec![0.0f32; time * c];
+                for t in 0..time {
+                    for ci in 0..c {
+                        ntc[t * c + ci] = logits[ci * time + t];
+                    }
+                }
+                ntc
+            }
+            _ => logits,
+        };
+        let blank = sess.blank_index.min(c.saturating_sub(1));
+        let path = ctc_greedy_decode_logits(&logits, time, c, blank);
+        let text = decode_line_alphabet(&path, &sess.alphabet, blank);
+        let conf = line_logits_confidence(&logits, time, c, blank);
+        Ok((text, conf))
+    }
+
+    #[cfg(not(feature = "htr"))]
+    fn infer_line_image(
+        &self,
+        _input: &crate::line_htr::LineHtrInput,
+    ) -> crate::Result<(String, f32)> {
+        Ok((String::new(), 0.0))
+    }
+}
+
+#[cfg(feature = "htr")]
+fn load_line_htr_meta(dir: &std::path::Path) -> (String, usize, String, String) {
+    let meta_path = dir.join("meta.json");
+    let charset_path = dir.join("charset.txt");
+    let alphabet_from_file = std::fs::read_to_string(&charset_path).ok().map(|raw| {
+        if raw.contains('\n') {
+            raw.lines()
+                .map(|l| l.trim_end_matches('\r'))
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(|l| l.chars().next().unwrap_or(' '))
+                .collect::<String>()
+        } else {
+            raw.chars().filter(|c| *c != '\n' && *c != '\r').collect()
+        }
+    });
+
+    #[derive(serde::Deserialize)]
+    struct Meta {
+        #[serde(default)]
+        blank_index: usize,
+        #[serde(default)]
+        alphabet: String,
+        #[serde(default)]
+        input_name: String,
+        #[serde(default)]
+        output_name: String,
+    }
+
+    let meta = std::fs::read_to_string(&meta_path)
+        .ok()
+        .and_then(|r| serde_json::from_str::<Meta>(&r).ok());
+
+    let alphabet = alphabet_from_file
+        .or_else(|| {
+            meta.as_ref()
+                .map(|m| m.alphabet.clone())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| DE_HTR_V2_ALPHABET.to_string());
+    let blank = meta.as_ref().map(|m| m.blank_index).unwrap_or(0);
+    let input = meta
+        .as_ref()
+        .map(|m| m.input_name.clone())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "image".into());
+    let output = meta
+        .as_ref()
+        .map(|m| m.output_name.clone())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "logits".into());
+    (alphabet, blank, input, output)
+}
+
+impl Transcriber for LineImageHtrTranscriber {
+    fn transcribe(&self, strokes: &[Stroke]) -> crate::Result<Vec<TextSpan>> {
+        if !self.enabled || strokes.is_empty() || !self.model_available() {
+            return Ok(Vec::new());
+        }
+        let (w, h, gray) = rasterize_strokes(strokes);
+        self.transcribe_raster(w, h, &gray)
+    }
+
+    fn transcribe_raster(
+        &self,
+        width: u32,
+        height: u32,
+        gray8: &[u8],
+    ) -> crate::Result<Vec<TextSpan>> {
+        if !self.enabled || !self.model_available() {
+            return Ok(Vec::new());
+        }
+        #[cfg(feature = "htr")]
+        {
+            self.ensure_session()?;
+        }
+        let bands = split_ink_line_bands(width, height, gray8);
+        let mut spans = Vec::new();
+        for (i, band) in bands.iter().enumerate() {
+            let Some(input) = prepare_line_htr_input(width, height, gray8, band) else {
+                continue;
+            };
+            let (text, conf) = self.infer_line_image(&input)?;
+            let text = text.trim().to_string();
+            if text.is_empty() {
+                continue;
+            }
+            spans.push(TextSpan {
+                text,
+                x: band.x0 as f32,
+                y: band.y0 as f32,
+                width: (band.x1 - band.x0).max(1) as f32,
+                height: (band.y1 - band.y0).max(1) as f32,
+                confidence: conf,
+                line: i as i32,
             });
         }
         Ok(spans)
@@ -521,14 +908,12 @@ impl RasterOcrTranscriber {
         }
     }
 
-    /// Join span texts into a single searchable string (word order).
+    /// Join span texts into searchable / See-text body text.
+    ///
+    /// Words on the same layout line are space-separated; distinct lines are
+    /// joined with `\n` so multi-line handwriting keeps paragraph structure.
     pub fn spans_to_text(spans: &[TextSpan]) -> String {
-        spans
-            .iter()
-            .map(|s| s.text.trim())
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ")
+        spans_to_multiline_text(spans)
     }
 
     /// True when the configured `tesseract` binary responds (OCR can run).
@@ -601,7 +986,9 @@ impl Transcriber for RasterOcrTranscriber {
 }
 
 /// Prepared OCR image + transform back to the source raster coordinates.
+#[cfg(any(feature = "ocr", test))]
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // gray/dpi used by OCR invoke; origins by remap
 struct OcrPrepared {
     gray: Vec<u8>,
     width: u32,
@@ -618,9 +1005,11 @@ struct OcrPrepared {
 }
 
 /// Ink darkness threshold (gray8); below this counts as ink.
+#[cfg(any(feature = "ocr", test))]
 const INK_THRESHOLD: u8 = 200;
 
 /// Crop to ink, thicken thin strokes, upscale, and pick a PSM for handwriting.
+#[cfg(any(feature = "ocr", test))]
 fn prepare_ocr_image(width: u32, height: u32, gray8: &[u8]) -> Option<OcrPrepared> {
     let expected = (width as usize).saturating_mul(height as usize);
     if width == 0 || height == 0 || gray8.len() < expected {
@@ -685,6 +1074,7 @@ fn prepare_ocr_image(width: u32, height: u32, gray8: &[u8]) -> Option<OcrPrepare
     })
 }
 
+#[cfg(any(feature = "ocr", test))]
 fn ink_bbox(width: u32, height: u32, gray8: &[u8]) -> Option<(u32, u32, u32, u32)> {
     let mut min_x = width;
     let mut min_y = height;
@@ -709,6 +1099,7 @@ fn ink_bbox(width: u32, height: u32, gray8: &[u8]) -> Option<(u32, u32, u32, u32
     }
 }
 
+#[cfg(any(feature = "ocr", test))]
 fn dilate_ink(gray: &[u8], w: u32, h: u32, radius: i32) -> Vec<u8> {
     if radius <= 0 {
         return gray.to_vec();
@@ -739,6 +1130,7 @@ fn dilate_ink(gray: &[u8], w: u32, h: u32, radius: i32) -> Vec<u8> {
     out
 }
 
+#[cfg(any(feature = "ocr", test))]
 fn nearest_upscale(gray: &[u8], w: u32, h: u32, scale: u32) -> (u32, u32, Vec<u8>) {
     let scale = scale.max(1);
     if scale == 1 {
@@ -767,6 +1159,7 @@ fn nearest_upscale(gray: &[u8], w: u32, h: u32, scale: u32) -> (u32, u32, Vec<u8
 /// - tiny / square-ish → single word/char (8)
 /// - wide short strip → single line (7)
 /// - otherwise sparse text (11) — better than block PSM 6 for notes
+#[cfg(any(feature = "ocr", test))]
 fn choose_ocr_psm(crop_w: u32, crop_h: u32) -> u8 {
     let short = crop_w.min(crop_h);
     let long = crop_w.max(crop_h);
@@ -779,6 +1172,7 @@ fn choose_ocr_psm(crop_w: u32, crop_h: u32) -> u8 {
     }
 }
 
+#[cfg(feature = "ocr")]
 fn remap_ocr_spans(spans: Vec<TextSpan>, prep: &OcrPrepared) -> Vec<TextSpan> {
     let inv = if prep.scale > 0.0 {
         1.0 / prep.scale
@@ -916,6 +1310,7 @@ pub fn parse_tesseract_tsv(tsv: &str) -> Vec<TextSpan> {
         } else {
             (conf / 100.0).clamp(0.0, 1.0)
         };
+        let line_num: i32 = cols[4].parse().unwrap_or(-1);
         spans.push(TextSpan {
             text: text.to_string(),
             x: left,
@@ -923,9 +1318,74 @@ pub fn parse_tesseract_tsv(tsv: &str) -> Vec<TextSpan> {
             width,
             height,
             confidence,
+            line: line_num,
         });
     }
     spans
+}
+
+/// Join recognised spans into multi-line plain text (reading order).
+///
+/// Prefer Tesseract `line` indices when present; otherwise cluster by `y`
+/// using a fraction of median span height. Within a line, join with spaces.
+pub fn spans_to_multiline_text(spans: &[TextSpan]) -> String {
+    let nonempty: Vec<&TextSpan> = spans.iter().filter(|s| !s.text.trim().is_empty()).collect();
+    if nonempty.is_empty() {
+        return String::new();
+    }
+
+    let use_line_idx = nonempty.iter().all(|s| s.line >= 0);
+    let mut order: Vec<&TextSpan> = nonempty;
+    if use_line_idx {
+        order.sort_by(|a, b| {
+            a.line
+                .cmp(&b.line)
+                .then(a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        let mut lines: Vec<String> = Vec::new();
+        let mut cur_line = order[0].line;
+        let mut words: Vec<&str> = Vec::new();
+        for s in order {
+            if s.line != cur_line {
+                if !words.is_empty() {
+                    lines.push(words.join(" "));
+                    words.clear();
+                }
+                cur_line = s.line;
+            }
+            words.push(s.text.trim());
+        }
+        if !words.is_empty() {
+            lines.push(words.join(" "));
+        }
+        return lines.join("\n");
+    }
+
+    order.sort_by(|a, b| {
+        a.y.partial_cmp(&b.y)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    let mut heights: Vec<f32> = order.iter().map(|s| s.height.max(1.0)).collect();
+    heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median_h = heights[heights.len() / 2];
+    let thresh = (median_h * 0.55).max(8.0);
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut words: Vec<&str> = Vec::new();
+    let mut line_y = order[0].y;
+    for s in order {
+        if (s.y - line_y).abs() > thresh && !words.is_empty() {
+            lines.push(words.join(" "));
+            words.clear();
+            line_y = s.y;
+        }
+        words.push(s.text.trim());
+    }
+    if !words.is_empty() {
+        lines.push(words.join(" "));
+    }
+    lines.join("\n")
 }
 
 #[cfg(feature = "ocr")]
@@ -1093,6 +1553,7 @@ level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theigh
         assert_eq!(spans[0].text, "Hello");
         assert_eq!(spans[0].x, 10.0);
         assert_eq!(spans[1].text, "World");
+        assert_eq!(spans[0].line, 1);
         assert_eq!(RasterOcrTranscriber::spans_to_text(&spans), "Hello World");
     }
 
@@ -1123,6 +1584,7 @@ level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theigh
             width: 10.0,
             height: 10.0,
             confidence: 0.5,
+            line: -1,
         }];
         let ocr = vec![TextSpan {
             text: "Hi".into(),
@@ -1131,6 +1593,7 @@ level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theigh
             width: 10.0,
             height: 10.0,
             confidence: 0.85,
+            line: -1,
         }];
         let picked = pick_cascade_spans(&htr, &ocr, 0.45);
         assert_eq!(picked[0].text, "Hi");
@@ -1164,8 +1627,59 @@ level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theigh
             width: 10.0,
             height: 10.0,
             confidence: 0.9,
+            line: -1,
         }];
         assert!(mean_confidence(&spans) >= 0.35);
+    }
+
+    #[test]
+    fn spans_to_text_preserves_newlines_by_line_index() {
+        let spans = vec![
+            TextSpan {
+                text: "Hello".into(),
+                x: 10.0,
+                y: 20.0,
+                width: 40.0,
+                height: 12.0,
+                confidence: 0.9,
+                line: 1,
+            },
+            TextSpan {
+                text: "World".into(),
+                x: 60.0,
+                y: 20.0,
+                width: 50.0,
+                height: 12.0,
+                confidence: 0.9,
+                line: 1,
+            },
+            TextSpan {
+                text: "Next".into(),
+                x: 10.0,
+                y: 50.0,
+                width: 40.0,
+                height: 12.0,
+                confidence: 0.9,
+                line: 2,
+            },
+        ];
+        assert_eq!(
+            RasterOcrTranscriber::spans_to_text(&spans),
+            "Hello World\nNext"
+        );
+    }
+
+    #[test]
+    fn spans_to_text_clusters_by_y_without_line_index() {
+        let spans = vec![
+            TextSpan::new("one", 10.0, 10.0, 30.0, 14.0),
+            TextSpan::new("two", 50.0, 12.0, 30.0, 14.0),
+            TextSpan::new("three", 10.0, 40.0, 40.0, 14.0),
+        ];
+        assert_eq!(
+            RasterOcrTranscriber::spans_to_text(&spans),
+            "one two\nthree"
+        );
     }
 
     #[test]
