@@ -215,6 +215,54 @@ pub fn ctc_greedy_decode(
     path
 }
 
+/// Mean softmax probability of the argmax class over non-blank timesteps.
+///
+/// Used as a cascade gate so weak OnlineHTR guesses fall through to OCR.
+pub fn ctc_softmax_confidence(
+    logits: &[f32],
+    time_steps: usize,
+    num_classes: usize,
+    blank: usize,
+) -> f32 {
+    if time_steps == 0 || num_classes == 0 || logits.len() < time_steps * num_classes {
+        return 0.0;
+    }
+    let mut sum = 0.0f32;
+    let mut n = 0u32;
+    for t in 0..time_steps {
+        let row = &logits[t * num_classes..(t + 1) * num_classes];
+        let mut best_i = 0usize;
+        let mut best_v = f32::NEG_INFINITY;
+        for (i, &v) in row.iter().enumerate() {
+            if v > best_v {
+                best_v = v;
+                best_i = i;
+            }
+        }
+        if best_i == blank {
+            continue;
+        }
+        // Stable softmax of the winning logit.
+        let mut m = f32::NEG_INFINITY;
+        for &v in row {
+            m = m.max(v);
+        }
+        let mut denom = 0.0f32;
+        for &v in row {
+            denom += (v - m).exp();
+        }
+        if denom > 0.0 {
+            sum += (best_v - m).exp() / denom;
+            n += 1;
+        }
+    }
+    if n == 0 {
+        0.0
+    } else {
+        (sum / n as f32).clamp(0.0, 1.0)
+    }
+}
+
 /// Map CTC class indices through a charset that does **not** include the blank.
 ///
 /// - `blank == 0` (OnlineHTR / Carbune): alphabet indices are `1..`; map via `i - 1`.
@@ -305,5 +353,16 @@ mod tests {
     fn decode_blank_zero_shifts_indices() {
         // blank=0, alphabet "ab" at indices 1,2
         assert_eq!(decode_charset_with_blank(&[1, 2, 1], "ab", 0), "aba");
+    }
+
+    #[test]
+    fn softmax_confidence_high_for_peaked_logits() {
+        // One non-blank timestep with a clear winner.
+        let logits = [
+            0.0, 5.0, 0.0, // class 1
+            5.0, 0.0, 0.0, // blank (0)
+        ];
+        let conf = ctc_softmax_confidence(&logits, 2, 3, 0);
+        assert!(conf > 0.9, "expected high confidence, got {conf}");
     }
 }

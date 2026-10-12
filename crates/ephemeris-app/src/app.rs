@@ -1340,6 +1340,9 @@ impl App {
             let cfg2 = config.clone();
             ui.on_note_see_text_toggled(move |show| {
                 if show {
+                    // Clear stale cached text immediately so a prior OCR result
+                    // cannot linger while we re-run recognition on new ink.
+                    ui_rc.set_note_text_content("Recognising…");
                     let active_id = ui2.get_active_note_id().to_string();
                     let (w, h) = ui_rc.canvas_size();
                     let pixels = ui_rc.get_committed_pixels();
@@ -1398,20 +1401,11 @@ impl App {
 
         // ── Note list: "+ Note" → create in active folder (0 = root) ──────────
         {
-            let ui_rc = ui.clone();
             let ui2 = ui.clone_component();
-            let notes2 = notes.clone();
             let notebooks2 = notebooks.clone();
-            let seq2 = note_id_seq.clone();
-            let nb_seq2 = notebook_id_seq.clone();
             let active_nb2 = active_notebook_id.clone();
-            let data_dir2 = data_dir.clone();
-            let cfg2 = config.clone();
             let filter_nn = active_profile_filter.clone();
-            let anchor_rc = current_note_anchor.clone();
             ui.on_note_new_tapped(move || {
-                let new_id = seq2.get();
-                seq2.set(new_id + 1);
                 let nb_id = active_nb2.get();
                 let folder_id = if nb_id == 0 { None } else { Some(nb_id) };
                 // Note inherits its folder's profile, else active profile filter.
@@ -1425,43 +1419,13 @@ impl App {
                 } else {
                     filter_nn.borrow().clone()
                 };
-                {
-                    let mut ns = notes2.borrow_mut();
-                    let idx = ns.len();
-                    ns.push(AppNote {
-                        id: new_id,
-                        title: format!("Note {}", new_id),
-                        page_index: idx,
-                        created_at: now_secs(),
-                        updated_at: now_secs(),
-                        notebook_id: folder_id,
-                        paper_template: ephemeris_core::PageTemplate::Blank,
-                        anchor: None,
-                        profile_id: pf,
-                        text_content: None,
-                        doc_page: 0,
-                        doc_page_count: 1,
-                    });
+                if pf.is_empty() {
+                    // All mode (or unassigned folder) — ask which profile first.
+                    ui2.set_create_picker_intent("note".into());
+                    ui2.set_show_create_profile_picker(true);
+                } else {
+                    ui2.invoke_create_profile_picked("note".into(), pf.as_str().into());
                 }
-                *anchor_rc.borrow_mut() = String::new();
-                ui_rc.set_note_anchor_label("");
-                ui_rc.push_new_page();
-                ui_rc.set_page_title(&format!("Note {}", new_id));
-                ui_rc.set_page_index(1, 1);
-                ui2.set_active_paper("blank".into());
-                ui2.set_show_note_list(false);
-                ui2.set_show_notebook_list(false);
-                ui2.set_active_note_id(new_id.to_string().as_str().into());
-                ui_rc.set_note_text_content("");
-                ui_rc.set_note_see_text(false);
-                save_notes_index_and_sync_vault(
-                    &data_dir2,
-                    &notes2.borrow(),
-                    &notebooks2.borrow(),
-                    seq2.get(),
-                    nb_seq2.get(),
-                    &cfg2.borrow(),
-                );
             });
         }
 
@@ -2020,19 +1984,11 @@ impl App {
         {
             let ui_rc = ui.clone();
             let ui2 = ui.clone_component();
-            let notes2 = notes.clone();
             let notebooks2 = notebooks.clone();
-            let seq2 = note_id_seq.clone();
-            let nb_seq2 = notebook_id_seq.clone();
             let active_nb2 = active_notebook_id.clone();
-            let data_dir2 = data_dir.clone();
-            let cfg2 = config.clone();
             let filter_ring = active_profile_filter.clone();
-            let anchor_rc = current_note_anchor.clone();
             ui.on_ring_note(move || {
                 ui_rc.save_current_page();
-                let new_id = seq2.get();
-                seq2.set(new_id + 1);
                 let nb_id = active_nb2.get();
                 let folder_id = if nb_id == 0 { None } else { Some(nb_id) };
                 let pf = if let Some(fid) = folder_id {
@@ -2045,54 +2001,13 @@ impl App {
                 } else {
                     filter_ring.borrow().clone()
                 };
-                {
-                    let mut ns = notes2.borrow_mut();
-                    let idx = ns.len();
-                    ns.push(AppNote {
-                        id: new_id,
-                        title: format!("Note {}", new_id),
-                        page_index: idx,
-                        created_at: now_secs(),
-                        updated_at: now_secs(),
-                        notebook_id: folder_id,
-                        paper_template: ephemeris_core::PageTemplate::Blank,
-                        anchor: None,
-                        profile_id: pf,
-                        text_content: None,
-                        doc_page: 0,
-                        doc_page_count: 1,
-                    });
+                if pf.is_empty() {
+                    // All mode — ask which profile first (same as notebook/rec).
+                    ui2.set_create_picker_intent("ring-note".into());
+                    ui2.set_show_create_profile_picker(true);
+                } else {
+                    ui2.invoke_create_profile_picked("ring-note".into(), pf.as_str().into());
                 }
-                *anchor_rc.borrow_mut() = String::new();
-                ui_rc.set_note_anchor_label("");
-                ui_rc.push_new_page();
-                ui_rc.set_page_title(&format!("Note {}", new_id));
-                ui_rc.set_page_index(1, 1);
-                ui2.set_active_paper("blank".into());
-                ui2.set_show_start_page(false);
-                ui2.set_show_task_view(false);
-                ui2.set_show_settings(false);
-                ui2.set_show_filebrowser(false);
-                ui2.set_show_calendar(false);
-                ui2.set_show_recording_list(false);
-                ui2.set_show_search(false);
-                ui2.set_show_md_viewer(false);
-                ui2.set_show_note_list(false);
-                ui2.set_show_notebook_list(false);
-                ui2.set_drawing_menu_open(false);
-                ui2.set_ring_visible(false);
-                ui2.set_nav_section(1);
-                ui2.set_active_note_id(new_id.to_string().as_str().into());
-                ui_rc.set_note_text_content("");
-                ui_rc.set_note_see_text(false);
-                save_notes_index_and_sync_vault(
-                    &data_dir2,
-                    &notes2.borrow(),
-                    &notebooks2.borrow(),
-                    seq2.get(),
-                    nb_seq2.get(),
-                    &cfg2.borrow(),
-                );
             });
         }
 
@@ -4229,11 +4144,20 @@ impl App {
 
         // ── Create-in-profile picker: dispatch ────────────────────────────────
         {
+            let ui_rc = ui.clone();
             let ui2 = ui.clone_component();
             let rec_handle2 = rec_handle.clone();
             let rec_id_seq2 = rec_id_seq.clone();
             let rec_dir2 = rec_dir.clone();
             let rec_pf_cp = rec_pending_profile.clone();
+            let notes2 = notes.clone();
+            let notebooks2 = notebooks.clone();
+            let seq2 = note_id_seq.clone();
+            let nb_seq2 = notebook_id_seq.clone();
+            let active_nb2 = active_notebook_id.clone();
+            let data_dir2 = data_dir.clone();
+            let cfg2 = config.clone();
+            let anchor_rc = current_note_anchor.clone();
             ui.on_create_profile_picked(move |intent, profile_id| {
                 let profile_id = profile_id.to_string();
                 match intent.as_str() {
@@ -4259,6 +4183,63 @@ impl App {
                         } else {
                             tracing::warn!("Failed to start recording via picker");
                         }
+                    }
+                    "note" | "ring-note" => {
+                        let from_ring = intent == "ring-note";
+                        let new_id = seq2.get();
+                        seq2.set(new_id + 1);
+                        let nb_id = active_nb2.get();
+                        let folder_id = if nb_id == 0 { None } else { Some(nb_id) };
+                        {
+                            let mut ns = notes2.borrow_mut();
+                            let idx = ns.len();
+                            ns.push(AppNote {
+                                id: new_id,
+                                title: format!("Note {}", new_id),
+                                page_index: idx,
+                                created_at: now_secs(),
+                                updated_at: now_secs(),
+                                notebook_id: folder_id,
+                                paper_template: ephemeris_core::PageTemplate::Blank,
+                                anchor: None,
+                                profile_id,
+                                text_content: None,
+                                doc_page: 0,
+                                doc_page_count: 1,
+                            });
+                        }
+                        *anchor_rc.borrow_mut() = String::new();
+                        ui_rc.set_note_anchor_label("");
+                        ui_rc.push_new_page();
+                        ui_rc.set_page_title(&format!("Note {}", new_id));
+                        ui_rc.set_page_index(1, 1);
+                        ui2.set_active_paper("blank".into());
+                        if from_ring {
+                            ui2.set_show_start_page(false);
+                            ui2.set_show_task_view(false);
+                            ui2.set_show_settings(false);
+                            ui2.set_show_filebrowser(false);
+                            ui2.set_show_calendar(false);
+                            ui2.set_show_recording_list(false);
+                            ui2.set_show_search(false);
+                            ui2.set_show_md_viewer(false);
+                            ui2.set_drawing_menu_open(false);
+                            ui2.set_ring_visible(false);
+                            ui2.set_nav_section(1);
+                        }
+                        ui2.set_show_note_list(false);
+                        ui2.set_show_notebook_list(false);
+                        ui2.set_active_note_id(new_id.to_string().as_str().into());
+                        ui_rc.set_note_text_content("");
+                        ui_rc.set_note_see_text(false);
+                        save_notes_index_and_sync_vault(
+                            &data_dir2,
+                            &notes2.borrow(),
+                            &notebooks2.borrow(),
+                            seq2.get(),
+                            nb_seq2.get(),
+                            &cfg2.borrow(),
+                        );
                     }
                     _ => {}
                 }
@@ -4667,6 +4648,9 @@ impl WinitHandler {
             note.updated_at = now_secs();
             note.text_content = None;
         }
+        // Drop stale See-text so the next toggle re-OCRs instead of showing
+        // text from before this ink change.
+        self.ui.set_note_text_content("");
     }
 
     fn handle_pointer_release(&mut self, lx: f32, ly: f32) {
@@ -4744,6 +4728,7 @@ impl WinitHandler {
                         note.updated_at = now_secs();
                         note.text_content = None;
                     }
+                    self.ui.set_note_text_content("");
                     export_single_note_to_vault(
                         &self.config.borrow(),
                         &self.notes.borrow(),
@@ -6547,7 +6532,10 @@ fn build_vault_note_export(
         .join(format!("{note_safe}.pdf"));
 
     let mut pdf_ok = false;
-    if let Some((w, h, gray)) = load_note_page(data_dir, note.id) {
+    // Prefer freshly recognised text over a cached See-text snapshot so export
+    // tracks newly added ink. Use the note's current document page (not always 0).
+    let mut recognised_text: Option<String> = None;
+    if let Some((w, h, gray)) = load_note_page_n(data_dir, note.id, note.doc_page) {
         let page = RasterPage {
             width: w,
             height: h,
@@ -6561,14 +6549,13 @@ fn build_vault_note_export(
                 tracing::debug!("Transcription for note {} skipped: {e}", note.id);
                 Vec::new()
             });
-        let searchable_text = note.text_content.clone().or_else(|| {
-            let t = RasterOcrTranscriber::spans_to_text(&spans);
-            if t.is_empty() {
-                None
-            } else {
-                Some(t)
-            }
-        });
+        let fresh = RasterOcrTranscriber::spans_to_text(&spans);
+        if !fresh.is_empty() {
+            recognised_text = Some(fresh);
+        }
+        let searchable_text = recognised_text
+            .clone()
+            .or_else(|| note.text_content.clone());
         let opts = PdfExportOptions {
             title: note.title.clone(),
             searchable_text,
@@ -6600,7 +6587,7 @@ fn build_vault_note_export(
         note_title: note.title.clone(),
         note_id: note.id,
         created_at: note.created_at,
-        text_content: note.text_content.clone(),
+        text_content: recognised_text.or_else(|| note.text_content.clone()),
         pdf_vault_rel,
     }
 }
