@@ -63,21 +63,8 @@ impl TaskCache {
     /// Get all tasks across all profiles.
     pub fn list_all(&self) -> Vec<Task> {
         let mut tasks: Vec<_> = self.tasks.values().cloned().collect();
-        // Sort by priority (High > Medium > Low) then by creation order
-        tasks.sort_by(|a, b| {
-            use crate::TaskPriority::*;
-            let a_pri = match a.priority {
-                High => 0,
-                Medium => 1,
-                Low => 2,
-            };
-            let b_pri = match b.priority {
-                High => 0,
-                Medium => 1,
-                Low => 2,
-            };
-            a_pri.cmp(&b_pri)
-        });
+        // Sort by priority (Urgent > High > Medium > Low) then by creation order
+        tasks.sort_by_key(|a| std::cmp::Reverse(a.priority));
         tasks
     }
 
@@ -92,20 +79,7 @@ impl TaskCache {
     /// Get all open (not done) tasks.
     pub fn list_open(&self) -> Vec<Task> {
         let mut tasks: Vec<_> = self.tasks.values().filter(|t| !t.done).cloned().collect();
-        tasks.sort_by(|a, b| {
-            use crate::TaskPriority::*;
-            let a_pri = match a.priority {
-                High => 0,
-                Medium => 1,
-                Low => 2,
-            };
-            let b_pri = match b.priority {
-                High => 0,
-                Medium => 1,
-                Low => 2,
-            };
-            a_pri.cmp(&b_pri)
-        });
+        tasks.sort_by_key(|a| std::cmp::Reverse(a.priority));
         tasks
     }
 

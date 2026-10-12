@@ -371,6 +371,11 @@ impl Platform for HeadlessPlatform {
 /// Call [`next_page`] / [`prev_page`] from the application layer.  The
 /// convenience method [`wire_swipe_navigation`] wires the `.slint` swipe
 /// callbacks to these methods automatically.
+///
+/// Task list row for [`EphemerisUi::set_full_task_list`]:
+/// `(id, title, priority_label, priority_int, due, overdue, done, lane)`.
+pub type FullTaskRow = (String, String, String, i32, String, bool, bool, String);
+
 pub struct EphemerisUi {
     window: Rc<MinimalSoftwareWindow>,
     component: EphemerisPage,
@@ -846,12 +851,12 @@ impl EphemerisUi {
 
     /// Push the full task list to the CRUD view.
     ///
-    /// Each tuple is `(id, title, priority_label, due_label, overdue, done)`.
-    pub fn set_full_task_list(&self, tasks: &[(String, String, String, i32, String, bool, bool)]) {
+    /// Each tuple is `(id, title, priority_label, priority_int, due, overdue, done, lane)`.
+    pub fn set_full_task_list(&self, tasks: &[FullTaskRow]) {
         let entries: Vec<TaskViewEntry> = tasks
             .iter()
             .map(
-                |(id, title, priority_label, priority_int, due_label, overdue, done)| {
+                |(id, title, priority_label, priority_int, due_label, overdue, done, lane)| {
                     TaskViewEntry {
                         id: slint::SharedString::from(id.as_str()),
                         title: slint::SharedString::from(title.as_str()),
@@ -860,6 +865,7 @@ impl EphemerisUi {
                         due_label: slint::SharedString::from(due_label.as_str()),
                         overdue: *overdue,
                         done: *done,
+                        lane_label: slint::SharedString::from(lane.as_str()),
                         show_profile: false,
                         profile_icon_char: slint::SharedString::new(),
                         has_custom_profile_icon: false,
@@ -873,6 +879,7 @@ impl EphemerisUi {
     }
 
     /// Open the task add/edit dialog.
+    #[allow(clippy::too_many_arguments)]
     pub fn open_task_dialog(
         &self,
         is_edit: bool,
@@ -881,6 +888,9 @@ impl EphemerisUi {
         priority: i32,
         due: &str,
         tags: &str,
+        lane: &str,
+        contexts: &str,
+        waiting: &str,
     ) {
         self.component.set_task_dialog_is_edit(is_edit);
         self.component
@@ -892,6 +902,12 @@ impl EphemerisUi {
             .set_task_dialog_due(slint::SharedString::from(due));
         self.component
             .set_task_dialog_tags(slint::SharedString::from(tags));
+        self.component
+            .set_task_dialog_lane(slint::SharedString::from(lane));
+        self.component
+            .set_task_dialog_contexts(slint::SharedString::from(contexts));
+        self.component
+            .set_task_dialog_waiting(slint::SharedString::from(waiting));
         self.component.set_task_dialog_visible(true);
     }
 
@@ -939,38 +955,64 @@ impl EphemerisUi {
     }
 
     /// Register a closure called when "Save" is tapped in the add dialog.
-    /// Handler args: title, priority, due (YYYY-MM-DD), tags (space-separated).
+    /// Handler args: title, priority, due, tags, lane, contexts, waiting.
     pub fn on_task_confirm_add<F>(&self, mut handler: F)
     where
-        F: FnMut(String, i32, String, String) + 'static,
+        F: FnMut(String, i32, String, String, String, String, String) + 'static,
     {
-        self.component
-            .on_task_confirm_add(move |title, priority, due, tags| {
+        self.component.on_task_confirm_add(
+            move |title, priority, due, tags, lane, contexts, waiting| {
                 handler(
                     title.to_string(),
                     priority,
                     due.to_string(),
                     tags.to_string(),
+                    lane.to_string(),
+                    contexts.to_string(),
+                    waiting.to_string(),
                 )
-            });
+            },
+        );
     }
 
     /// Register a closure called when "Save" is tapped in the edit dialog.
-    /// Handler args: id, title, priority, due (YYYY-MM-DD), tags (space-separated).
+    /// Handler args: id, title, priority, due, tags, lane, contexts, waiting.
     pub fn on_task_confirm_edit<F>(&self, mut handler: F)
     where
-        F: FnMut(String, String, i32, String, String) + 'static,
+        F: FnMut(String, String, i32, String, String, String, String, String) + 'static,
     {
-        self.component
-            .on_task_confirm_edit(move |id, title, priority, due, tags| {
+        self.component.on_task_confirm_edit(
+            move |id, title, priority, due, tags, lane, contexts, waiting| {
                 handler(
                     id.to_string(),
                     title.to_string(),
                     priority,
                     due.to_string(),
                     tags.to_string(),
+                    lane.to_string(),
+                    contexts.to_string(),
+                    waiting.to_string(),
                 )
-            });
+            },
+        );
+    }
+
+    /// Register a closure when a horizon lane chip is tapped.
+    pub fn on_task_lane_changed<F>(&self, mut handler: F)
+    where
+        F: FnMut(String) + 'static,
+    {
+        self.component
+            .on_task_lane_changed(move |lane| handler(lane.to_string()));
+    }
+
+    /// Register a closure when an Engage context filter chip is tapped.
+    pub fn on_task_context_filter_changed<F>(&self, mut handler: F)
+    where
+        F: FnMut(String) + 'static,
+    {
+        self.component
+            .on_task_context_filter_changed(move |ctx| handler(ctx.to_string()));
     }
 
     /// Register a closure called when "Cancel" is tapped in the task dialog.

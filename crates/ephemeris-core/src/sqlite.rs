@@ -67,6 +67,22 @@ struct TaskMetaRow {
     parent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     url: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    contexts: Vec<crate::TaskContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    waiting_for: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    duration_minutes: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    energy: Option<crate::EnergyLevel>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    depends_on: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cancelled_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lane_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reviewed_at: Option<u64>,
 }
 
 fn task_meta_to_json(task: &Task) -> std::result::Result<String, serde_json::Error> {
@@ -82,6 +98,14 @@ fn task_meta_to_json(task: &Task) -> std::result::Result<String, serde_json::Err
         section: task.section.clone(),
         parent_id: task.parent_id.map(|p| p.0.to_string()),
         url: task.url.clone(),
+        contexts: task.contexts.clone(),
+        waiting_for: task.waiting_for.clone(),
+        duration_minutes: task.duration_minutes,
+        energy: task.energy,
+        depends_on: task.depends_on.clone(),
+        cancelled_at: task.cancelled_at,
+        lane_id: task.lane_id.clone(),
+        reviewed_at: task.reviewed_at,
     };
     serde_json::to_string(&meta)
 }
@@ -109,11 +133,20 @@ fn apply_task_meta(task: &mut Task, meta_json: Option<&str>) {
     task.section = meta.section;
     task.parent_id = meta.parent_id.and_then(|s| s.parse().ok()).map(TaskId);
     task.url = meta.url;
+    task.contexts = meta.contexts;
+    task.waiting_for = meta.waiting_for;
+    task.duration_minutes = meta.duration_minutes;
+    task.energy = meta.energy;
+    task.depends_on = meta.depends_on;
+    task.cancelled_at = meta.cancelled_at;
+    task.lane_id = meta.lane_id;
+    task.reviewed_at = meta.reviewed_at;
     if task.done && task.status == TaskStatus::Todo {
         task.status = TaskStatus::Done;
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn row_to_task(
     id_s: String,
     pid_s: String,
@@ -135,6 +168,7 @@ fn row_to_task(
     let priority = match prio {
         0 => TaskPriority::Low,
         2 => TaskPriority::High,
+        3 => TaskPriority::Urgent,
         _ => TaskPriority::Medium,
     };
     let tags: Vec<String> = serde_json::from_str(&tags_s).map_err(serde_err)?;
@@ -159,6 +193,14 @@ fn row_to_task(
         section: None,
         parent_id: None,
         url: None,
+        contexts: Vec::new(),
+        waiting_for: None,
+        duration_minutes: None,
+        energy: None,
+        depends_on: Vec::new(),
+        cancelled_at: None,
+        lane_id: None,
+        reviewed_at: None,
     };
     apply_task_meta(&mut task, meta.as_deref());
     Ok(task)
@@ -168,7 +210,7 @@ fn row_to_task(
 
 /// Current schema version. Bump this and add a migration step in
 /// [`run_migrations`] whenever the schema changes.
-const CURRENT_VERSION: u32 = 4;
+const CURRENT_VERSION: u32 = 5;
 
 /// The migration SQL for each version level, indexed `0..CURRENT_VERSION`.
 /// Entry `i` takes the schema from version `i` to `i+1`.
@@ -261,6 +303,17 @@ static MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE tasks ADD COLUMN meta TEXT NOT NULL DEFAULT '{}';
     UPDATE schema_version SET version = 4;
+    "#,
+    // 4 → 5: local-first horizon lane overlay for any provider task
+    r#"
+    CREATE TABLE IF NOT EXISTS task_placement (
+        source     TEXT NOT NULL,
+        task_id    TEXT NOT NULL,
+        lane_id    TEXT NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (source, task_id)
+    );
+    UPDATE schema_version SET version = 5;
     "#,
 ];
 
@@ -982,6 +1035,75 @@ impl SqliteStore {
         Ok(n > 0)
     }
 
+    // ── Task placement (horizon lane overlay) ─────────────────────────────────
+
+    /// Upsert a local-first lane placement for any provider task.
+    pub fn set_task_placement(&self, source: &str, task_id: TaskId, lane_id: &str) -> Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.conn
+            .execute(
+                "INSERT INTO task_placement (source, task_id, lane_id, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(source, task_id) DO UPDATE SET
+                   lane_id = excluded.lane_id,
+                   updated_at = excluded.updated_at",
+                params![source, task_id.0.to_string(), lane_id, now],
+            )
+            .map_err(storage_err)?;
+        Ok(())
+    }
+
+    /// Look up overlay lane for a provider task.
+    pub fn get_task_placement(&self, source: &str, task_id: TaskId) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT lane_id FROM task_placement WHERE source = ?1 AND task_id = ?2")
+            .map_err(storage_err)?;
+        let mut rows = stmt
+            .query(params![source, task_id.0.to_string()])
+            .map_err(storage_err)?;
+        if let Some(row) = rows.next().map_err(storage_err)? {
+            Ok(Some(row.get::<_, String>(0).map_err(storage_err)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// All placements for a source (e.g. `"obsidian"`).
+    pub fn list_task_placements(&self, source: &str) -> Result<Vec<(TaskId, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT task_id, lane_id FROM task_placement WHERE source = ?1")
+            .map_err(storage_err)?;
+        let rows = stmt
+            .query_map(params![source], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(storage_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id_s, lane) = row.map_err(storage_err)?;
+            let id = id_s
+                .parse()
+                .map_err(|e| AppError::Storage(format!("bad task uuid: {e}")))?;
+            out.push((TaskId(id), lane));
+        }
+        Ok(out)
+    }
+
+    /// Apply overlay placements onto a task list (sets `lane_id` when present).
+    pub fn apply_placements_to_tasks(&self, tasks: &mut [Task]) -> Result<()> {
+        for task in tasks.iter_mut() {
+            if let Some(lane) = self.get_task_placement(&task.source, task.id)? {
+                task.lane_id = Some(lane);
+            }
+        }
+        Ok(())
+    }
+
     // ── Calendar events ───────────────────────────────────────────────────────
 
     /// Insert or replace a calendar event.
@@ -1429,7 +1551,6 @@ mod tests {
 
     #[test]
     fn active_profile_persists_across_reopen() {
-        use std::io::Write;
         let path = {
             let mut p = std::env::temp_dir();
             p.push(format!("ephemeris_test_{}.db", uuid::Uuid::new_v4()));
@@ -1602,7 +1723,12 @@ mod tests {
         let profile = Profile::new("Prio");
         store.upsert_profile(&profile).unwrap();
 
-        for priority in [TaskPriority::Low, TaskPriority::Medium, TaskPriority::High] {
+        for priority in [
+            TaskPriority::Low,
+            TaskPriority::Medium,
+            TaskPriority::High,
+            TaskPriority::Urgent,
+        ] {
             let mut task = Task::new(format!("{priority:?}"), profile.id);
             task.priority = priority;
             store.upsert_task(&task).unwrap();

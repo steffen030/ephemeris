@@ -136,9 +136,133 @@ pub struct Config {
     #[serde(default = "default_pen_only_drawing")]
     pub pen_only_drawing: bool,
 
+    /// Configurable GTD horizon lanes (Now / Next / Later / …).
+    #[serde(default = "default_task_lanes")]
+    pub task_lanes: Vec<TaskLaneConfig>,
+
+    /// Engage / Start-page task behaviour (WIP, staleness, default lane).
+    #[serde(default)]
+    pub task_engage: TaskEngageConfig,
+
     /// Arbitrary key-value overrides for experimental / future settings.
     #[serde(default)]
     pub custom: HashMap<String, String>,
+}
+
+/// One horizon lane in the task board (commitment timing, not checkbox status).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskLaneConfig {
+    /// Stable id written to overlays / `#lane/<id>` tags (`now`, `next`, …).
+    pub id: String,
+    /// Display label.
+    pub label: String,
+    /// When false, lane is hidden from Manage chips (still valid for placement).
+    #[serde(default = "default_true")]
+    pub visible: bool,
+    /// Soft WIP limit (warn in UI); primarily for `now`. `None` = no limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wip_limit: Option<u32>,
+}
+
+/// Engage filters and review thresholds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskEngageConfig {
+    /// Lane id used for Start-page Engage list (default `now`).
+    #[serde(default = "default_engage_lane")]
+    pub engage_lane: String,
+    /// Lane id assigned to newly captured tasks (default `next`).
+    #[serde(default = "default_capture_lane")]
+    pub capture_lane: String,
+    /// Days without update before Waiting/Someday show as stale.
+    #[serde(default = "default_staleness_days")]
+    pub staleness_days: u32,
+    /// Context vocabulary presets shown as quick chips (`phone`, `home`, …).
+    #[serde(default = "default_context_presets")]
+    pub context_presets: Vec<String>,
+    /// After title-first capture, open the clarify sheet (lane/context/waiting).
+    #[serde(default = "default_true")]
+    pub clarify_after_capture: bool,
+    /// Lane ids included in weekly review (default waiting + someday).
+    #[serde(default = "default_review_lanes")]
+    pub review_lanes: Vec<String>,
+}
+
+impl Default for TaskEngageConfig {
+    fn default() -> Self {
+        TaskEngageConfig {
+            engage_lane: default_engage_lane(),
+            capture_lane: default_capture_lane(),
+            staleness_days: default_staleness_days(),
+            context_presets: default_context_presets(),
+            clarify_after_capture: true,
+            review_lanes: default_review_lanes(),
+        }
+    }
+}
+
+fn default_review_lanes() -> Vec<String> {
+    vec!["waiting".into(), "someday".into()]
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_engage_lane() -> String {
+    "now".into()
+}
+
+fn default_capture_lane() -> String {
+    "next".into()
+}
+
+fn default_staleness_days() -> u32 {
+    14
+}
+
+fn default_context_presets() -> Vec<String> {
+    vec![
+        "phone".into(),
+        "computer".into(),
+        "home".into(),
+        "errand".into(),
+        "office".into(),
+    ]
+}
+
+fn default_task_lanes() -> Vec<TaskLaneConfig> {
+    vec![
+        TaskLaneConfig {
+            id: "now".into(),
+            label: "Now".into(),
+            visible: true,
+            wip_limit: Some(5),
+        },
+        TaskLaneConfig {
+            id: "next".into(),
+            label: "Next".into(),
+            visible: true,
+            wip_limit: None,
+        },
+        TaskLaneConfig {
+            id: "later".into(),
+            label: "Later".into(),
+            visible: true,
+            wip_limit: None,
+        },
+        TaskLaneConfig {
+            id: "waiting".into(),
+            label: "Waiting".into(),
+            visible: true,
+            wip_limit: None,
+        },
+        TaskLaneConfig {
+            id: "someday".into(),
+            label: "Someday".into(),
+            visible: true,
+            wip_limit: None,
+        },
+    ]
 }
 
 fn default_theme() -> String {
@@ -201,6 +325,8 @@ impl Default for Config {
             line_htr_enabled: default_line_htr_enabled(),
             line_htr_model_dir: None,
             pen_only_drawing: default_pen_only_drawing(),
+            task_lanes: default_task_lanes(),
+            task_engage: TaskEngageConfig::default(),
             custom: HashMap::new(),
         }
     }

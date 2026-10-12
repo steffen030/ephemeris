@@ -12,6 +12,9 @@
 # Git worktrees (local development branches)
 .worktree/
 
+# Local Cargo home used when the sandbox blocks crate unpack (e.g. .vscode dirs)
+.cargo-home/
+
 
 # Local packaging output
 /dist/

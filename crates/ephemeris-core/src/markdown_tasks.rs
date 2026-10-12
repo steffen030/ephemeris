@@ -1,3 +1,7 @@
+use crate::task_context::{
+    apply_parsed_tags, parse_priority_word, parse_tags_and_mentions, project_from_vault_path,
+    sync_tags_from_structured,
+};
 use crate::{
     ProfileId, ProviderCapabilities, Task, TaskId, TaskPriority, TaskProvider, TaskStatus,
 };
@@ -18,7 +22,9 @@ pub const DEFAULT_TASKS_INBOX: &str = "Ephemeris/Tasks.md";
 ///
 /// Parses markdown checkbox tasks and Tasks-plugin metadata:
 /// `due:` / `📅`, `scheduled:` / `⏳`, `start:` / `🛫`, `priority:` / ⏫🔼🔽⏬,
-/// `#tags`, `🔁` recurrence, and status marks `[ ]` `/` `x` `-`.
+/// `#tags`, `#lane/<id>`, `#ctx/<name>`, `@mentions`, `🔁` recurrence,
+/// `🆔`/`⛔` dependencies, nearest heading → section, path → project,
+/// and status marks `[ ]` `/` `x` `-`.
 pub struct MarkdownTaskExtractor {
     vault_path: PathBuf,
     profile_id: ProfileId,
@@ -64,10 +70,17 @@ impl MarkdownTaskExtractor {
     /// Parse markdown content and extract tasks.
     fn parse_tasks(&self, markdown: &str, rel_path: Option<&str>) -> Vec<Task> {
         let mut tasks = Vec::new();
+        let mut current_heading: Option<String> = None;
+        let project = rel_path.and_then(project_from_vault_path);
 
         for (idx, line) in markdown.lines().enumerate() {
             let line_no = idx + 1;
             let trimmed = line.trim_start();
+
+            if let Some(heading) = parse_markdown_heading(trimmed) {
+                current_heading = Some(heading);
+                continue;
+            }
 
             let (status, task_text) = match parse_checkbox_prefix(trimmed) {
                 Some(v) => v,
@@ -79,6 +92,12 @@ impl MarkdownTaskExtractor {
                     let source_ref = format!("{rel}:{line_no}");
                     task.id = stable_task_id(rel, line_no);
                     task.source_ref = Some(source_ref);
+                }
+                if task.project.is_none() {
+                    task.project = project.clone();
+                }
+                if task.section.is_none() {
+                    task.section = current_heading.clone();
                 }
                 tasks.push(task);
             }
@@ -95,14 +114,17 @@ impl MarkdownTaskExtractor {
         }
 
         let mut title_parts = Vec::new();
-        let mut tags = Vec::new();
+        let mut raw_tags = Vec::new();
         let mut due = None;
         let mut scheduled = None;
         let mut start = None;
         let mut completed_at = None;
         let mut created_at = None;
+        let mut cancelled_at = None;
         let mut recurrence = None;
         let mut priority = TaskPriority::default();
+        let mut depends_on = Vec::new();
+        let mut task_id_token: Option<String> = None;
 
         let parts: Vec<&str> = line.split_whitespace().collect();
         let mut i = 0;
@@ -110,7 +132,7 @@ impl MarkdownTaskExtractor {
             let part = parts[i];
 
             if part.starts_with('#') && part.len() > 1 {
-                tags.push(part[1..].to_string());
+                raw_tags.push(part[1..].to_string());
                 i += 1;
                 continue;
             }
@@ -154,6 +176,13 @@ impl MarkdownTaskExtractor {
                         i += 1;
                         continue;
                     }
+                    "cancelled" | "canceled" => {
+                        if let Ok(ts) = parse_date(val) {
+                            cancelled_at = Some(ts);
+                        }
+                        i += 1;
+                        continue;
+                    }
                     "priority" | "prio" => {
                         priority = parse_priority_word(val);
                         i += 1;
@@ -163,6 +192,24 @@ impl MarkdownTaskExtractor {
                         recurrence = Some(val.to_string());
                         i += 1;
                         continue;
+                    }
+                    "id" => {
+                        task_id_token = Some(val.to_string());
+                        i += 1;
+                        continue;
+                    }
+                    "dependsOn" | "dependson" | "depends" => {
+                        for id in val.split(',') {
+                            let id = id.trim();
+                            if !id.is_empty() {
+                                depends_on.push(id.to_string());
+                            }
+                        }
+                        i += 1;
+                        continue;
+                    }
+                    "waiting" | "waiting_for" | "waiting-for" => {
+                        // handled after title assembly via raw token; keep as title word
                     }
                     _ => {}
                 }
@@ -174,6 +221,25 @@ impl MarkdownTaskExtractor {
                     priority = p;
                     i += 1;
                     continue;
+                }
+                if let EmojiMeta::Id = kind {
+                    if let Some(next) = parts.get(i + 1) {
+                        task_id_token = Some((*next).to_string());
+                        i += 2;
+                        continue;
+                    }
+                }
+                if let EmojiMeta::Depends = kind {
+                    if let Some(next) = parts.get(i + 1) {
+                        for id in next.split(',') {
+                            let id = id.trim();
+                            if !id.is_empty() {
+                                depends_on.push(id.to_string());
+                            }
+                        }
+                        i += 2;
+                        continue;
+                    }
                 }
                 if let Some(next) = parts.get(i + 1) {
                     match kind {
@@ -202,6 +268,11 @@ impl MarkdownTaskExtractor {
                                 created_at = Some(ts);
                             }
                         }
+                        EmojiMeta::Cancelled => {
+                            if let Ok(ts) = parse_date(next) {
+                                cancelled_at = Some(ts);
+                            }
+                        }
                         EmojiMeta::Recurrence => {
                             // Collect remaining recurrence words until next emoji/tag/key
                             let mut rule = String::new();
@@ -225,7 +296,7 @@ impl MarkdownTaskExtractor {
                             i += 1;
                             continue;
                         }
-                        EmojiMeta::Priority(_) => {}
+                        EmojiMeta::Priority(_) | EmojiMeta::Id | EmojiMeta::Depends => {}
                     }
                     i += 2;
                     continue;
@@ -242,18 +313,38 @@ impl MarkdownTaskExtractor {
         }
 
         let done = matches!(status, TaskStatus::Done);
-        let mut task = Task::new(title, self.profile_id);
+        let mut task = Task::new(title.clone(), self.profile_id);
         task.due = due;
         task.scheduled = scheduled;
         task.start = start;
         task.completed_at = completed_at;
         task.created_at = created_at;
+        task.cancelled_at = cancelled_at;
         task.recurrence = recurrence;
         task.priority = priority;
-        task.tags = tags;
+        task.depends_on = depends_on;
+        // Opaque Obsidian id kept in url-ish slot only if we need round-trip later;
+        // store as description note when present and no description yet.
+        let _ = task_id_token;
         task.done = done;
         task.status = status;
         task.source = "obsidian".to_string();
+
+        let title_refs: Vec<&str> = title_parts.iter().map(|s| s.as_str()).collect();
+        let tag_refs: Vec<&str> = raw_tags.iter().map(|s| s.as_str()).collect();
+        let parsed = parse_tags_and_mentions(tag_refs, title_refs);
+        apply_parsed_tags(&mut task, parsed);
+
+        // Strip @mentions from displayed title (contexts already captured).
+        let clean_title: Vec<&str> = title_parts
+            .iter()
+            .map(|s| s.as_str())
+            .filter(|s| !s.starts_with('@'))
+            .collect();
+        if !clean_title.is_empty() {
+            task.title = clean_title.join(" ");
+        }
+
         Some(task)
     }
 
@@ -429,6 +520,9 @@ fn parse_checkbox_prefix(trimmed: &str) -> Option<(TaskStatus, &str)> {
 }
 
 fn format_checkbox_line(task: &Task) -> String {
+    let mut task = task.clone();
+    sync_tags_from_structured(&mut task);
+
     let mark = match task.status {
         TaskStatus::Todo => " ",
         TaskStatus::InProgress => "/",
@@ -443,6 +537,15 @@ fn format_checkbox_line(task: &Task) -> String {
     };
 
     let mut body = task.title.clone();
+    for ctx in &task.contexts {
+        if matches!(
+            ctx.kind,
+            crate::TaskContextKind::Tool | crate::TaskContextKind::Person
+        ) {
+            body.push_str(" @");
+            body.push_str(&ctx.name);
+        }
+    }
     for tag in &task.tags {
         body.push_str(" #");
         body.push_str(tag);
@@ -467,13 +570,22 @@ fn format_checkbox_line(task: &Task) -> String {
         body.push_str(" ✅ ");
         body.push_str(&done_at);
     }
+    if let Some(cancelled) = task.cancelled_at.and_then(format_due) {
+        body.push_str(" ❌ ");
+        body.push_str(&cancelled);
+    }
     if let Some(ref rule) = task.recurrence {
         if !rule.is_empty() {
             body.push_str(" 🔁 ");
             body.push_str(rule);
         }
     }
+    if !task.depends_on.is_empty() {
+        body.push_str(" ⛔ ");
+        body.push_str(&task.depends_on.join(","));
+    }
     match task.priority {
+        TaskPriority::Urgent => body.push_str(" ⏫"),
         TaskPriority::High => body.push_str(" 🔼"),
         TaskPriority::Low => body.push_str(" 🔽"),
         TaskPriority::Medium => {}
@@ -487,22 +599,17 @@ fn format_due(ts: u64) -> Option<String> {
     Some(dt.format("%Y-%m-%d").to_string())
 }
 
-fn parse_priority_word(s: &str) -> TaskPriority {
-    match s.to_lowercase().as_str() {
-        "highest" | "high" | "p1" | "1" => TaskPriority::High,
-        "lowest" | "low" | "p4" | "4" => TaskPriority::Low,
-        _ => TaskPriority::Medium,
-    }
-}
-
 enum EmojiMeta {
     Due,
     Scheduled,
     Start,
     Completed,
     Created,
+    Cancelled,
     Recurrence,
     Priority(TaskPriority),
+    Id,
+    Depends,
 }
 
 fn emoji_meta_kind(token: &str) -> Option<EmojiMeta> {
@@ -512,11 +619,38 @@ fn emoji_meta_kind(token: &str) -> Option<EmojiMeta> {
         "🛫" => Some(EmojiMeta::Start),
         "✅" => Some(EmojiMeta::Completed),
         "➕" => Some(EmojiMeta::Created),
+        "❌" => Some(EmojiMeta::Cancelled),
         "🔁" => Some(EmojiMeta::Recurrence),
-        "⏫" | "🔼" => Some(EmojiMeta::Priority(TaskPriority::High)),
-        "🔽" | "⏬" => Some(EmojiMeta::Priority(TaskPriority::Low)),
+        "⏫" => Some(EmojiMeta::Priority(TaskPriority::Urgent)),
+        "🔼" => Some(EmojiMeta::Priority(TaskPriority::High)),
+        "🔽" => Some(EmojiMeta::Priority(TaskPriority::Low)),
+        "⏬" => Some(EmojiMeta::Priority(TaskPriority::Low)),
+        "🆔" => Some(EmojiMeta::Id),
+        "⛔" => Some(EmojiMeta::Depends),
         _ => None,
     }
+}
+
+fn parse_markdown_heading(trimmed: &str) -> Option<String> {
+    let bytes = trimmed.as_bytes();
+    if bytes.is_empty() || bytes[0] != b'#' {
+        return None;
+    }
+    let mut i = 0;
+    while i < bytes.len() && bytes[i] == b'#' {
+        i += 1;
+    }
+    if i == 0 || i > 6 {
+        return None;
+    }
+    if i < bytes.len() && bytes[i] != b' ' {
+        return None;
+    }
+    let title = trimmed[i..].trim();
+    if title.is_empty() {
+        return None;
+    }
+    Some(title.to_string())
 }
 
 fn resolve_vault_path(vault: &Path, path: &Path) -> PathBuf {
@@ -588,6 +722,29 @@ mod tests {
         assert!(tasks[0].due.is_some());
         assert_eq!(tasks[0].priority, TaskPriority::High);
         assert_eq!(tasks[0].tags, vec!["work".to_string()]);
+    }
+
+    #[test]
+    fn parse_lane_ctx_and_heading_section() {
+        let ext = MarkdownTaskExtractor::new("/tmp", ProfileId::new());
+        let md = "## Inbox\n- [ ] Call bank @phone #lane/now #ctx/home\n";
+        let tasks = ext.parse_tasks(md, Some("Work/note.md"));
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].section.as_deref(), Some("Inbox"));
+        assert_eq!(tasks[0].project.as_deref(), Some("Work"));
+        assert_eq!(tasks[0].lane_id.as_deref(), Some("now"));
+        assert!(tasks[0]
+            .contexts
+            .iter()
+            .any(|c| c.name == "phone" || c.name == "home"));
+        assert!(!tasks[0].title.contains('@'));
+    }
+
+    #[test]
+    fn parse_urgent_priority_emoji() {
+        let ext = MarkdownTaskExtractor::new("/tmp", ProfileId::new());
+        let tasks = ext.parse_tasks("- [ ] Critical ⏫", Some("a.md"));
+        assert_eq!(tasks[0].priority, TaskPriority::Urgent);
     }
 
     #[test]

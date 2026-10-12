@@ -251,11 +251,10 @@ impl Page {
     }
 }
 
-/// Task priority level.
+/// Task priority — four levels aligned with Todoist p1–p4.
 ///
-/// Covers Obsidian Tasks (highest→lowest) and Todoist (p1–p4) via mapping:
-/// Highest/P1 → High, High/P2 → High, Medium/P3 → Medium, Low/P4 → Low,
-/// Lowest → Low.
+/// Obsidian Tasks 6-tier maps in: Highest→Urgent, High→High, Medium/Normal→Medium,
+/// Low/Lowest→Low. Todoist: p4→Urgent, p3→High, p2→Medium, p1→Low.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum TaskPriority {
@@ -263,6 +262,44 @@ pub enum TaskPriority {
     #[default]
     Medium = 1,
     High = 2,
+    Urgent = 3,
+}
+
+/// GTD-style typed context on a task (place, tool, person, …).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskContext {
+    pub kind: TaskContextKind,
+    pub name: String,
+}
+
+impl TaskContext {
+    pub fn new(kind: TaskContextKind, name: impl Into<String>) -> Self {
+        TaskContext {
+            kind,
+            name: name.into(),
+        }
+    }
+}
+
+/// Kind of a [`TaskContext`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskContextKind {
+    Place,
+    Tool,
+    Person,
+    Energy,
+    Duration,
+    Custom,
+}
+
+/// Optional energy level for Engage filtering (GTD criterion).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnergyLevel {
+    Low,
+    Medium,
+    High,
 }
 
 /// Workflow status shared by Obsidian Tasks (`[ ]`/`[/]`/`[x]`/`[-]`) and Todoist.
@@ -323,6 +360,30 @@ pub struct Task {
     /// Deep link back to the provider (Todoist URL, Obsidian URI, …).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// Typed GTD contexts (place/tool/person/…); freeform tags stay in [`Self::tags`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contexts: Vec<TaskContext>,
+    /// Who/what this is waiting on (Waiting lane).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_for: Option<String>,
+    /// Estimated duration in minutes (Todoist duration / Engage time filter).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_minutes: Option<u32>,
+    /// Energy needed (Engage filter); may also appear as an Energy context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub energy: Option<EnergyLevel>,
+    /// Obsidian Tasks dependency ids (`⛔`), opaque provider refs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
+    /// When cancelled (`❌`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancelled_at: Option<u64>,
+    /// Effective horizon lane id after overlay + provider inference (`now`, `next`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane_id: Option<String>,
+    /// Last weekly-review confirmation (Unix secs); used for Waiting/Someday staleness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewed_at: Option<u64>,
 }
 
 impl Task {
@@ -348,6 +409,14 @@ impl Task {
             section: None,
             parent_id: None,
             url: None,
+            contexts: Vec::new(),
+            waiting_for: None,
+            duration_minutes: None,
+            energy: None,
+            depends_on: Vec::new(),
+            cancelled_at: None,
+            lane_id: None,
+            reviewed_at: None,
         }
     }
 
@@ -689,7 +758,12 @@ mod tests {
 
     #[test]
     fn task_priority_serde_all_variants() {
-        for priority in [TaskPriority::Low, TaskPriority::Medium, TaskPriority::High] {
+        for priority in [
+            TaskPriority::Low,
+            TaskPriority::Medium,
+            TaskPriority::High,
+            TaskPriority::Urgent,
+        ] {
             let json = serde_json::to_string(&priority).unwrap();
             assert_eq!(
                 priority,

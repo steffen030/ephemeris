@@ -22,6 +22,11 @@ impl IcsReader {
         window_start: u64,
         window_end: u64,
     ) -> crate::Result<Vec<CalendarEvent>> {
+        // icalendar 0.17+ rejects empty input; treat blank feeds as no events.
+        if ics_text.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+
         let calendar: Calendar = ics_text
             .parse()
             .map_err(|e| AppError::InvalidInput(format!("ICS parse failed: {e:?}")))?;

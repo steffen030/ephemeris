@@ -4,10 +4,12 @@
 //! returns them sorted highest-priority-first.
 //!
 //! Score components (all additive, higher = more urgent):
-//! - `priority_score`: High=300, Medium=200, Low=100
+//! - `priority_score`: Urgent=400, High=300, Medium=200, Low=100
 //! - `due_score`: 500 if overdue, 400 if due today, 300 if due in 1 d,
 //!   200 if due in 2 d, 100 if due in 3–7 d, 0 if >7 d or no due
-//! - total = priority_score + due_score
+//! - `start_bonus`: +50 if start ≤ now (actionable), 0 if start in future
+//! - `scheduled_bonus`: +25 if scheduled ≤ now
+//! - total = priority_score + due_score + start_bonus + scheduled_bonus
 
 use crate::{Task, TaskPriority};
 
@@ -16,6 +18,7 @@ const SECS_PER_DAY: u64 = 86_400;
 /// Score a single task at `now_secs` (Unix seconds).
 pub fn task_score(task: &Task, now_secs: u64) -> u32 {
     let priority_score = match task.priority {
+        TaskPriority::Urgent => 400,
         TaskPriority::High => 300,
         TaskPriority::Medium => 200,
         TaskPriority::Low => 100,
@@ -39,7 +42,18 @@ pub fn task_score(task: &Task, now_secs: u64) -> u32 {
         }
     };
 
-    priority_score + due_score
+    let start_bonus = match task.start {
+        Some(s) if s > now_secs => 0,
+        Some(_) => 50,
+        None => 0,
+    };
+
+    let scheduled_bonus = match task.scheduled {
+        Some(s) if s <= now_secs => 25,
+        _ => 0,
+    };
+
+    priority_score + due_score + start_bonus + scheduled_bonus
 }
 
 /// Return `tasks` sorted highest-score-first, excluding done tasks.

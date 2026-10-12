@@ -7,14 +7,12 @@
 use crate::model::{Color, Stroke, Tool};
 use crate::transcriber::TextSpan;
 use printpdf::{
-    BuiltinFont, Color as PdfColor, ColorBits, ColorSpace, Greyscale, Image, ImageTransform,
-    ImageXObject, Line, Mm, PdfDocument, PdfDocumentReference, PdfLayerReference, PdfPageIndex,
-    Point as PdfPoint, Pt, Px, Rgb, TextRenderingMode,
+    BuiltinFont, Color as PdfColor, Greyscale, Line, LinePoint, Mm, Op, PdfDocument, PdfFontHandle,
+    PdfPage, PdfSaveOptions, Point as PdfPoint, Pt, RawImage, RawImageData, RawImageFormat, Rgb,
+    TextItem, TextRenderingMode, XObjectTransform,
 };
 use std::collections::hash_map::DefaultHasher;
-use std::fs::File;
 use std::hash::{Hash, Hasher};
-use std::io::BufWriter;
 use std::path::Path;
 
 /// One page of raster ink (8-bpp grayscale, 0 = black, 255 = white).
@@ -88,42 +86,26 @@ pub fn export_raster_pages_to_pdf(
         return Ok(0);
     }
 
-    let (page_w_mm, page_h_mm) = page_size_mm(pages[0].width, pages[0].height);
-    let (doc, page1, layer1) = PdfDocument::new(
-        if opts.title.is_empty() {
-            "Ephemeris Note"
+    let mut doc = PdfDocument::new(if opts.title.is_empty() {
+        "Ephemeris Note"
+    } else {
+        &opts.title
+    });
+
+    let mut pdf_pages = Vec::with_capacity(pages.len());
+    for (i, page) in pages.iter().enumerate() {
+        let (page_w_mm, page_h_mm) = page_size_mm(page.width, page.height);
+        let full_text = if i == 0 {
+            opts.searchable_text.as_deref()
         } else {
-            &opts.title
-        },
-        page_w_mm,
-        page_h_mm,
-        "Page 1",
-    );
-
-    write_raster_page(
-        &doc,
-        page1,
-        layer1,
-        &pages[0],
-        page_w_mm,
-        page_h_mm,
-        opts.searchable_text.as_deref(),
-        opts.page_spans.first().map(|s| s.as_slice()).unwrap_or(&[]),
-    )?;
-
-    for (i, page) in pages.iter().enumerate().skip(1) {
-        let (pw, ph) = page_size_mm(page.width, page.height);
-        let (pdf_page, layer) = doc.add_page(pw, ph, format!("Page {}", i + 1));
+            None
+        };
         let spans = opts.page_spans.get(i).map(|s| s.as_slice()).unwrap_or(&[]);
-        write_raster_page(&doc, pdf_page, layer, page, pw, ph, None, spans)?;
+        let ops = build_raster_page_ops(&mut doc, page, page_w_mm, page_h_mm, full_text, spans)?;
+        pdf_pages.push(PdfPage::new(page_w_mm, page_h_mm, ops));
     }
 
-    if let Some(parent) = out_path.parent() {
-        std::fs::create_dir_all(parent).map_err(crate::AppError::Io)?;
-    }
-    let file = File::create(out_path).map_err(crate::AppError::Io)?;
-    doc.save(&mut BufWriter::new(file))
-        .map_err(|e| crate::AppError::Storage(format!("pdf save: {e}")))?;
+    save_doc(&mut doc, pdf_pages, out_path)?;
     write_pdf_hash_sidecar(out_path, &hash);
     Ok(pages.len())
 }
@@ -140,45 +122,40 @@ pub fn export_stroke_pages_to_pdf(
         return Err(crate::AppError::InvalidInput("pdf export: no pages".into()));
     }
     let (page_w_mm, page_h_mm) = page_size_mm(canvas_w as u32, canvas_h as u32);
-    let (doc, page1, layer1) = PdfDocument::new(
-        if opts.title.is_empty() {
-            "Ephemeris Note"
+    let mut doc = PdfDocument::new(if opts.title.is_empty() {
+        "Ephemeris Note"
+    } else {
+        &opts.title
+    });
+
+    let mut pdf_pages = Vec::with_capacity(pages.len());
+    for (i, strokes) in pages.iter().enumerate() {
+        let full_text = if i == 0 {
+            opts.searchable_text.as_deref()
         } else {
-            &opts.title
-        },
-        page_w_mm,
-        page_h_mm,
-        "Page 1",
-    );
-
-    draw_stroke_page(
-        &doc,
-        page1,
-        layer1,
-        &pages[0],
-        canvas_w,
-        canvas_h,
-        page_w_mm,
-        page_h_mm,
-        opts.searchable_text.as_deref(),
-        opts.page_spans.first().map(|s| s.as_slice()).unwrap_or(&[]),
-    )?;
-
-    for (i, strokes) in pages.iter().enumerate().skip(1) {
-        let (pdf_page, layer) = doc.add_page(page_w_mm, page_h_mm, format!("Page {}", i + 1));
+            None
+        };
         let spans = opts.page_spans.get(i).map(|s| s.as_slice()).unwrap_or(&[]);
-        draw_stroke_page(
-            &doc, pdf_page, layer, strokes, canvas_w, canvas_h, page_w_mm, page_h_mm, None, spans,
-        )?;
+        let ops = build_stroke_page_ops(
+            strokes, canvas_w, canvas_h, page_w_mm, page_h_mm, full_text, spans,
+        );
+        pdf_pages.push(PdfPage::new(page_w_mm, page_h_mm, ops));
     }
 
+    save_doc(&mut doc, pdf_pages, out_path)?;
+    Ok(pages.len())
+}
+
+fn save_doc(doc: &mut PdfDocument, pages: Vec<PdfPage>, out_path: &Path) -> crate::Result<()> {
     if let Some(parent) = out_path.parent() {
         std::fs::create_dir_all(parent).map_err(crate::AppError::Io)?;
     }
-    let file = File::create(out_path).map_err(crate::AppError::Io)?;
-    doc.save(&mut BufWriter::new(file))
-        .map_err(|e| crate::AppError::Storage(format!("pdf save: {e}")))?;
-    Ok(pages.len())
+    let mut warnings = Vec::new();
+    let bytes = doc
+        .with_pages(pages)
+        .save(&PdfSaveOptions::default(), &mut warnings);
+    std::fs::write(out_path, bytes).map_err(crate::AppError::Io)?;
+    Ok(())
 }
 
 fn page_size_mm(width_px: u32, height_px: u32) -> (Mm, Mm) {
@@ -196,19 +173,14 @@ fn page_size_mm(width_px: u32, height_px: u32) -> (Mm, Mm) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn write_raster_page(
-    doc: &PdfDocumentReference,
-    page: PdfPageIndex,
-    layer_idx: printpdf::PdfLayerIndex,
+fn build_raster_page_ops(
+    doc: &mut PdfDocument,
     raster: &RasterPage,
     page_w_mm: Mm,
     page_h_mm: Mm,
     full_text: Option<&str>,
     spans: &[TextSpan],
-) -> crate::Result<()> {
-    let layer = doc.get_page(page).get_layer(layer_idx);
-
+) -> crate::Result<Vec<Op>> {
     let expected = (raster.width as usize).saturating_mul(raster.height as usize);
     if raster.gray8.len() < expected {
         return Err(crate::AppError::InvalidInput(format!(
@@ -216,47 +188,41 @@ fn write_raster_page(
             raster.gray8.len()
         )));
     }
-    let xobj = ImageXObject {
-        width: Px(raster.width as usize),
-        height: Px(raster.height as usize),
-        color_space: ColorSpace::Greyscale,
-        bits_per_component: ColorBits::Bit8,
-        interpolate: true,
-        image_data: raster.gray8[..expected].to_vec(),
-        image_filter: None,
-        smask: None,
-        clipping_bbox: None,
+
+    let image = RawImage {
+        pixels: RawImageData::U8(raster.gray8[..expected].to_vec()),
+        width: raster.width as usize,
+        height: raster.height as usize,
+        data_format: RawImageFormat::R8,
+        tag: Vec::new(),
     };
+    let image_id = doc.add_image(&image);
+
     // dpi such that image width in points equals page width in points.
     let dpi = (raster.width.max(1) as f32) * 25.4 / page_w_mm.0.max(0.1);
-    Image::from(xobj).add_to_layer(
-        layer.clone(),
-        ImageTransform {
-            translate_x: Some(Mm(0.0)),
-            translate_y: Some(Mm(0.0)),
+    let mut ops = vec![Op::UseXobject {
+        id: image_id,
+        transform: XObjectTransform {
+            translate_x: Some(Pt(0.0)),
+            translate_y: Some(Pt(0.0)),
             dpi: Some(dpi),
-            ..ImageTransform::default()
+            ..XObjectTransform::default()
         },
-    );
+    }];
 
-    embed_text_layer(
-        doc,
-        &layer,
+    ops.extend(embed_text_ops(
         page_w_mm,
         page_h_mm,
         raster.width as f32,
         raster.height as f32,
         full_text,
         spans,
-    )?;
-    Ok(())
+    ));
+    Ok(ops)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn draw_stroke_page(
-    doc: &PdfDocumentReference,
-    page: PdfPageIndex,
-    layer_idx: printpdf::PdfLayerIndex,
+fn build_stroke_page_ops(
     strokes: &[Stroke],
     canvas_w: f32,
     canvas_h: f32,
@@ -264,63 +230,72 @@ fn draw_stroke_page(
     page_h_mm: Mm,
     full_text: Option<&str>,
     spans: &[TextSpan],
-) -> crate::Result<()> {
-    let layer = doc.get_page(page).get_layer(layer_idx);
+) -> Vec<Op> {
     let sx = page_w_mm.0 / canvas_w.max(1.0);
     let sy = page_h_mm.0 / canvas_h.max(1.0);
+    let mut ops = Vec::new();
 
     for stroke in strokes {
         if stroke.tool == Tool::Eraser || stroke.points.len() < 2 {
             continue;
         }
-        let points: Vec<(PdfPoint, bool)> = stroke
+        let points: Vec<LinePoint> = stroke
             .points
             .iter()
-            .enumerate()
-            .map(|(i, p)| {
+            .map(|p| {
                 // PDF y grows upward; canvas y grows downward.
                 let x = Mm(p.x * sx);
                 let y = Mm((canvas_h - p.y) * sy);
-                (PdfPoint::new(x, y), i == 0)
+                LinePoint {
+                    p: PdfPoint::new(x, y),
+                    bezier: false,
+                }
             })
             .collect();
-        let line = Line {
-            points,
-            is_closed: false,
-        };
         let (r, g, b) = color_to_rgb(stroke.color);
-        layer.set_outline_color(PdfColor::Rgb(Rgb::new(r, g, b, None)));
         let width_pt = Pt(stroke.base_width.max(0.5) * sx * 2.83465); // mm→approx via scale
-        layer.set_outline_thickness(width_pt.0);
-        layer.add_line(line);
+        ops.push(Op::SetOutlineColor {
+            col: PdfColor::Rgb(Rgb::new(r, g, b, None)),
+        });
+        ops.push(Op::SetOutlineThickness { pt: width_pt });
+        ops.push(Op::DrawLine {
+            line: Line {
+                points,
+                is_closed: false,
+            },
+        });
     }
 
-    embed_text_layer(
-        doc, &layer, page_w_mm, page_h_mm, canvas_w, canvas_h, full_text, spans,
-    )?;
-    Ok(())
+    ops.extend(embed_text_ops(
+        page_w_mm, page_h_mm, canvas_w, canvas_h, full_text, spans,
+    ));
+    ops
 }
 
-#[allow(clippy::too_many_arguments)]
-fn embed_text_layer(
-    doc: &PdfDocumentReference,
-    layer: &PdfLayerReference,
+fn embed_text_ops(
     page_w_mm: Mm,
     page_h_mm: Mm,
     canvas_w: f32,
     canvas_h: f32,
     full_text: Option<&str>,
     spans: &[TextSpan],
-) -> crate::Result<()> {
-    let font = doc
-        .add_builtin_font(BuiltinFont::Helvetica)
-        .map_err(|e| crate::AppError::Storage(format!("pdf font: {e}")))?;
-
-    layer.set_text_rendering_mode(TextRenderingMode::Invisible);
-    layer.set_fill_color(PdfColor::Greyscale(Greyscale::new(0.0, None)));
-
+) -> Vec<Op> {
     let sx = page_w_mm.0 / canvas_w.max(1.0);
     let sy = page_h_mm.0 / canvas_h.max(1.0);
+    let mut ops = vec![
+        Op::StartTextSection,
+        Op::SetTextRenderingMode {
+            mode: TextRenderingMode::Invisible,
+        },
+        Op::SetFillColor {
+            col: PdfColor::Greyscale(Greyscale::new(0.0, None)),
+        },
+        Op::SetFont {
+            font: PdfFontHandle::Builtin(BuiltinFont::Helvetica),
+            size: Pt(8.0),
+        },
+        Op::SetLineHeight { lh: Pt(8.0) },
+    ];
 
     if let Some(text) = full_text.map(str::trim).filter(|s| !s.is_empty()) {
         // Lay out as wrapped lines near the top so the whole note is searchable.
@@ -329,7 +304,16 @@ fn embed_text_layer(
             if y < 4.0 {
                 break;
             }
-            layer.use_text(line, 8.0, Mm(4.0), Mm(y), &font);
+            ops.push(Op::SetTextCursor {
+                pos: PdfPoint::new(Mm(4.0), Mm(y)),
+            });
+            ops.push(Op::SetFont {
+                font: PdfFontHandle::Builtin(BuiltinFont::Helvetica),
+                size: Pt(8.0),
+            });
+            ops.push(Op::ShowText {
+                items: vec![TextItem::Text(line.to_string())],
+            });
             y -= 4.0;
         }
     }
@@ -341,12 +325,20 @@ fn embed_text_layer(
         let x = Mm(span.x * sx);
         let y = Mm((canvas_h - span.y - span.height) * sy);
         let font_size = (span.height * sy * 2.83465).clamp(6.0, 24.0);
-        layer.use_text(&span.text, font_size, x, y, &font);
+        ops.push(Op::SetTextCursor {
+            pos: PdfPoint::new(x, y),
+        });
+        ops.push(Op::SetFont {
+            font: PdfFontHandle::Builtin(BuiltinFont::Helvetica),
+            size: Pt(font_size),
+        });
+        ops.push(Op::ShowText {
+            items: vec![TextItem::Text(span.text.clone())],
+        });
     }
 
-    // Restore normal rendering for any subsequent drawing (none expected).
-    layer.set_text_rendering_mode(TextRenderingMode::Fill);
-    Ok(())
+    ops.push(Op::EndTextSection);
+    ops
 }
 
 fn color_to_rgb(c: Color) -> (f32, f32, f32) {

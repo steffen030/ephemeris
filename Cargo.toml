@@ -22,7 +22,7 @@ ephemeris-ui    = { path = "crates/ephemeris-ui" }
 
 # Shared external dependencies (pin versions here; crates inherit via workspace = true)
 crossbeam-channel = "0.5"
-rusqlite = { version = "0.30", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 thiserror = "2"
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
@@ -45,15 +45,15 @@ reqwest_dav = { version = "0.3", default-features = false, features = ["rustls-t
 bytes = "1"
 
 # PDF export (note pages → searchable PDF)
-printpdf = "0.7"
+printpdf = "0.12"
 
 # ICS calendar parsing
-icalendar = "0.16"
+icalendar = "0.17"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 
 # Audio recording (mic capture + WAV writing)
-cpal = "0.15"
+cpal = "0.18"
 hound = "3.5"
 
 # Linux stylus / digitiser access (PineNote pen via /dev/input)
