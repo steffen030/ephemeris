@@ -5,7 +5,9 @@
 
 use crate::model::{Point, Stroke, Tool};
 #[cfg(feature = "htr")]
-use crate::stroke_htr::{ctc_greedy_decode, decode_charset_with_blank, features_to_tensor};
+use crate::stroke_htr::{
+    ctc_greedy_decode, ctc_softmax_confidence, decode_charset_with_blank, features_to_tensor,
+};
 use crate::stroke_htr::{default_line_gap, featurize_line, group_strokes_into_lines};
 #[cfg(feature = "ocr")]
 use std::path::Path;
@@ -120,12 +122,18 @@ impl CascadingTranscriber {
         Self {
             htr,
             ocr,
-            min_htr_confidence: 0.35,
+            // Slightly stricter than the old 0.35 so weak OnlineHTR guesses
+            // fall through to preprocessed Tesseract (better for print / letters).
+            min_htr_confidence: 0.45,
         }
     }
 
     /// Transcribe a page using strokes when possible, else / on low confidence
     /// the gray8 raster via Tesseract.
+    ///
+    /// When both backends return text, pick the higher mean-confidence result
+    /// (OCR wins ties by +0.05 so print/block letters are not stuck on a weak
+    /// HTR decode).
     pub fn transcribe_page(
         &self,
         strokes: &[Stroke],
@@ -133,29 +141,67 @@ impl CascadingTranscriber {
         height: u32,
         gray8: &[u8],
     ) -> crate::Result<Vec<TextSpan>> {
-        if !strokes.is_empty() && self.htr.enabled && self.htr.model_available() {
-            let spans = self.htr.transcribe(strokes)?;
-            // Accept non-empty HTR when confidence unknown (negative) or above threshold.
-            let accept = !spans.is_empty()
-                && (spans.iter().any(|s| s.confidence < 0.0)
-                    || mean_confidence(&spans) >= self.min_htr_confidence);
-            if accept {
-                return Ok(spans);
+        let htr_spans = if !strokes.is_empty() && self.htr.enabled && self.htr.model_available() {
+            self.htr.transcribe(strokes)?
+        } else {
+            Vec::new()
+        };
+        let ocr_spans = self.ocr.transcribe_raster(width, height, gray8)?;
+        Ok(pick_cascade_spans(
+            &htr_spans,
+            &ocr_spans,
+            self.min_htr_confidence,
+        ))
+    }
+}
+
+/// Choose HTR vs OCR spans for the cascade (shared by page + stroke paths).
+fn pick_cascade_spans(
+    htr_spans: &[TextSpan],
+    ocr_spans: &[TextSpan],
+    min_htr_confidence: f32,
+) -> Vec<TextSpan> {
+    let htr_scored = !htr_spans.is_empty()
+        && (htr_spans.iter().any(|s| s.confidence < 0.0)
+            || mean_confidence(htr_spans) >= min_htr_confidence);
+    let ocr_ok = !ocr_spans.is_empty();
+    match (htr_scored, ocr_ok) {
+        (true, true) => {
+            let hc = mean_confidence(htr_spans);
+            let oc = mean_confidence(ocr_spans);
+            // Prefer OCR when it is clearly more confident (print / letters).
+            if oc + 0.05 >= hc {
+                ocr_spans.to_vec()
+            } else {
+                htr_spans.to_vec()
             }
         }
-        self.ocr.transcribe_raster(width, height, gray8)
+        (true, false) => htr_spans.to_vec(),
+        (false, true) => ocr_spans.to_vec(),
+        (false, false) => {
+            // Last resort: any non-empty HTR even if below threshold.
+            if !htr_spans.is_empty() {
+                htr_spans.to_vec()
+            } else {
+                ocr_spans.to_vec()
+            }
+        }
     }
 }
 
 impl Transcriber for CascadingTranscriber {
     fn transcribe(&self, strokes: &[Stroke]) -> crate::Result<Vec<TextSpan>> {
-        if !strokes.is_empty() && self.htr.enabled && self.htr.model_available() {
-            let spans = self.htr.transcribe(strokes)?;
-            if !spans.is_empty() {
-                return Ok(spans);
-            }
-        }
-        self.ocr.transcribe(strokes)
+        let htr_spans = if !strokes.is_empty() && self.htr.enabled && self.htr.model_available() {
+            self.htr.transcribe(strokes)?
+        } else {
+            Vec::new()
+        };
+        let ocr_spans = self.ocr.transcribe(strokes)?;
+        Ok(pick_cascade_spans(
+            &htr_spans,
+            &ocr_spans,
+            self.min_htr_confidence,
+        ))
     }
 
     fn transcribe_raster(
@@ -333,11 +379,7 @@ impl StrokeHtrTranscriber {
         let blank = sess.blank_index.min(c.saturating_sub(1));
         let path = ctc_greedy_decode(&logits, time, c, blank);
         let text = decode_charset_with_blank(&path, &sess.charset, blank);
-        let conf = if time == 0 {
-            0.0
-        } else {
-            (path.len() as f32 / time as f32).clamp(0.15, 0.95)
-        };
+        let conf = ctc_softmax_confidence(&logits, time, c, blank);
         Ok((text, conf))
     }
 
@@ -524,7 +566,7 @@ impl RasterOcrTranscriber {
             return "Tesseract not found. On PineNote: sudo apt install tesseract-ocr tesseract-ocr-eng"
                 .into();
         }
-        "No text recognised. Block/print handwriting works best.".into()
+        "No text recognised. Try larger letters, or Settings → Handwriting for stroke HTR.".into()
     }
 }
 
@@ -558,6 +600,203 @@ impl Transcriber for RasterOcrTranscriber {
     }
 }
 
+/// Prepared OCR image + transform back to the source raster coordinates.
+#[derive(Debug, Clone)]
+struct OcrPrepared {
+    gray: Vec<u8>,
+    width: u32,
+    height: u32,
+    /// Crop origin in the source image.
+    origin_x: f32,
+    origin_y: f32,
+    /// Uniform scale applied after crop.
+    scale: f32,
+    /// Tesseract page segmentation mode.
+    psm: u8,
+    /// Declared DPI so LSTM sees roughly print-sized glyphs.
+    dpi: u32,
+}
+
+/// Ink darkness threshold (gray8); below this counts as ink.
+const INK_THRESHOLD: u8 = 200;
+
+/// Crop to ink, thicken thin strokes, upscale, and pick a PSM for handwriting.
+fn prepare_ocr_image(width: u32, height: u32, gray8: &[u8]) -> Option<OcrPrepared> {
+    let expected = (width as usize).saturating_mul(height as usize);
+    if width == 0 || height == 0 || gray8.len() < expected {
+        return None;
+    }
+    let (min_x, min_y, max_x, max_y) = ink_bbox(width, height, &gray8[..expected])?;
+    let pad = 16i32;
+    let x0 = (min_x as i32 - pad).max(0) as u32;
+    let y0 = (min_y as i32 - pad).max(0) as u32;
+    let x1 = (max_x as i32 + pad).min(width as i32 - 1).max(x0 as i32) as u32;
+    let y1 = (max_y as i32 + pad).min(height as i32 - 1).max(y0 as i32) as u32;
+    let cw = (x1 - x0 + 1).max(1);
+    let ch = (y1 - y0 + 1).max(1);
+
+    let mut cropped = vec![255u8; (cw as usize) * (ch as usize)];
+    for y in 0..ch {
+        let src_row = ((y0 + y) * width + x0) as usize;
+        let dst_row = (y * cw) as usize;
+        cropped[dst_row..dst_row + cw as usize]
+            .copy_from_slice(&gray8[src_row..src_row + cw as usize]);
+    }
+    // Thicken thin pen strokes before upscale (helps single letters / light ink).
+    cropped = dilate_ink(&cropped, cw, ch, 1);
+
+    // Target ~3× for small glyphs (letters), 2× for larger blocks; cap size.
+    let short = cw.min(ch);
+    let scale: u32 = if short < 48 {
+        4
+    } else if short < 120 {
+        3
+    } else {
+        2
+    };
+    let (sw, sh, scaled) = nearest_upscale(&cropped, cw, ch, scale);
+    // Keep Tesseract inputs bounded on large pages.
+    let (fw, fh, final_gray, used_scale) = if sw > 2400 || sh > 2400 {
+        let factor = (2400.0 / sw.max(sh) as f32).min(1.0);
+        if factor < 0.99 {
+            let ns = ((scale as f32) * factor).max(1.0).round().max(1.0) as u32;
+            let (w2, h2, g2) = nearest_upscale(&cropped, cw, ch, ns);
+            (w2, h2, g2, ns as f32)
+        } else {
+            (sw, sh, scaled, scale as f32)
+        }
+    } else {
+        (sw, sh, scaled, scale as f32)
+    };
+
+    let psm = choose_ocr_psm(cw, ch);
+    // After upscale, pretend ~150–300 DPI so LSTM sees print-like sizes.
+    let dpi = (72u32.saturating_mul(used_scale as u32)).clamp(150, 300);
+
+    Some(OcrPrepared {
+        gray: final_gray,
+        width: fw,
+        height: fh,
+        origin_x: x0 as f32,
+        origin_y: y0 as f32,
+        scale: used_scale,
+        psm,
+        dpi,
+    })
+}
+
+fn ink_bbox(width: u32, height: u32, gray8: &[u8]) -> Option<(u32, u32, u32, u32)> {
+    let mut min_x = width;
+    let mut min_y = height;
+    let mut max_x = 0u32;
+    let mut max_y = 0u32;
+    let mut any = false;
+    for y in 0..height {
+        for x in 0..width {
+            if gray8[(y * width + x) as usize] < INK_THRESHOLD {
+                any = true;
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+            }
+        }
+    }
+    if any {
+        Some((min_x, min_y, max_x, max_y))
+    } else {
+        None
+    }
+}
+
+fn dilate_ink(gray: &[u8], w: u32, h: u32, radius: i32) -> Vec<u8> {
+    if radius <= 0 {
+        return gray.to_vec();
+    }
+    let mut out = vec![255u8; gray.len()];
+    let r = radius;
+    for y in 0..h as i32 {
+        for x in 0..w as i32 {
+            let mut dark = false;
+            'n: for dy in -r..=r {
+                for dx in -r..=r {
+                    let nx = x + dx;
+                    let ny = y + dy;
+                    if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 {
+                        continue;
+                    }
+                    if gray[(ny as u32 * w + nx as u32) as usize] < INK_THRESHOLD {
+                        dark = true;
+                        break 'n;
+                    }
+                }
+            }
+            if dark {
+                out[(y as u32 * w + x as u32) as usize] = 0;
+            }
+        }
+    }
+    out
+}
+
+fn nearest_upscale(gray: &[u8], w: u32, h: u32, scale: u32) -> (u32, u32, Vec<u8>) {
+    let scale = scale.max(1);
+    if scale == 1 {
+        return (w, h, gray.to_vec());
+    }
+    let nw = w * scale;
+    let nh = h * scale;
+    let mut out = vec![255u8; (nw as usize) * (nh as usize)];
+    for y in 0..h {
+        for x in 0..w {
+            let v = gray[(y * w + x) as usize];
+            for dy in 0..scale {
+                for dx in 0..scale {
+                    let ox = x * scale + dx;
+                    let oy = y * scale + dy;
+                    out[(oy * nw + ox) as usize] = v;
+                }
+            }
+        }
+    }
+    (nw, nh, out)
+}
+
+/// Pick Tesseract PSM for cropped handwriting.
+///
+/// - tiny / square-ish → single word/char (8)
+/// - wide short strip → single line (7)
+/// - otherwise sparse text (11) — better than block PSM 6 for notes
+fn choose_ocr_psm(crop_w: u32, crop_h: u32) -> u8 {
+    let short = crop_w.min(crop_h);
+    let long = crop_w.max(crop_h);
+    if short < 64 && long < 160 {
+        8 // treat as a single word / letter cluster
+    } else if crop_h > 0 && (crop_w as f32 / crop_h as f32) >= 3.5 && crop_h < 80 {
+        7 // single text line
+    } else {
+        11 // sparse text
+    }
+}
+
+fn remap_ocr_spans(spans: Vec<TextSpan>, prep: &OcrPrepared) -> Vec<TextSpan> {
+    let inv = if prep.scale > 0.0 {
+        1.0 / prep.scale
+    } else {
+        1.0
+    };
+    spans
+        .into_iter()
+        .map(|mut s| {
+            s.x = s.x * inv + prep.origin_x;
+            s.y = s.y * inv + prep.origin_y;
+            s.width *= inv;
+            s.height *= inv;
+            s
+        })
+        .collect()
+}
+
 #[cfg(feature = "ocr")]
 fn run_tesseract_tsv(
     cfg: &RasterOcrTranscriber,
@@ -576,6 +815,10 @@ fn run_tesseract_tsv(
         )));
     }
 
+    let Some(prep) = prepare_ocr_image(width, height, &gray8[..expected]) else {
+        return Ok(Vec::new());
+    };
+
     let bin = cfg
         .tesseract_bin
         .clone()
@@ -583,16 +826,38 @@ fn run_tesseract_tsv(
 
     let tmp = tempfile_dir()?;
     let img_path = tmp.join("page.pgm");
-    write_pgm(&img_path, width, height, &gray8[..expected])?;
+    write_pgm(&img_path, prep.width, prep.height, &prep.gray)?;
 
-    let mut cmd = Command::new(&bin);
-    cmd.arg(&img_path)
+    // Try the adaptive PSM first; if empty, fall back to uniform block (6).
+    let mut spans = invoke_tesseract_tsv(cfg, &bin, &img_path, prep.psm, prep.dpi)?;
+    if spans.is_empty() && prep.psm != 6 {
+        spans = invoke_tesseract_tsv(cfg, &bin, &img_path, 6, prep.dpi)?;
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+    Ok(remap_ocr_spans(spans, &prep))
+}
+
+#[cfg(feature = "ocr")]
+fn invoke_tesseract_tsv(
+    cfg: &RasterOcrTranscriber,
+    bin: &Path,
+    img_path: &Path,
+    psm: u8,
+    dpi: u32,
+) -> crate::Result<Vec<TextSpan>> {
+    let mut cmd = Command::new(bin);
+    // Options before the config name (`tsv`); LSTM OEM helps handwriting.
+    cmd.arg(img_path)
         .arg("stdout")
+        .arg("--oem")
+        .arg("1")
         .arg("--psm")
-        .arg("6")
-        .arg("tsv")
+        .arg(psm.to_string())
+        .arg("--dpi")
+        .arg(dpi.to_string())
         .arg("-l")
-        .arg(&cfg.languages);
+        .arg(&cfg.languages)
+        .arg("tsv");
     if let Some(ref td) = cfg.tessdata {
         cmd.env("TESSDATA_PREFIX", td);
     }
@@ -601,15 +866,13 @@ fn run_tesseract_tsv(
         Ok(o) => o,
         Err(e) => {
             tracing::debug!("tesseract not runnable ({e}); OCR skipped");
-            let _ = std::fs::remove_dir_all(&tmp);
             return Ok(Vec::new());
         }
     };
-    let _ = std::fs::remove_dir_all(&tmp);
 
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
-        tracing::debug!("tesseract failed ({}): {err}", output.status);
+        tracing::debug!("tesseract failed psm={psm} ({}): {err}", output.status);
         return Ok(Vec::new());
     }
 
@@ -637,8 +900,8 @@ pub fn parse_tesseract_tsv(tsv: &str) -> Vec<TextSpan> {
             continue;
         }
         let conf: f32 = cols[10].parse().unwrap_or(-1.0);
-        if (0.0..15.0).contains(&conf) {
-            // Drop very low-confidence noise; -1 means conf missing.
+        if (0.0..5.0).contains(&conf) {
+            // Drop only near-zero noise; keep mid-low scores (letters / sparse ink).
             continue;
         }
         let left: f32 = cols[6].parse().unwrap_or(0.0);
@@ -822,7 +1085,7 @@ mod tests {
 level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext
 5\t1\t1\t1\t1\t1\t10\t20\t40\t12\t90.0\tHello
 5\t1\t1\t1\t1\t2\t60\t20\t50\t12\t88.5\tWorld
-5\t1\t1\t1\t1\t3\t0\t0\t10\t10\t5.0\tnose
+5\t1\t1\t1\t1\t3\t0\t0\t10\t10\t2.0\tnose
 4\t1\t1\t1\t1\t0\t10\t20\t100\t12\t-1\t
 ";
         let spans = parse_tesseract_tsv(tsv);
@@ -831,6 +1094,46 @@ level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theigh
         assert_eq!(spans[0].x, 10.0);
         assert_eq!(spans[1].text, "World");
         assert_eq!(RasterOcrTranscriber::spans_to_text(&spans), "Hello World");
+    }
+
+    #[test]
+    fn prepare_ocr_crops_and_upscales_ink() {
+        let w = 200u32;
+        let h = 100u32;
+        let mut gray = vec![255u8; (w * h) as usize];
+        // Small dark blob in the corner (letter-sized).
+        for y in 10..30 {
+            for x in 10..25 {
+                gray[(y * w + x) as usize] = 0;
+            }
+        }
+        let prep = prepare_ocr_image(w, h, &gray).expect("ink present");
+        assert!(prep.width > 25, "expected upscale, got w={}", prep.width);
+        assert!(prep.height > 20, "expected upscale, got h={}", prep.height);
+        assert_eq!(prep.psm, 8, "tiny crop should use single-word PSM");
+        assert!(prep.scale >= 3.0);
+    }
+
+    #[test]
+    fn pick_cascade_prefers_higher_ocr_confidence() {
+        let htr = vec![TextSpan {
+            text: "xx".into(),
+            x: 0.0,
+            y: 0.0,
+            width: 10.0,
+            height: 10.0,
+            confidence: 0.5,
+        }];
+        let ocr = vec![TextSpan {
+            text: "Hi".into(),
+            x: 0.0,
+            y: 0.0,
+            width: 10.0,
+            height: 10.0,
+            confidence: 0.85,
+        }];
+        let picked = pick_cascade_spans(&htr, &ocr, 0.45);
+        assert_eq!(picked[0].text, "Hi");
     }
 
     #[test]
