@@ -53,7 +53,7 @@ chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 
 # Audio recording (mic capture + WAV writing)
-cpal = "0.15"
+cpal = "0.18"
 hound = "3.5"
 
 # Linux stylus / digitiser access (PineNote pen via /dev/input)
