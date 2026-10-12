@@ -7,11 +7,11 @@ use ephemeris_core::{
     count_lane, export_raster_pages_to_pdf, filter_agenda, is_stale, list_engage, mark_reviewed,
     markdown_to_blocks, markdown_to_plain, resolve_lane, review_queue, search_events,
     search_local_notes, search_tasks, set_lane_tag, strip_inline_markdown, sync_notes_to_vault,
-    sync_tags_from_structured, to_agenda_entries, AgendaRange, CalendarEvent,
-    CascadingTranscriber, Config, EngageFilter, EventId, LineImageHtrTranscriber,
-    MarkdownTaskExtractor, PdfExportOptions, ProfileId, RasterOcrTranscriber, RasterPage,
-    SearchHit, StrokeHtrTranscriber, Task, TaskContext, TaskContextKind, TaskId, TaskPriority,
-    TaskProvider, VaultFtsIndex, VaultNoteExport,
+    sync_tags_from_structured, to_agenda_entries, AgendaRange, CalendarEvent, CascadingTranscriber,
+    Config, EngageFilter, EventId, LineImageHtrTranscriber, MarkdownTaskExtractor,
+    PdfExportOptions, ProfileId, RasterOcrTranscriber, RasterPage, SearchHit, StrokeHtrTranscriber,
+    Task, TaskContext, TaskContextKind, TaskId, TaskPriority, TaskProvider, VaultFtsIndex,
+    VaultNoteExport,
 };
 #[cfg(target_os = "linux")]
 use ephemeris_pal::input::{EvdevPenSource, PenTarget};
@@ -2641,9 +2641,7 @@ impl App {
                         .cloned()
                         .collect();
                     ui2.set_task_dialog_tags(free_tags.join(" ").as_str().into());
-                    ui2.set_task_dialog_lane(
-                        resolve_lane(t, "next").as_str().into(),
-                    );
+                    ui2.set_task_dialog_lane(resolve_lane(t, "next").as_str().into());
                     let ctxs: Vec<_> = t.contexts.iter().map(|c| c.name.clone()).collect();
                     ui2.set_task_dialog_contexts(ctxs.join(" ").as_str().into());
                     ui2.set_task_dialog_waiting(
@@ -2732,8 +2730,7 @@ impl App {
                             ui2.set_clarify_task_id(id.0.to_string().as_str().into());
                             ui2.set_clarify_title(t.title.as_str().into());
                             ui2.set_clarify_lane(resolve_lane(t, "next").as_str().into());
-                            let ctxs: Vec<_> =
-                                t.contexts.iter().map(|c| c.name.clone()).collect();
+                            let ctxs: Vec<_> = t.contexts.iter().map(|c| c.name.clone()).collect();
                             ui2.set_clarify_contexts(ctxs.join(" ").as_str().into());
                             ui2.set_clarify_waiting(
                                 t.waiting_for.clone().unwrap_or_default().as_str().into(),
@@ -2752,32 +2749,34 @@ impl App {
             let ui2 = ui.clone_component();
             let cfg2 = config.clone();
             let filter_rc = active_profile_filter.clone();
-            ui.on_task_confirm_edit(move |id, title, priority, due, tags, lane, contexts, waiting| {
-                let title = title.trim().to_string();
-                let mut dirty: Option<Task> = None;
-                {
-                    let mut ts = tasks2.borrow_mut();
-                    if let Some(t) = ts.iter_mut().find(|t| t.id.0.to_string() == id) {
-                        if !title.is_empty() {
-                            t.title = title;
-                        }
-                        t.priority = priority_from_int(priority);
-                        t.due = parse_due_ymd(&due);
-                        t.tags = parse_tag_list(&tags);
-                        apply_task_dialog_fields(t, lane.trim(), &contexts, &waiting);
-                        if t.source == "obsidian" {
-                            dirty = Some(t.clone());
+            ui.on_task_confirm_edit(
+                move |id, title, priority, due, tags, lane, contexts, waiting| {
+                    let title = title.trim().to_string();
+                    let mut dirty: Option<Task> = None;
+                    {
+                        let mut ts = tasks2.borrow_mut();
+                        if let Some(t) = ts.iter_mut().find(|t| t.id.0.to_string() == id) {
+                            if !title.is_empty() {
+                                t.title = title;
+                            }
+                            t.priority = priority_from_int(priority);
+                            t.due = parse_due_ymd(&due);
+                            t.tags = parse_tag_list(&tags);
+                            apply_task_dialog_fields(t, lane.trim(), &contexts, &waiting);
+                            if t.source == "obsidian" {
+                                dirty = Some(t.clone());
+                            }
                         }
                     }
-                }
-                if let Some(ref t) = dirty {
-                    write_back_obsidian_task(&cfg2.borrow(), t);
-                }
-                ui2.set_task_dialog_visible(false);
-                let filter_str = filter_rc.borrow().clone();
-                let filtered = filter_tasks_by_profile(&tasks2.borrow(), &filter_str);
-                refresh_comp(&ui2, &filtered, work_pid, &mgr_refresh_3, &cfg2.borrow());
-            });
+                    if let Some(ref t) = dirty {
+                        write_back_obsidian_task(&cfg2.borrow(), t);
+                    }
+                    ui2.set_task_dialog_visible(false);
+                    let filter_str = filter_rc.borrow().clone();
+                    let filtered = filter_tasks_by_profile(&tasks2.borrow(), &filter_str);
+                    refresh_comp(&ui2, &filtered, work_pid, &mgr_refresh_3, &cfg2.borrow());
+                },
+            );
         }
 
         // ── Dialog cancel ─────────────────────────────────────────────────────
@@ -3068,7 +3067,7 @@ impl App {
             let page = ui.clone_component();
             let ui2 = ui.clone_component();
             page.on_settings_lane_label_changed(move |id, label| {
-                mutate_settings_lane(&ui2, &id.to_string(), |row| {
+                mutate_settings_lane(&ui2, id.as_ref(), |row| {
                     row.label = label.as_str().into();
                 });
             });
@@ -3077,7 +3076,7 @@ impl App {
             let page = ui.clone_component();
             let ui2 = ui.clone_component();
             page.on_settings_lane_visible_toggled(move |id| {
-                mutate_settings_lane(&ui2, &id.to_string(), |row| {
+                mutate_settings_lane(&ui2, id.as_ref(), |row| {
                     row.visible = !row.visible;
                 });
             });
@@ -3086,7 +3085,7 @@ impl App {
             let page = ui.clone_component();
             let ui2 = ui.clone_component();
             page.on_settings_lane_wip_cycle(move |id| {
-                mutate_settings_lane(&ui2, &id.to_string(), |row| {
+                mutate_settings_lane(&ui2, id.as_ref(), |row| {
                     row.wip_limit = match row.wip_limit {
                         0 => 3,
                         3 => 5,
@@ -4223,7 +4222,13 @@ impl App {
                 let filter_str = filter_rc.borrow().clone();
                 let filtered_tasks = filter_tasks_by_profile(&tasks2.borrow(), &filter_str);
                 let visible_events = filter_events_by_profile(&cal2.borrow(), &filter_str);
-                refresh_comp(&ui2, &filtered_tasks, work_pid, &mgr_settings, &cfg2.borrow());
+                refresh_comp(
+                    &ui2,
+                    &filtered_tasks,
+                    work_pid,
+                    &mgr_settings,
+                    &cfg2.borrow(),
+                );
                 push_agenda_comp(&ui2, &visible_events, AgendaRange::Day, now);
 
                 ui2.set_show_settings(false);
@@ -6097,7 +6102,7 @@ fn start_recording(rec_dir: &Path, rec_id: u32) -> Option<RecordingHandle> {
     // cpal 0.17+: SampleRate is a plain u32 (was a newtype with `.0`).
     let sample_rate = supported_config.sample_rate();
     let channels = supported_config.channels();
-    let stream_config: cpal::StreamConfig = supported_config.clone().into();
+    let stream_config: cpal::StreamConfig = supported_config.into();
 
     let (tx, rx) = std::sync::mpsc::channel::<WriterCmd>();
     let frame_count = Arc::new(AtomicU64::new(0));
@@ -8437,11 +8442,7 @@ fn refresh_comp(
     let _ = profile_id;
 }
 
-fn push_task_lanes_comp(
-    comp: &ephemeris_ui::EphemerisPage,
-    tasks: &[Task],
-    config: &Config,
-) {
+fn push_task_lanes_comp(comp: &ephemeris_ui::EphemerisPage, tasks: &[Task], config: &Config) {
     let entries: Vec<ephemeris_ui::TaskLaneEntry> = config
         .task_lanes
         .iter()

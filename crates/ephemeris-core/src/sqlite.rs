@@ -146,6 +146,7 @@ fn apply_task_meta(task: &mut Task, meta_json: Option<&str>) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn row_to_task(
     id_s: String,
     pid_s: String,
@@ -1059,9 +1060,7 @@ impl SqliteStore {
     pub fn get_task_placement(&self, source: &str, task_id: TaskId) -> Result<Option<String>> {
         let mut stmt = self
             .conn
-            .prepare(
-                "SELECT lane_id FROM task_placement WHERE source = ?1 AND task_id = ?2",
-            )
+            .prepare("SELECT lane_id FROM task_placement WHERE source = ?1 AND task_id = ?2")
             .map_err(storage_err)?;
         let mut rows = stmt
             .query(params![source, task_id.0.to_string()])
@@ -1552,7 +1551,6 @@ mod tests {
 
     #[test]
     fn active_profile_persists_across_reopen() {
-        use std::io::Write;
         let path = {
             let mut p = std::env::temp_dir();
             p.push(format!("ephemeris_test_{}.db", uuid::Uuid::new_v4()));

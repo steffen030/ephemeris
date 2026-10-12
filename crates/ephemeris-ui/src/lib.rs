@@ -371,6 +371,11 @@ impl Platform for HeadlessPlatform {
 /// Call [`next_page`] / [`prev_page`] from the application layer.  The
 /// convenience method [`wire_swipe_navigation`] wires the `.slint` swipe
 /// callbacks to these methods automatically.
+///
+/// Task list row for [`EphemerisUi::set_full_task_list`]:
+/// `(id, title, priority_label, priority_int, due, overdue, done, lane)`.
+pub type FullTaskRow = (String, String, String, i32, String, bool, bool, String);
+
 pub struct EphemerisUi {
     window: Rc<MinimalSoftwareWindow>,
     component: EphemerisPage,
@@ -847,10 +852,7 @@ impl EphemerisUi {
     /// Push the full task list to the CRUD view.
     ///
     /// Each tuple is `(id, title, priority_label, priority_int, due, overdue, done, lane)`.
-    pub fn set_full_task_list(
-        &self,
-        tasks: &[(String, String, String, i32, String, bool, bool, String)],
-    ) {
+    pub fn set_full_task_list(&self, tasks: &[FullTaskRow]) {
         let entries: Vec<TaskViewEntry> = tasks
             .iter()
             .map(
@@ -877,6 +879,7 @@ impl EphemerisUi {
     }
 
     /// Open the task add/edit dialog.
+    #[allow(clippy::too_many_arguments)]
     pub fn open_task_dialog(
         &self,
         is_edit: bool,

@@ -101,14 +101,7 @@ pub fn export_raster_pages_to_pdf(
             None
         };
         let spans = opts.page_spans.get(i).map(|s| s.as_slice()).unwrap_or(&[]);
-        let ops = build_raster_page_ops(
-            &mut doc,
-            page,
-            page_w_mm,
-            page_h_mm,
-            full_text,
-            spans,
-        )?;
+        let ops = build_raster_page_ops(&mut doc, page, page_w_mm, page_h_mm, full_text, spans)?;
         pdf_pages.push(PdfPage::new(page_w_mm, page_h_mm, ops));
     }
 
@@ -144,13 +137,7 @@ pub fn export_stroke_pages_to_pdf(
         };
         let spans = opts.page_spans.get(i).map(|s| s.as_slice()).unwrap_or(&[]);
         let ops = build_stroke_page_ops(
-            strokes,
-            canvas_w,
-            canvas_h,
-            page_w_mm,
-            page_h_mm,
-            full_text,
-            spans,
+            strokes, canvas_w, canvas_h, page_w_mm, page_h_mm, full_text, spans,
         );
         pdf_pages.push(PdfPage::new(page_w_mm, page_h_mm, ops));
     }

@@ -5,9 +5,7 @@
 //! into the unified [`Task`] model.
 
 use crate::config::TaskLaneConfig;
-use crate::model::{
-    EnergyLevel, Task, TaskContext, TaskContextKind, TaskId, TaskPriority,
-};
+use crate::model::{EnergyLevel, Task, TaskContext, TaskContextKind, TaskId, TaskPriority};
 
 /// Tag prefix that encodes a horizon lane (`#lane/now`).
 pub const LANE_TAG_PREFIX: &str = "lane/";
@@ -62,8 +60,10 @@ pub fn parse_tags_and_mentions<'a>(
         if let Some(level) = tag.strip_prefix("energy/") {
             if let Some(e) = parse_energy(level) {
                 out.energy = Some(e);
-                out.contexts
-                    .push(TaskContext::new(TaskContextKind::Energy, level.to_ascii_lowercase()));
+                out.contexts.push(TaskContext::new(
+                    TaskContextKind::Energy,
+                    level.to_ascii_lowercase(),
+                ));
             }
             continue;
         }
@@ -224,11 +224,7 @@ impl EngageFilter {
 ///
 /// Excludes Later / Waiting / Someday so Engage stays a short “what can I do”
 /// list. Context / duration / energy chips further narrow the list.
-pub fn list_engage<'a>(
-    tasks: &'a [Task],
-    filter: &EngageFilter,
-    now_secs: u64,
-) -> Vec<&'a Task> {
+pub fn list_engage<'a>(tasks: &'a [Task], filter: &EngageFilter, now_secs: u64) -> Vec<&'a Task> {
     let candidates: Vec<Task> = tasks
         .iter()
         .filter(|t| !t.done && !matches!(t.status, crate::TaskStatus::Cancelled))
@@ -263,10 +259,7 @@ fn context_match(task: &Task, names: &[String]) -> bool {
         task.contexts
             .iter()
             .any(|c| c.name.eq_ignore_ascii_case(want))
-            || task
-                .tags
-                .iter()
-                .any(|t| t.eq_ignore_ascii_case(want))
+            || task.tags.iter().any(|t| t.eq_ignore_ascii_case(want))
     })
 }
 
@@ -441,9 +434,7 @@ pub fn apply_todoist_fields(
 
 /// Anchor timestamp for staleness: `reviewed_at` → `created_at` → 0.
 pub fn review_anchor(task: &Task) -> u64 {
-    task.reviewed_at
-        .or(task.created_at)
-        .unwrap_or(0)
+    task.reviewed_at.or(task.created_at).unwrap_or(0)
 }
 
 /// True when an open task in a review lane has not been confirmed within `staleness_days`.
@@ -558,7 +549,7 @@ mod tests {
         b.lane_id = Some("next".into());
         let mut c = Task::new("later task", pid);
         c.lane_id = Some("later".into());
-        let mut d = Task::new("unlaned obsidian", pid); // resolves to next
+        let d = Task::new("unlaned obsidian", pid); // resolves to next
         let tasks = vec![a, b, c, d];
         let f = EngageFilter::start_page("now");
         let got = list_engage(&tasks, &f, 1_750_000_000);
