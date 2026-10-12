@@ -21,13 +21,19 @@ pub mod sqlite;
 pub mod store;
 
 pub use action::{Action, ActionMap, ActionRouter, CanvasPoint, DefaultActionMap, RouterOutput};
-pub use config::Config;
+pub use config::{Config, TaskEngageConfig, TaskLaneConfig};
+pub use task_context::{
+    apply_parsed_tags, apply_todoist_fields, apply_todoist_labels, count_lane, is_stale,
+    list_engage, mark_reviewed, parse_tags_and_mentions, project_from_vault_path, resolve_lane,
+    review_queue, set_lane_tag, sync_tags_from_structured, todoist_priority,
+    todoist_section_to_lane, EngageFilter, TodoistTaskFields, LANE_TAG_PREFIX,
+};
 pub use error::{AppError, Result};
 pub use ink::{EraserConfig, EraserEngine, EraserUpdate, InkConfig, InkEngine, InkUpdate};
 pub use model::{
-    Account, AccountId, AccountKind, CalendarEvent, Color, EventId, Note, NoteId, Page, PageId,
-    PageTemplate, Point, Profile, ProfileId, Stroke, StrokeId, Task, TaskId, TaskPriority,
-    TaskStatus, Tool,
+    Account, AccountId, AccountKind, CalendarEvent, Color, EnergyLevel, EventId, Note, NoteId,
+    Page, PageId, PageTemplate, Point, Profile, ProfileId, Stroke, StrokeId, Task, TaskContext,
+    TaskContextKind, TaskId, TaskPriority, TaskStatus, Tool,
 };
 pub use refresh::{DamageSource, Present, RefreshConfig, RefreshScheduler};
 
@@ -56,6 +62,7 @@ pub mod profile_manager;
 pub mod stroke_htr;
 pub mod stroke_persistence;
 pub mod task_cache;
+pub mod task_context;
 pub mod task_provider;
 pub mod transcriber;
 pub mod vault_export;

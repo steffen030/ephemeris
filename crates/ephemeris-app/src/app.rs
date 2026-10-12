@@ -2,14 +2,15 @@ use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, Timelike, Utc};
 use ephemeris_core::ics::IcsReader;
 use ephemeris_core::ink::InkUpdate;
 use ephemeris_core::model::Tool;
-use ephemeris_core::prioritizer::rank_tasks;
 use ephemeris_core::profile_manager::ProfileManager;
 use ephemeris_core::{
-    export_raster_pages_to_pdf, filter_agenda, markdown_to_blocks, markdown_to_plain,
-    search_events, search_local_notes, search_tasks, strip_inline_markdown, sync_notes_to_vault,
-    to_agenda_entries, AgendaRange, CalendarEvent, CascadingTranscriber, Config, EventId,
-    LineImageHtrTranscriber, MarkdownTaskExtractor, PdfExportOptions, ProfileId,
-    RasterOcrTranscriber, RasterPage, SearchHit, StrokeHtrTranscriber, Task, TaskPriority,
+    count_lane, export_raster_pages_to_pdf, filter_agenda, is_stale, list_engage, mark_reviewed,
+    markdown_to_blocks, markdown_to_plain, resolve_lane, review_queue, search_events,
+    search_local_notes, search_tasks, set_lane_tag, strip_inline_markdown, sync_notes_to_vault,
+    sync_tags_from_structured, to_agenda_entries, AgendaRange, CalendarEvent,
+    CascadingTranscriber, Config, EngageFilter, EventId, LineImageHtrTranscriber,
+    MarkdownTaskExtractor, PdfExportOptions, ProfileId, RasterOcrTranscriber, RasterPage,
+    SearchHit, StrokeHtrTranscriber, Task, TaskContext, TaskContextKind, TaskId, TaskPriority,
     TaskProvider, VaultFtsIndex, VaultNoteExport,
 };
 #[cfg(target_os = "linux")]
@@ -482,7 +483,14 @@ impl App {
         let caldav_active = Arc::new(AtomicBool::new(false));
 
         // ── Initial UI state ──────────────────────────────────────────────────
-        refresh_ui(&ui, &tasks.borrow(), profile_id, &profile_mgr);
+        {
+            let cfg = config.borrow();
+            let page = ui.clone_component();
+            page.set_task_engage_lane(cfg.task_engage.engage_lane.as_str().into());
+            // Default Manage filter to All so Obsidian tasks without #lane/* still show.
+            page.set_task_lane_filter("".into());
+            refresh_ui(&ui, &tasks.borrow(), profile_id, &profile_mgr, &cfg);
+        }
         push_agenda_ui(&ui, &calendar_events.borrow(), AgendaRange::Day, now);
         ui.set_show_start_page(true);
         ui.set_nav_section(0);
@@ -818,6 +826,7 @@ impl App {
             let ui2 = ui.clone_component();
             let filter_rc = active_profile_filter.clone();
             let mgr2 = profile_mgr.clone();
+            let cfg2 = config.clone();
             let push_recs_switch = push_recordings.clone();
             let push_nbs_switch = push_notebooks.clone();
             ui.on_profile_changed(move |id| {
@@ -830,7 +839,7 @@ impl App {
                 }
                 let now = now_secs();
                 let filtered_tasks = filter_tasks_by_profile(&tasks2.borrow(), &filter_str);
-                refresh_comp(&ui2, &filtered_tasks, work_pid, &mgr2);
+                refresh_comp(&ui2, &filtered_tasks, work_pid, &mgr2, &cfg2.borrow());
                 let range = int_to_range(ui2.get_agenda_range());
                 let visible_events = filter_events_by_profile(&cal2.borrow(), &filter_str);
                 push_agenda_comp(&ui2, &visible_events, range, now);
@@ -2509,6 +2518,7 @@ impl App {
                 // Reset task-view filters when entering the page (active = hide closed).
                 ui2.set_task_filter("active".into());
                 ui2.set_task_sort("priority".into());
+                ui2.set_task_lane_filter("".into());
                 ui2.set_task_profile_filter("".into());
                 ui2.set_task_search_query("".into());
                 let filter_str = filter_rc.borrow().clone();
@@ -2545,6 +2555,7 @@ impl App {
                 }
                 ui2.set_task_filter("active".into());
                 ui2.set_task_sort("priority".into());
+                ui2.set_task_lane_filter("".into());
                 ui2.set_task_profile_filter("".into());
                 ui2.set_task_search_query("".into());
                 let filter_str = filter_rc.borrow().clone();
@@ -2601,7 +2612,7 @@ impl App {
                 }
                 let filter_str = filter_rc.borrow().clone();
                 let filtered = filter_tasks_by_profile(&tasks2.borrow(), &filter_str);
-                refresh_comp(&ui2, &filtered, work_pid, &mgr_refresh_1);
+                refresh_comp(&ui2, &filtered, work_pid, &mgr_refresh_1, &cfg2.borrow());
             });
         }
 
@@ -2617,7 +2628,27 @@ impl App {
                     ui2.set_task_dialog_title(t.title.as_str().into());
                     ui2.set_task_dialog_priority(priority_to_int(t.priority));
                     ui2.set_task_dialog_due(format_due_ymd(t.due).as_str().into());
-                    ui2.set_task_dialog_tags(t.tags.join(" ").as_str().into());
+                    let free_tags: Vec<_> = t
+                        .tags
+                        .iter()
+                        .filter(|tag| {
+                            let t = tag.trim_start_matches('#');
+                            !t.starts_with("lane/")
+                                && !t.starts_with("ctx/")
+                                && !t.starts_with("context/")
+                                && !t.starts_with("energy/")
+                        })
+                        .cloned()
+                        .collect();
+                    ui2.set_task_dialog_tags(free_tags.join(" ").as_str().into());
+                    ui2.set_task_dialog_lane(
+                        resolve_lane(t, "next").as_str().into(),
+                    );
+                    let ctxs: Vec<_> = t.contexts.iter().map(|c| c.name.clone()).collect();
+                    ui2.set_task_dialog_contexts(ctxs.join(" ").as_str().into());
+                    ui2.set_task_dialog_waiting(
+                        t.waiting_for.clone().unwrap_or_default().as_str().into(),
+                    );
                     ui2.set_task_dialog_visible(true);
                 }
             });
@@ -2631,7 +2662,7 @@ impl App {
             let cfg2 = config.clone();
             let filter_rc = active_profile_filter.clone();
             let counter = new_task_n.clone();
-            ui.on_task_confirm_add(move |title, priority, due, tags| {
+            ui.on_task_confirm_add(move |title, priority, due, tags, lane, contexts, waiting| {
                 let title = title.trim().to_string();
                 let title = if title.is_empty() {
                     let n = counter.get();
@@ -2655,12 +2686,22 @@ impl App {
                 } else {
                     work_pid
                 };
-                {
+                let capture_lane = {
+                    let cfg = cfg2.borrow();
+                    if lane.trim().is_empty() {
+                        cfg.task_engage.capture_lane.clone()
+                    } else {
+                        lane.trim().to_string()
+                    }
+                };
+                let created_id = {
                     let mut ts = tasks2.borrow_mut();
-                    let mut t = Task::new(title, task_profile);
+                    let mut t = Task::new(title.clone(), task_profile);
                     t.priority = priority_from_int(priority);
                     t.due = parse_due_ymd(&due);
                     t.tags = parse_tag_list(&tags);
+                    apply_task_dialog_fields(&mut t, &capture_lane, &contexts, &waiting);
+                    let id = t.id;
                     // When a vault is connected, create into Obsidian inbox.
                     if cfg2.borrow().vault_path.is_some() {
                         t.source = "obsidian".to_string();
@@ -2668,25 +2709,50 @@ impl App {
                             // Fall back to local in-memory task if write failed.
                             t.source = "local".to_string();
                             ts.push(t);
+                            Some(id)
+                        } else {
+                            // Obsidian rewrite may change id; prefer title match at end.
+                            ts.iter()
+                                .rev()
+                                .find(|x| x.title == title && x.source == "obsidian")
+                                .map(|x| x.id)
+                                .or(Some(id))
                         }
                     } else {
                         ts.push(t);
+                        Some(id)
                     }
-                }
+                };
                 ui2.set_task_dialog_visible(false);
                 let filtered = filter_tasks_by_profile(&tasks2.borrow(), &filter_str);
-                refresh_comp(&ui2, &filtered, work_pid, &mgr_refresh_2);
+                refresh_comp(&ui2, &filtered, work_pid, &mgr_refresh_2, &cfg2.borrow());
+                if cfg2.borrow().task_engage.clarify_after_capture {
+                    if let Some(id) = created_id {
+                        if let Some(t) = tasks2.borrow().iter().find(|t| t.id == id) {
+                            ui2.set_clarify_task_id(id.0.to_string().as_str().into());
+                            ui2.set_clarify_title(t.title.as_str().into());
+                            ui2.set_clarify_lane(resolve_lane(t, "next").as_str().into());
+                            let ctxs: Vec<_> =
+                                t.contexts.iter().map(|c| c.name.clone()).collect();
+                            ui2.set_clarify_contexts(ctxs.join(" ").as_str().into());
+                            ui2.set_clarify_waiting(
+                                t.waiting_for.clone().unwrap_or_default().as_str().into(),
+                            );
+                            ui2.set_clarify_visible(true);
+                        }
+                    }
+                }
             });
         }
 
-        // ── Edit confirmed — title / priority / due / tags (+ Obsidian write-back)
+        // ── Edit confirmed — title / priority / due / tags / lane / context
         {
             let mgr_refresh_3 = profile_mgr.clone();
             let tasks2 = tasks.clone();
             let ui2 = ui.clone_component();
             let cfg2 = config.clone();
             let filter_rc = active_profile_filter.clone();
-            ui.on_task_confirm_edit(move |id, title, priority, due, tags| {
+            ui.on_task_confirm_edit(move |id, title, priority, due, tags, lane, contexts, waiting| {
                 let title = title.trim().to_string();
                 let mut dirty: Option<Task> = None;
                 {
@@ -2698,6 +2764,7 @@ impl App {
                         t.priority = priority_from_int(priority);
                         t.due = parse_due_ymd(&due);
                         t.tags = parse_tag_list(&tags);
+                        apply_task_dialog_fields(t, lane.trim(), &contexts, &waiting);
                         if t.source == "obsidian" {
                             dirty = Some(t.clone());
                         }
@@ -2709,7 +2776,7 @@ impl App {
                 ui2.set_task_dialog_visible(false);
                 let filter_str = filter_rc.borrow().clone();
                 let filtered = filter_tasks_by_profile(&tasks2.borrow(), &filter_str);
-                refresh_comp(&ui2, &filtered, work_pid, &mgr_refresh_3);
+                refresh_comp(&ui2, &filtered, work_pid, &mgr_refresh_3, &cfg2.borrow());
             });
         }
 
@@ -2920,11 +2987,12 @@ impl App {
             let mgr_refresh_4 = profile_mgr.clone();
             let ui2 = ui.clone_component();
             let tasks2 = tasks.clone();
+            let cfg2 = config.clone();
             let filter_rc = active_profile_filter.clone();
             ui.on_task_profile_filter_changed(move |_pid| {
                 let filter_str = filter_rc.borrow().clone();
                 let filtered = filter_tasks_by_profile(&tasks2.borrow(), &filter_str);
-                refresh_comp(&ui2, &filtered, work_pid, &mgr_refresh_4);
+                refresh_comp(&ui2, &filtered, work_pid, &mgr_refresh_4, &cfg2.borrow());
             });
         }
         {
@@ -2934,6 +3002,32 @@ impl App {
             ui.on_task_search_changed(move |q| {
                 ui2.set_task_search_query(q.as_str().into());
                 push_full_task_list_comp(&ui2, &tasks2.borrow(), &mgr_tasklist_3);
+            });
+        }
+        {
+            let mgr_lane = profile_mgr.clone();
+            let ui2 = ui.clone_component();
+            let tasks2 = tasks.clone();
+            let cfg2 = config.clone();
+            let filter_rc = active_profile_filter.clone();
+            ui.on_task_lane_changed(move |lane| {
+                ui2.set_task_lane_filter(lane.as_str().into());
+                let filter_str = filter_rc.borrow().clone();
+                let filtered = filter_tasks_by_profile(&tasks2.borrow(), &filter_str);
+                refresh_comp(&ui2, &filtered, work_pid, &mgr_lane, &cfg2.borrow());
+            });
+        }
+        {
+            let mgr_ctx = profile_mgr.clone();
+            let ui2 = ui.clone_component();
+            let tasks2 = tasks.clone();
+            let cfg2 = config.clone();
+            let filter_rc = active_profile_filter.clone();
+            ui.on_task_context_filter_changed(move |ctx| {
+                ui2.set_task_context_filter(ctx.as_str().into());
+                let filter_str = filter_rc.borrow().clone();
+                let filtered = filter_tasks_by_profile(&tasks2.borrow(), &filter_str);
+                refresh_comp(&ui2, &filtered, work_pid, &mgr_ctx, &cfg2.borrow());
             });
         }
 
@@ -2950,9 +3044,10 @@ impl App {
                     let mut ts = tasks2.borrow_mut();
                     if let Some(t) = ts.iter_mut().find(|t| t.id.0.to_string() == id) {
                         t.priority = match t.priority {
+                            TaskPriority::Urgent => TaskPriority::High,
                             TaskPriority::High => TaskPriority::Medium,
                             TaskPriority::Medium => TaskPriority::Low,
-                            TaskPriority::Low => TaskPriority::High,
+                            TaskPriority::Low => TaskPriority::Urgent,
                         };
                         if t.source == "obsidian" {
                             dirty = Some(t.clone());
@@ -2964,7 +3059,259 @@ impl App {
                 }
                 let filter_str = filter_rc.borrow().clone();
                 let profile_filtered = filter_tasks_by_profile(&tasks2.borrow(), &filter_str);
-                refresh_comp(&ui2, &profile_filtered, work_pid, &mgr_prio);
+                refresh_comp(&ui2, &profile_filtered, work_pid, &mgr_prio, &cfg2.borrow());
+            });
+        }
+
+        // ── Settings › Tasks lane editors ─────────────────────────────────────
+        {
+            let page = ui.clone_component();
+            let ui2 = ui.clone_component();
+            page.on_settings_lane_label_changed(move |id, label| {
+                mutate_settings_lane(&ui2, &id.to_string(), |row| {
+                    row.label = label.as_str().into();
+                });
+            });
+        }
+        {
+            let page = ui.clone_component();
+            let ui2 = ui.clone_component();
+            page.on_settings_lane_visible_toggled(move |id| {
+                mutate_settings_lane(&ui2, &id.to_string(), |row| {
+                    row.visible = !row.visible;
+                });
+            });
+        }
+        {
+            let page = ui.clone_component();
+            let ui2 = ui.clone_component();
+            page.on_settings_lane_wip_cycle(move |id| {
+                mutate_settings_lane(&ui2, &id.to_string(), |row| {
+                    row.wip_limit = match row.wip_limit {
+                        0 => 3,
+                        3 => 5,
+                        5 => 8,
+                        _ => 0,
+                    };
+                });
+            });
+        }
+
+        // ── Clarify after capture ─────────────────────────────────────────────
+        {
+            let mgr_clarify = profile_mgr.clone();
+            let tasks2 = tasks.clone();
+            let page = ui.clone_component();
+            let ui2 = ui.clone_component();
+            let cfg2 = config.clone();
+            let filter_rc = active_profile_filter.clone();
+            page.on_clarify_save(move |id, lane, contexts, waiting| {
+                let id = id.to_string();
+                let lane = lane.to_string();
+                let contexts = contexts.to_string();
+                let waiting = waiting.to_string();
+                let mut dirty: Option<Task> = None;
+                {
+                    let mut ts = tasks2.borrow_mut();
+                    if let Some(t) = ts.iter_mut().find(|t| t.id.0.to_string() == id) {
+                        apply_task_dialog_fields(t, lane.trim(), &contexts, &waiting);
+                        if t.source == "obsidian" {
+                            dirty = Some(t.clone());
+                        }
+                    }
+                }
+                if let Some(ref t) = dirty {
+                    write_back_obsidian_task(&cfg2.borrow(), t);
+                }
+                ui2.set_clarify_visible(false);
+                let filter_str = filter_rc.borrow().clone();
+                let filtered = filter_tasks_by_profile(&tasks2.borrow(), &filter_str);
+                refresh_comp(&ui2, &filtered, work_pid, &mgr_clarify, &cfg2.borrow());
+            });
+        }
+        {
+            let page = ui.clone_component();
+            let ui2 = ui.clone_component();
+            page.on_clarify_skip(move || {
+                ui2.set_clarify_visible(false);
+            });
+        }
+
+        // ── Weekly review ─────────────────────────────────────────────────────
+        let review_queue_ids: Rc<RefCell<Vec<TaskId>>> = Rc::new(RefCell::new(Vec::new()));
+        let review_index: Rc<Cell<usize>> = Rc::new(Cell::new(0));
+        {
+            let mgr_rev = profile_mgr.clone();
+            let tasks2 = tasks.clone();
+            let page = ui.clone_component();
+            let ui2 = ui.clone_component();
+            let cfg2 = config.clone();
+            let filter_rc = active_profile_filter.clone();
+            let q_ids = review_queue_ids.clone();
+            let q_idx = review_index.clone();
+            page.on_review_start(move || {
+                let filter_str = filter_rc.borrow().clone();
+                let filtered = filter_tasks_by_profile(&tasks2.borrow(), &filter_str);
+                let cfg = cfg2.borrow();
+                let queue = review_queue(
+                    &filtered,
+                    &cfg.task_engage.review_lanes,
+                    now_secs(),
+                    cfg.task_engage.staleness_days,
+                );
+                let ids: Vec<TaskId> = queue.iter().map(|t| t.id).collect();
+                if ids.is_empty() {
+                    ui2.set_review_title("Nothing to review".into());
+                    ui2.set_review_meta("Waiting and Someday are clear.".into());
+                    ui2.set_review_progress("0/0".into());
+                    ui2.set_review_stale(false);
+                    ui2.set_review_task_id("".into());
+                    ui2.set_review_lane_label("".into());
+                    ui2.set_review_visible(true);
+                    *q_ids.borrow_mut() = Vec::new();
+                    q_idx.set(0);
+                    return;
+                }
+                *q_ids.borrow_mut() = ids;
+                q_idx.set(0);
+                show_review_card(&ui2, &filtered, &q_ids.borrow(), 0, &cfg);
+                let _ = mgr_rev;
+            });
+        }
+        {
+            let mgr_rev = profile_mgr.clone();
+            let tasks2 = tasks.clone();
+            let page = ui.clone_component();
+            let ui2 = ui.clone_component();
+            let cfg2 = config.clone();
+            let filter_rc = active_profile_filter.clone();
+            let q_ids = review_queue_ids.clone();
+            let q_idx = review_index.clone();
+            page.on_review_confirm(move || {
+                let id_str = ui2.get_review_task_id().to_string();
+                if !id_str.is_empty() {
+                    let mut dirty: Option<Task> = None;
+                    {
+                        let mut ts = tasks2.borrow_mut();
+                        if let Some(t) = ts.iter_mut().find(|t| t.id.0.to_string() == id_str) {
+                            mark_reviewed(t, now_secs());
+                            if t.source == "obsidian" {
+                                dirty = Some(t.clone());
+                            }
+                        }
+                    }
+                    if let Some(ref t) = dirty {
+                        write_back_obsidian_task(&cfg2.borrow(), t);
+                    }
+                }
+                let next = q_idx.get() + 1;
+                q_idx.set(next);
+                let filter_str = filter_rc.borrow().clone();
+                let filtered = filter_tasks_by_profile(&tasks2.borrow(), &filter_str);
+                if next >= q_ids.borrow().len() {
+                    ui2.set_review_visible(false);
+                    refresh_comp(&ui2, &filtered, work_pid, &mgr_rev, &cfg2.borrow());
+                } else {
+                    show_review_card(&ui2, &filtered, &q_ids.borrow(), next, &cfg2.borrow());
+                }
+            });
+        }
+        {
+            let tasks2 = tasks.clone();
+            let page = ui.clone_component();
+            let ui2 = ui.clone_component();
+            page.on_review_edit(move || {
+                let id = ui2.get_review_task_id().to_string();
+                ui2.set_review_visible(false);
+                if let Some(t) = tasks2.borrow().iter().find(|t| t.id.0.to_string() == id) {
+                    ui2.set_task_dialog_is_edit(true);
+                    ui2.set_task_dialog_id(t.id.0.to_string().as_str().into());
+                    ui2.set_task_dialog_title(t.title.as_str().into());
+                    ui2.set_task_dialog_priority(priority_to_int(t.priority));
+                    ui2.set_task_dialog_due(format_due_ymd(t.due).as_str().into());
+                    ui2.set_task_dialog_lane(resolve_lane(t, "next").as_str().into());
+                    let ctxs: Vec<_> = t.contexts.iter().map(|c| c.name.clone()).collect();
+                    ui2.set_task_dialog_contexts(ctxs.join(" ").as_str().into());
+                    ui2.set_task_dialog_waiting(
+                        t.waiting_for.clone().unwrap_or_default().as_str().into(),
+                    );
+                    ui2.set_task_dialog_tags("".into());
+                    ui2.set_task_dialog_visible(true);
+                }
+            });
+        }
+        {
+            let mgr_rev = profile_mgr.clone();
+            let tasks2 = tasks.clone();
+            let page = ui.clone_component();
+            let ui2 = ui.clone_component();
+            let cfg2 = config.clone();
+            let filter_rc = active_profile_filter.clone();
+            let q_ids = review_queue_ids.clone();
+            let q_idx = review_index.clone();
+            page.on_review_done(move || {
+                let id_str = ui2.get_review_task_id().to_string();
+                if !id_str.is_empty() {
+                    let mut dirty: Option<Task> = None;
+                    {
+                        let mut ts = tasks2.borrow_mut();
+                        if let Some(t) = ts.iter_mut().find(|t| t.id.0.to_string() == id_str) {
+                            t.set_done(true);
+                            if t.source == "obsidian" {
+                                dirty = Some(t.clone());
+                            }
+                        }
+                    }
+                    if let Some(ref t) = dirty {
+                        write_back_obsidian_task(&cfg2.borrow(), t);
+                    }
+                }
+                let next = q_idx.get() + 1;
+                q_idx.set(next);
+                let filter_str = filter_rc.borrow().clone();
+                let filtered = filter_tasks_by_profile(&tasks2.borrow(), &filter_str);
+                if next >= q_ids.borrow().len() {
+                    ui2.set_review_visible(false);
+                    refresh_comp(&ui2, &filtered, work_pid, &mgr_rev, &cfg2.borrow());
+                } else {
+                    show_review_card(&ui2, &filtered, &q_ids.borrow(), next, &cfg2.borrow());
+                }
+            });
+        }
+        {
+            let mgr_rev = profile_mgr.clone();
+            let tasks2 = tasks.clone();
+            let page = ui.clone_component();
+            let ui2 = ui.clone_component();
+            let cfg2 = config.clone();
+            let filter_rc = active_profile_filter.clone();
+            let q_ids = review_queue_ids.clone();
+            let q_idx = review_index.clone();
+            page.on_review_skip(move || {
+                let next = q_idx.get() + 1;
+                q_idx.set(next);
+                let filter_str = filter_rc.borrow().clone();
+                let filtered = filter_tasks_by_profile(&tasks2.borrow(), &filter_str);
+                if next >= q_ids.borrow().len() {
+                    ui2.set_review_visible(false);
+                    refresh_comp(&ui2, &filtered, work_pid, &mgr_rev, &cfg2.borrow());
+                } else {
+                    show_review_card(&ui2, &filtered, &q_ids.borrow(), next, &cfg2.borrow());
+                }
+            });
+        }
+        {
+            let mgr_rev = profile_mgr.clone();
+            let tasks2 = tasks.clone();
+            let page = ui.clone_component();
+            let ui2 = ui.clone_component();
+            let cfg2 = config.clone();
+            let filter_rc = active_profile_filter.clone();
+            page.on_review_close(move || {
+                ui2.set_review_visible(false);
+                let filter_str = filter_rc.borrow().clone();
+                let filtered = filter_tasks_by_profile(&tasks2.borrow(), &filter_str);
+                refresh_comp(&ui2, &filtered, work_pid, &mgr_rev, &cfg2.borrow());
             });
         }
 
@@ -3209,6 +3556,14 @@ impl App {
                 ui2.set_whisper_model_installed(find_whisper_model().is_some());
                 ui2.set_htr_model_installed(find_htr_model_installed(&cfg));
                 ui2.set_line_htr_model_installed(find_line_htr_model_installed(&cfg));
+                push_settings_task_lanes(&ui2, &cfg);
+                ui2.set_settings_staleness_days(cfg.task_engage.staleness_days as i32);
+                ui2.set_settings_context_presets(
+                    cfg.task_engage.context_presets.join(" ").as_str().into(),
+                );
+                ui2.set_settings_engage_lane(cfg.task_engage.engage_lane.as_str().into());
+                ui2.set_settings_capture_lane(cfg.task_engage.capture_lane.as_str().into());
+                ui2.set_settings_clarify_after_capture(cfg.task_engage.clarify_after_capture);
                 drop(cfg);
                 ui2.set_show_start_page(false);
                 ui2.set_show_task_view(false);
@@ -3808,6 +4163,9 @@ impl App {
                 new_cfg.ics_urls = ics_urls;
                 new_cfg.ics_paths = ics_paths;
 
+                // Tasks / GTD settings
+                apply_settings_task_fields_from_ui(&ui2, &mut new_cfg);
+
                 if let Err(e) = new_cfg.save() {
                     tracing::warn!("Config save failed: {e}");
                 }
@@ -3865,7 +4223,7 @@ impl App {
                 let filter_str = filter_rc.borrow().clone();
                 let filtered_tasks = filter_tasks_by_profile(&tasks2.borrow(), &filter_str);
                 let visible_events = filter_events_by_profile(&cal2.borrow(), &filter_str);
-                refresh_comp(&ui2, &filtered_tasks, work_pid, &mgr_settings);
+                refresh_comp(&ui2, &filtered_tasks, work_pid, &mgr_settings, &cfg2.borrow());
                 push_agenda_comp(&ui2, &visible_events, AgendaRange::Day, now);
 
                 ui2.set_show_settings(false);
@@ -5736,7 +6094,8 @@ fn start_recording(rec_dir: &Path, rec_id: u32) -> Option<RecordingHandle> {
     let host = cpal::default_host();
     let device = host.default_input_device()?;
     let supported_config = device.default_input_config().ok()?;
-    let sample_rate = supported_config.sample_rate().0;
+    // cpal 0.17+: SampleRate is a plain u32 (was a newtype with `.0`).
+    let sample_rate = supported_config.sample_rate();
     let channels = supported_config.channels();
     let stream_config: cpal::StreamConfig = supported_config.clone().into();
 
@@ -5786,11 +6145,12 @@ fn start_recording(rec_dir: &Path, rec_id: u32) -> Option<RecordingHandle> {
     let tx2 = tx.clone();
     let ch_usize = channels as usize;
 
-    let err_fn = |e: cpal::StreamError| tracing::warn!("cpal input error: {e}");
+    // cpal 0.18: StreamError → Error; StreamConfig passed by value (Copy).
+    let err_fn = |e: cpal::Error| tracing::warn!("cpal input error: {e}");
 
     let stream = match supported_config.sample_format() {
         cpal::SampleFormat::F32 => device.build_input_stream(
-            &stream_config,
+            stream_config,
             move |data: &[f32], _| {
                 if pa2.load(Ordering::Relaxed) {
                     return;
@@ -5806,7 +6166,7 @@ fn start_recording(rec_dir: &Path, rec_id: u32) -> Option<RecordingHandle> {
             let pa3 = pa2;
             let tx3 = tx2;
             device.build_input_stream(
-                &stream_config,
+                stream_config,
                 move |data: &[i16], _| {
                     if pa3.load(Ordering::Relaxed) {
                         return;
@@ -5823,7 +6183,7 @@ fn start_recording(rec_dir: &Path, rec_id: u32) -> Option<RecordingHandle> {
         _ => {
             tracing::warn!("Unsupported cpal sample format; attempting F32 fallback");
             device.build_input_stream(
-                &stream_config,
+                stream_config,
                 move |data: &[f32], _| {
                     if pa2.load(Ordering::Relaxed) {
                         return;
@@ -7983,14 +8343,15 @@ fn push_agenda_comp(
 /// Max ranked open tasks shown on the home page (keeps agenda visible).
 const HOME_TASK_LIMIT: usize = 5;
 
-/// Refresh both the start-page ranked list and the full-task-list in the UI.
+/// Refresh both the start-page Engage list and the full-task-list in the UI.
 fn refresh_ui(
     ui: &EphemerisUi,
     tasks: &[Task],
     profile_id: ProfileId,
     mgr: &ephemeris_core::profile_manager::ProfileManager,
+    config: &Config,
 ) {
-    refresh_comp(&ui.clone_component(), tasks, profile_id, mgr);
+    refresh_comp(&ui.clone_component(), tasks, profile_id, mgr, config);
 }
 
 /// Same as `refresh_ui` but operates on a cloned `EphemerisPage` component.
@@ -7999,10 +8360,11 @@ fn refresh_comp(
     tasks: &[Task],
     profile_id: ProfileId,
     mgr: &ephemeris_core::profile_manager::ProfileManager,
+    config: &Config,
 ) {
     let now = now_secs();
 
-    // In All-profiles mode, home Tasks Ahead chips filter without switching profile.
+    // In All-profiles mode, home Engage chips filter without switching profile.
     let chip = if comp.get_active_profile_id().is_empty() {
         comp.get_task_profile_filter().to_string()
     } else {
@@ -8016,8 +8378,38 @@ fn refresh_comp(
         &chip_scoped
     };
 
+    let engage_lane = {
+        let from_ui = comp.get_task_engage_lane().to_string();
+        if from_ui.is_empty() {
+            config.task_engage.engage_lane.clone()
+        } else {
+            from_ui
+        }
+    };
+    let ctx_filter = comp.get_task_context_filter().to_string();
+    // Now + Next: unlaned Obsidian tasks resolve to Next and must still appear.
+    let mut filter = EngageFilter::start_page(engage_lane.clone());
+    if !ctx_filter.is_empty() {
+        filter.context_names.push(ctx_filter);
+    }
+    let ranked = list_engage(home_tasks, &filter, now);
+
+    let now_count = count_lane(home_tasks, &engage_lane);
+    let wip = config
+        .task_lanes
+        .iter()
+        .find(|l| l.id == engage_lane)
+        .and_then(|l| l.wip_limit);
+    let wip_msg = match wip {
+        Some(limit) if now_count as u32 > limit => {
+            format!("Now WIP soft limit: {now_count}/{limit}")
+        }
+        _ => String::new(),
+    };
+    comp.set_task_wip_warning(wip_msg.as_str().into());
+    comp.set_task_engage_lane(engage_lane.as_str().into());
+
     let show_badges = comp.get_active_profile_id().is_empty();
-    let ranked = rank_tasks(home_tasks, now);
     let task_entries: Vec<ephemeris_ui::TaskEntry> = ranked
         .iter()
         .take(HOME_TASK_LIMIT)
@@ -8040,8 +8432,169 @@ fn refresh_comp(
         })
         .collect();
     comp.set_task_list(Rc::new(slint::VecModel::from(task_entries)).into());
+    push_task_lanes_comp(comp, tasks, config);
     push_full_task_list_comp(comp, tasks, mgr);
     let _ = profile_id;
+}
+
+fn push_task_lanes_comp(
+    comp: &ephemeris_ui::EphemerisPage,
+    tasks: &[Task],
+    config: &Config,
+) {
+    let entries: Vec<ephemeris_ui::TaskLaneEntry> = config
+        .task_lanes
+        .iter()
+        .filter(|l| l.visible)
+        .map(|l| ephemeris_ui::TaskLaneEntry {
+            id: l.id.as_str().into(),
+            label: l.label.as_str().into(),
+            count: count_lane(tasks, &l.id) as i32,
+        })
+        .collect();
+    comp.set_task_lane_list(Rc::new(slint::VecModel::from(entries)).into());
+}
+
+fn apply_task_dialog_fields(task: &mut Task, lane: &str, contexts: &str, waiting: &str) {
+    let lane = if lane.is_empty() { "next" } else { lane };
+    set_lane_tag(task, lane);
+    task.contexts = parse_tag_list(contexts)
+        .into_iter()
+        .map(|name| {
+            let lower = name.to_ascii_lowercase();
+            let kind = match lower.as_str() {
+                "phone" | "computer" | "email" | "laptop" | "online" => TaskContextKind::Tool,
+                "home" | "office" | "errand" | "anywhere" | "town" | "shop" => {
+                    TaskContextKind::Place
+                }
+                _ => TaskContextKind::Custom,
+            };
+            TaskContext::new(kind, lower)
+        })
+        .collect();
+    let w = waiting.trim();
+    task.waiting_for = if w.is_empty() {
+        None
+    } else {
+        Some(w.to_string())
+    };
+    if task.waiting_for.is_some() && lane == "next" {
+        // Keep explicit waiting lane if user picked Waiting; else infer.
+    }
+    sync_tags_from_structured(task);
+}
+
+fn push_settings_task_lanes(comp: &ephemeris_ui::EphemerisPage, cfg: &Config) {
+    let entries: Vec<ephemeris_ui::SettingsLaneEntry> = cfg
+        .task_lanes
+        .iter()
+        .map(|l| ephemeris_ui::SettingsLaneEntry {
+            id: l.id.as_str().into(),
+            label: l.label.as_str().into(),
+            visible: l.visible,
+            wip_limit: l.wip_limit.unwrap_or(0) as i32,
+        })
+        .collect();
+    comp.set_settings_task_lanes(Rc::new(slint::VecModel::from(entries)).into());
+}
+
+fn apply_settings_task_fields_from_ui(comp: &ephemeris_ui::EphemerisPage, cfg: &mut Config) {
+    let model = comp.get_settings_task_lanes();
+    for i in 0..model.row_count() {
+        if let Some(row) = model.row_data(i) {
+            let id = row.id.to_string();
+            if let Some(lane) = cfg.task_lanes.iter_mut().find(|l| l.id == id) {
+                let label = row.label.to_string();
+                if !label.trim().is_empty() {
+                    lane.label = label;
+                }
+                lane.visible = row.visible;
+                lane.wip_limit = if row.wip_limit <= 0 {
+                    None
+                } else {
+                    Some(row.wip_limit as u32)
+                };
+            }
+        }
+    }
+    let days = comp.get_settings_staleness_days();
+    if days > 0 {
+        cfg.task_engage.staleness_days = days as u32;
+    }
+    let presets = comp.get_settings_context_presets().to_string();
+    cfg.task_engage.context_presets = parse_tag_list(&presets);
+    let engage = comp.get_settings_engage_lane().to_string();
+    if !engage.is_empty() {
+        cfg.task_engage.engage_lane = engage;
+    }
+    let capture = comp.get_settings_capture_lane().to_string();
+    if !capture.is_empty() {
+        cfg.task_engage.capture_lane = capture;
+    }
+    cfg.task_engage.clarify_after_capture = comp.get_settings_clarify_after_capture();
+}
+
+fn mutate_settings_lane(
+    comp: &ephemeris_ui::EphemerisPage,
+    id: &str,
+    mut f: impl FnMut(&mut ephemeris_ui::SettingsLaneEntry),
+) {
+    let model = comp.get_settings_task_lanes();
+    let mut rows: Vec<_> = (0..model.row_count())
+        .filter_map(|i| model.row_data(i))
+        .collect();
+    if let Some(row) = rows.iter_mut().find(|r| r.id.as_str() == id) {
+        f(row);
+    }
+    comp.set_settings_task_lanes(Rc::new(slint::VecModel::from(rows)).into());
+}
+
+fn show_review_card(
+    comp: &ephemeris_ui::EphemerisPage,
+    tasks: &[Task],
+    queue: &[TaskId],
+    index: usize,
+    cfg: &Config,
+) {
+    if queue.is_empty() || index >= queue.len() {
+        comp.set_review_visible(false);
+        return;
+    }
+    let id = queue[index];
+    let Some(t) = tasks.iter().find(|t| t.id == id) else {
+        comp.set_review_visible(false);
+        return;
+    };
+    let now = now_secs();
+    let lane = resolve_lane(t, "next");
+    let lane_label = cfg
+        .task_lanes
+        .iter()
+        .find(|l| l.id == lane)
+        .map(|l| l.label.clone())
+        .unwrap_or(lane.clone());
+    let stale = is_stale(t, now, cfg.task_engage.staleness_days);
+    let mut meta = Vec::new();
+    if let Some(ref w) = t.waiting_for {
+        meta.push(format!("Waiting: {w}"));
+    }
+    if !t.contexts.is_empty() {
+        meta.push(format!(
+            "Ctx: {}",
+            t.contexts
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    comp.set_review_task_id(id.0.to_string().as_str().into());
+    comp.set_review_title(strip_inline_markdown(&t.title).as_str().into());
+    comp.set_review_lane_label(lane_label.as_str().into());
+    comp.set_review_meta(meta.join(" · ").as_str().into());
+    comp.set_review_stale(stale);
+    comp.set_review_progress(format!("{}/{}", index + 1, queue.len()).as_str().into());
+    comp.set_review_visible(true);
 }
 
 /// Push the task-view list using current UI filter/sort/profile-chip/search.
@@ -8059,6 +8612,7 @@ fn push_full_task_list_comp(
     let search = comp.get_task_search_query().to_string();
     let filter = comp.get_task_filter().to_string();
     let sort = comp.get_task_sort().to_string();
+    let lane_filter = comp.get_task_lane_filter().to_string();
     let now = now_secs();
 
     let mut scoped = filter_tasks_by_profile(all_tasks, &global_profile);
@@ -8066,6 +8620,9 @@ fn push_full_task_list_comp(
         scoped = filter_tasks_by_profile(&scoped, &chip);
     }
     scoped = filter_tasks_by_query(&scoped, &search);
+    if !lane_filter.is_empty() {
+        scoped.retain(|t| resolve_lane(t, "next") == lane_filter);
+    }
 
     let show_badges = global_profile.is_empty();
     let entries = build_full_task_list(&scoped, now, &filter, &sort);
@@ -8073,7 +8630,7 @@ fn push_full_task_list_comp(
         Rc::new(slint::VecModel::from(
             entries
                 .iter()
-                .map(|(id, title, pl, pi, dl, ov, done, profile_id)| {
+                .map(|(id, title, pl, pi, dl, ov, done, profile_id, lane)| {
                     let (show_profile, profile_icon_char, has_custom, custom_icon) =
                         profile_badge_for(profile_id, show_badges, mgr);
                     ephemeris_ui::TaskViewEntry {
@@ -8084,6 +8641,7 @@ fn push_full_task_list_comp(
                         due_label: dl.as_str().into(),
                         overdue: *ov,
                         done: *done,
+                        lane_label: lane.as_str().into(),
                         show_profile,
                         profile_icon_char: profile_icon_char.as_str().into(),
                         has_custom_profile_icon: has_custom,
@@ -8110,6 +8668,13 @@ fn filter_tasks_by_query(tasks: &[Task], query: &str) -> Vec<Task> {
                 return true;
             }
             t.tags.iter().any(|tag| tag.to_lowercase().contains(&q))
+                || t.contexts
+                    .iter()
+                    .any(|c| c.name.to_lowercase().contains(&q))
+                || t.waiting_for
+                    .as_deref()
+                    .map(|w| w.to_lowercase().contains(&q))
+                    .unwrap_or(false)
                 || t.project
                     .as_deref()
                     .map(|p| p.to_lowercase().contains(&q))
@@ -8126,8 +8691,18 @@ fn filter_tasks_by_query(tasks: &[Task], query: &str) -> Vec<Task> {
 /// Completed tasks older than this are hidden from the "all" filter.
 const CLOSED_TASK_RETENTION_SECS: u64 = 14 * 86_400;
 
-/// Slint task-list row: id, title, priority label, priority int, due, overdue, done, profile.
-type TaskListRow = (String, String, String, i32, String, bool, bool, String);
+/// Slint task-list row: id, title, priority label, priority int, due, overdue, done, profile, lane.
+type TaskListRow = (
+    String,
+    String,
+    String,
+    i32,
+    String,
+    bool,
+    bool,
+    String,
+    String,
+);
 
 /// True when `ts` falls on the same local calendar day as `now`.
 fn same_local_day(ts: u64, now: u64) -> bool {
@@ -8178,6 +8753,7 @@ fn build_full_task_list(tasks: &[Task], now: u64, filter: &str, sort: &str) -> V
                 ov,
                 t.done,
                 t.profile_id.0.to_string(),
+                resolve_lane(t, "next"),
             )
         })
         .collect();
@@ -8208,25 +8784,28 @@ fn build_full_task_list(tasks: &[Task], now: u64, filter: &str, sort: &str) -> V
 
 fn priority_label(p: TaskPriority) -> String {
     match p {
-        TaskPriority::High => "P0".to_string(),
-        TaskPriority::Medium => "P1".to_string(),
-        TaskPriority::Low => "P2".to_string(),
+        TaskPriority::Urgent => "U".to_string(),
+        TaskPriority::High => "H".to_string(),
+        TaskPriority::Medium => "M".to_string(),
+        TaskPriority::Low => "L".to_string(),
     }
 }
 
 fn priority_from_int(p: i32) -> TaskPriority {
     match p {
-        0 => TaskPriority::High,
-        2 => TaskPriority::Low,
+        0 => TaskPriority::Urgent,
+        1 => TaskPriority::High,
+        3 => TaskPriority::Low,
         _ => TaskPriority::Medium,
     }
 }
 
 fn priority_to_int(p: TaskPriority) -> i32 {
     match p {
-        TaskPriority::High => 0,
-        TaskPriority::Medium => 1,
-        TaskPriority::Low => 2,
+        TaskPriority::Urgent => 0,
+        TaskPriority::High => 1,
+        TaskPriority::Medium => 2,
+        TaskPriority::Low => 3,
     }
 }
 
@@ -8252,24 +8831,35 @@ fn sample_tasks_split(work: ProfileId, personal: ProfileId) -> Vec<Task> {
     let mut t = Task::new("Review quarterly OKRs", work);
     t.priority = TaskPriority::High;
     t.due = Some(now + DAY);
+    set_lane_tag(&mut t, "now");
+    t.contexts
+        .push(TaskContext::new(TaskContextKind::Tool, "computer"));
     tasks.push(t);
 
     let mut t = Task::new("Fix login redirect bug", work);
-    t.priority = TaskPriority::High;
+    t.priority = TaskPriority::Urgent;
     t.due = Some(now.saturating_sub(DAY));
+    set_lane_tag(&mut t, "now");
+    t.contexts
+        .push(TaskContext::new(TaskContextKind::Tool, "computer"));
     tasks.push(t);
 
     let mut t = Task::new("Write architecture doc", work);
     t.priority = TaskPriority::Medium;
     t.due = Some(now + 3 * DAY);
+    set_lane_tag(&mut t, "next");
     tasks.push(t);
 
     let mut t = Task::new("Book dentist appointment", personal);
     t.priority = TaskPriority::Medium;
+    set_lane_tag(&mut t, "now");
+    t.contexts
+        .push(TaskContext::new(TaskContextKind::Tool, "phone"));
     tasks.push(t);
 
     let mut t = Task::new("Plan weekend trip", personal);
     t.priority = TaskPriority::Low;
+    set_lane_tag(&mut t, "later");
     t.due = Some(now + 7 * DAY);
     tasks.push(t);
 

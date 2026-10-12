@@ -152,15 +152,31 @@ export struct TaskViewEntry {
     id: string,
     title: string,
     priority-label: string,
-    priority-int: int,    // 0=high 1=medium 2=low
+    priority-int: int,    // 0=urgent 1=high 2=medium 3=low
     due-label: string,
     overdue: bool,
     done: bool,
+    lane-label: string,
     /// Show owning-profile badge (All aggregator view).
     show-profile: bool,
     profile-icon-char: string,
     has-custom-profile-icon: bool,
     custom-profile-icon: image,
+}
+
+/// Horizon lane chip for the Tasks Manage view.
+export struct TaskLaneEntry {
+    id: string,
+    label: string,
+    count: int,
+}
+
+/// Editable lane row in Settings › Tasks.
+export struct SettingsLaneEntry {
+    id: string,
+    label: string,
+    visible: bool,
+    wip-limit: int, // 0 = none
 }
 
 /// A filesystem entry for the settings file browser.
@@ -380,15 +396,25 @@ export component EphemerisPage inherits Window {
 
     // ── Task CRUD view ───────────────────────────────────────────────────
     in property <[TaskViewEntry]> full-task-list: [];
+    in property <[TaskLaneEntry]> task-lane-list: [];
     in-out property <bool> task-dialog-visible: false;
     in-out property <bool> task-dialog-is-edit: false;
     in-out property <string> task-dialog-id: "";
     in-out property <string> task-dialog-title: "";
-    in-out property <int> task-dialog-priority: 1;
+    in-out property <int> task-dialog-priority: 2;  // medium default (0=urgent…3=low)
     in-out property <string> task-dialog-due: "";   // YYYY-MM-DD or empty
-    in-out property <string> task-dialog-tags: "";  // space-separated tags
+    in-out property <string> task-dialog-tags: "";  // space-separated freeform tags
+    in-out property <string> task-dialog-lane: "next";
+    in-out property <string> task-dialog-contexts: ""; // space-separated context names
+    in-out property <string> task-dialog-waiting: "";
     in-out property <string> task-filter: "active";    // all | active | done
     in-out property <string> task-sort: "priority"; // priority | due | title | added
+    // Horizon lane filter; empty = all lanes (default so vault tasks without #lane/* show).
+    in-out property <string> task-lane-filter: "";
+    // Engage context filter on Start (empty = any).
+    in-out property <string> task-context-filter: "";
+    in property <string> task-engage-lane: "now";
+    in property <string> task-wip-warning: "";
     // Local filter while aggregator ("All") is active — does not switch global profile.
     in-out property <string> task-profile-filter: "";
     in-out property <string> task-search-query: "";
@@ -399,13 +425,15 @@ export component EphemerisPage inherits Window {
     callback task-back-tapped();
     callback task-complete-toggled(string);
     callback task-edit-requested(string);
-    // title, priority, due (YYYY-MM-DD), tags (space-separated)
-    callback task-confirm-add(string, int, string, string);
-    // id, title, priority, due, tags
-    callback task-confirm-edit(string, string, int, string, string);
+    // title, priority, due, tags, lane, contexts, waiting
+    callback task-confirm-add(string, int, string, string, string, string, string);
+    // id, title, priority, due, tags, lane, contexts, waiting
+    callback task-confirm-edit(string, string, int, string, string, string, string, string);
     callback task-dialog-cancel();
     callback task-filter-changed(string);
     callback task-sort-changed(string);
+    callback task-lane-changed(string);
+    callback task-context-filter-changed(string);
     callback task-priority-cycle(string);
     callback task-profile-filter-changed(string);
     callback task-search-changed(string);
@@ -690,8 +718,44 @@ export component EphemerisPage inherits Window {
     in property <string> active-profile-name: "";
     callback profile-changed(string);
 
-    // ── Settings section navigation (0=general 1=profiles 2=connections) ────
+    // ── Settings section navigation (0=general 1=profiles 2=connect 3=tasks)
     in-out property <int> settings-section: 0;
+
+    // ── Settings › Tasks ─────────────────────────────────────────────────
+    in-out property <[SettingsLaneEntry]> settings-task-lanes: [];
+    in-out property <int> settings-staleness-days: 14;
+    in-out property <string> settings-context-presets: "phone computer home errand office";
+    in-out property <string> settings-engage-lane: "now";
+    in-out property <string> settings-capture-lane: "next";
+    in-out property <bool> settings-clarify-after-capture: true;
+    callback settings-lane-label-changed(string, string); // id, label
+    callback settings-lane-visible-toggled(string);
+    callback settings-lane-wip-cycle(string);
+
+    // ── Weekly review overlay ────────────────────────────────────────────
+    in-out property <bool> review-visible: false;
+    in-out property <string> review-task-id: "";
+    in-out property <string> review-title: "";
+    in-out property <string> review-lane-label: "";
+    in-out property <string> review-meta: "";
+    in-out property <bool> review-stale: false;
+    in-out property <string> review-progress: "";
+    callback review-start();
+    callback review-confirm();
+    callback review-edit();
+    callback review-done();
+    callback review-skip();
+    callback review-close();
+
+    // ── Clarify-after-capture sheet ──────────────────────────────────────
+    in-out property <bool> clarify-visible: false;
+    in-out property <string> clarify-task-id: "";
+    in-out property <string> clarify-title: "";
+    in-out property <string> clarify-lane: "next";
+    in-out property <string> clarify-contexts: "";
+    in-out property <string> clarify-waiting: "";
+    callback clarify-save(string, string, string, string); // id, lane, contexts, waiting
+    callback clarify-skip();
 
     // ── Profile management (settings › Profiles) ──────────────────────────
     in-out property <bool> profile-edit-dialog-visible: false;
@@ -846,12 +910,13 @@ export component EphemerisPage inherits Window {
                         padding-bottom: 4px;
 
                         Text {
-                            text: "Tasks Ahead";
+                            text: "Engage";
                             font-size: 18px;
                             font-weight: 700;
                             color: EinkTheme.btn-fg;
                             vertical-alignment: center;
                         }
+                        // Subtitle lives in WIP / empty-state copy; chips filter by context.
 
                         Rectangle {
                             width: 96px; height: 36px;
@@ -867,6 +932,52 @@ export component EphemerisPage inherits Window {
                                 vertical-alignment: center;
                             }
                             TouchArea { clicked => { root.start-page-tasks-tapped(); } }
+                        }
+                    }
+                }
+
+                if root.task-wip-warning != "": Rectangle {
+                    height: 28px;
+                    background: transparent;
+                    Text {
+                        text: root.task-wip-warning;
+                        font-size: 12px;
+                        color: EinkTheme.text-secondary;
+                        vertical-alignment: center;
+                    }
+                }
+
+                // Context filter chips for Engage (GTD: what can I do now?)
+                Rectangle {
+                    height: 36px;
+                    background: transparent;
+                    HorizontalLayout {
+                        spacing: 6px; alignment: start;
+                        Rectangle {
+                            property <bool> sel: root.task-context-filter == "";
+                            width: 44px; height: 28px;
+                            background: sel ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+                            border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                            Text { text: "Any"; font-size: 11px;
+                                   color: sel ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                                   horizontal-alignment: center; vertical-alignment: center; }
+                            TouchArea { clicked => {
+                                root.task-context-filter = "";
+                                root.task-context-filter-changed("");
+                            } }
+                        }
+                        for c in ["phone", "computer", "home", "errand", "office"]: Rectangle {
+                            property <bool> sel: root.task-context-filter == c;
+                            height: 28px; width: 72px;
+                            background: sel ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+                            border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                            Text { text: c; font-size: 11px;
+                                   color: sel ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                                   horizontal-alignment: center; vertical-alignment: center; }
+                            TouchArea { clicked => {
+                                root.task-context-filter = c;
+                                root.task-context-filter-changed(c);
+                            } }
                         }
                     }
                 }
@@ -1005,7 +1116,7 @@ export component EphemerisPage inherits Window {
                     height: 64px;
                     background: transparent;
                     Text {
-                        text: "All clear — no tasks ahead";
+                        text: "All clear — nothing actionable in Now/Next";
                         font-size: 14px;
                         color: EinkTheme.text-secondary;
                         horizontal-alignment: center;
@@ -1190,6 +1301,16 @@ export component EphemerisPage inherits Window {
                     }
 
                     Rectangle {
+                        width: 72px; height: 32px;
+                        background: EinkTheme.btn-bg;
+                        border-radius: 4px; border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        Text { text: "Review"; font-size: 12px; color: EinkTheme.btn-fg;
+                               horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea { clicked => { root.review-start(); } }
+                    }
+
+                    Rectangle {
                         width: 60px; height: 32px;
                         background: EinkTheme.btn-active-bg;
                         border-radius: 4px; border-width: 2px;
@@ -1201,9 +1322,12 @@ export component EphemerisPage inherits Window {
                                 root.task-dialog-is-edit = false;
                                 root.task-dialog-id = "";
                                 root.task-dialog-title = "";
-                                root.task-dialog-priority = 1;
+                                root.task-dialog-priority = 2;
                                 root.task-dialog-due = "";
                                 root.task-dialog-tags = "";
+                                root.task-dialog-lane = "next";
+                                root.task-dialog-contexts = "";
+                                root.task-dialog-waiting = "";
                                 root.task-dialog-visible = true;
                             }
                         }
@@ -1253,6 +1377,50 @@ export component EphemerisPage inherits Window {
                             clicked => { root.task-search-changed(task-search-input.text); }
                         }
                     }
+                }
+            }
+
+            // ── Horizon lanes ────────────────────────────────────────────
+            Rectangle {
+                height: 40px;
+                background: EinkTheme.canvas-bg;
+                HorizontalLayout {
+                    padding-left: 12px; padding-right: 12px;
+                    padding-top: 4px; padding-bottom: 4px;
+                    spacing: 6px;
+
+                    Rectangle {
+                        property <bool> sel: root.task-lane-filter == "";
+                        width: 44px; height: 32px;
+                        background: sel ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+                        border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                        Text { text: "All"; font-size: 12px;
+                               color: sel ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                               horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea { clicked => {
+                            root.task-lane-filter = "";
+                            root.task-lane-changed("");
+                        } }
+                    }
+
+                    for lane in root.task-lane-list: Rectangle {
+                        property <bool> sel: root.task-lane-filter == lane.id;
+                        height: 32px; width: 78px;
+                        background: sel ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+                        border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                        Text {
+                            text: lane.label + " " + lane.count;
+                            font-size: 12px;
+                            color: sel ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                            horizontal-alignment: center; vertical-alignment: center;
+                        }
+                        TouchArea { clicked => {
+                            root.task-lane-filter = lane.id;
+                            root.task-lane-changed(lane.id);
+                        } }
+                    }
+
+                    Rectangle { horizontal-stretch: 1; }
                 }
             }
 
@@ -3934,6 +4102,30 @@ export component EphemerisPage inherits Window {
                         }
                     }
 
+                    Rectangle { height: 1px; background: EinkTheme.chrome-border; }
+
+                    // Tasks (GTD lanes)
+                    Rectangle {
+                        height: 72px;
+                        background: root.settings-section == 3 ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+                        VerticalLayout {
+                            padding: 6px; spacing: 2px; alignment: center;
+                            Text {
+                                text: Icons.tasks;
+                                font-family: "Material Icons"; font-size: 24px;
+                                color: root.settings-section == 3 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                                horizontal-alignment: center;
+                            }
+                            Text {
+                                text: "Tasks";
+                                font-size: 9px;
+                                color: root.settings-section == 3 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                                horizontal-alignment: center;
+                            }
+                        }
+                        TouchArea { clicked => { root.settings-section = 3; } }
+                    }
+
                     // Spacer
                     Rectangle { vertical-stretch: 1; background: EinkTheme.chrome-bg; }
 
@@ -4940,6 +5132,247 @@ export component EphemerisPage inherits Window {
                         }
                     }
                 }
+
+                // ── Tasks section (GTD lanes) ─────────────────────────────
+                Rectangle {
+                    visible: root.settings-section == 3;
+                    width: parent.width; height: parent.height;
+                    clip: true;
+
+                    Flickable {
+                        width: parent.width; height: parent.height;
+                        content-width: parent.width;
+                        content-height: tasks-settings-col.preferred-height;
+
+                        tasks-settings-col := VerticalLayout {
+                            padding: 0px; spacing: 0px;
+                            width: parent.width;
+
+                            Rectangle {
+                                height: 44px;
+                                background: EinkTheme.canvas-bg;
+                                Text {
+                                    text: "Horizon lanes & Engage";
+                                    font-size: 14px; font-weight: 700; color: EinkTheme.btn-fg;
+                                    vertical-alignment: center;
+                                    x: 16px; height: parent.height;
+                                }
+                            }
+                            Rectangle { height: 1px; background: EinkTheme.chrome-border; }
+
+                            for lane in root.settings-task-lanes: Rectangle {
+                                height: 72px;
+                                background: EinkTheme.canvas-bg;
+                                VerticalLayout {
+                                    padding-left: 16px; padding-right: 12px;
+                                    padding-top: 6px; padding-bottom: 6px;
+                                    spacing: 4px;
+
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        Text {
+                                            text: lane.id;
+                                            font-size: 11px; color: EinkTheme.text-secondary;
+                                            vertical-alignment: center; width: 64px;
+                                        }
+                                        Rectangle {
+                                            horizontal-stretch: 1; height: 32px;
+                                            border-radius: 4px; border-width: 2px;
+                                            border-color: EinkTheme.btn-border;
+                                            background: EinkTheme.canvas-bg;
+                                            TextInput {
+                                                x: 8px; width: parent.width - 16px; height: parent.height;
+                                                font-size: 13px; color: EinkTheme.btn-fg;
+                                                text: lane.label;
+                                                vertical-alignment: center; single-line: true;
+                                                edited => {
+                                                    root.settings-lane-label-changed(lane.id, self.text);
+                                                }
+                                            }
+                                        }
+                                        Rectangle {
+                                            width: 64px; height: 28px;
+                                            background: lane.visible ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+                                            border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                                            Text {
+                                                text: lane.visible ? "Show" : "Hide";
+                                                font-size: 11px;
+                                                color: lane.visible ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                                                horizontal-alignment: center; vertical-alignment: center;
+                                            }
+                                            TouchArea { clicked => { root.settings-lane-visible-toggled(lane.id); } }
+                                        }
+                                        Rectangle {
+                                            width: 72px; height: 28px;
+                                            background: EinkTheme.btn-bg;
+                                            border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                                            Text {
+                                                text: lane.wip-limit == 0 ? "WIP —" : "WIP " + lane.wip-limit;
+                                                font-size: 11px; color: EinkTheme.btn-fg;
+                                                horizontal-alignment: center; vertical-alignment: center;
+                                            }
+                                            TouchArea { clicked => { root.settings-lane-wip-cycle(lane.id); } }
+                                        }
+                                    }
+                                }
+                                Rectangle {
+                                    y: parent.height - 1px; height: 1px; width: parent.width;
+                                    background: EinkTheme.chrome-border; opacity: 0.4;
+                                }
+                            }
+
+                            Rectangle { height: 8px; background: EinkTheme.canvas-bg; }
+
+                            Rectangle {
+                                height: 44px;
+                                background: EinkTheme.canvas-bg;
+                                HorizontalLayout {
+                                    padding-left: 16px; padding-right: 16px; spacing: 12px;
+                                    Text {
+                                        text: "Stale after (days)";
+                                        font-size: 13px; color: EinkTheme.btn-fg;
+                                        vertical-alignment: center; width: 140px;
+                                    }
+                                    Rectangle {
+                                        width: 40px; height: 32px; background: EinkTheme.btn-bg;
+                                        border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                                        Text { text: "−"; font-size: 18px; color: EinkTheme.btn-fg;
+                                               horizontal-alignment: center; vertical-alignment: center; }
+                                        TouchArea {
+                                            clicked => {
+                                                if (root.settings-staleness-days > 1) {
+                                                    root.settings-staleness-days = root.settings-staleness-days - 1;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Text {
+                                        text: root.settings-staleness-days;
+                                        font-size: 14px; color: EinkTheme.btn-fg;
+                                        vertical-alignment: center; width: 36px;
+                                        horizontal-alignment: center;
+                                    }
+                                    Rectangle {
+                                        width: 40px; height: 32px; background: EinkTheme.btn-bg;
+                                        border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                                        Text { text: "+"; font-size: 18px; color: EinkTheme.btn-fg;
+                                               horizontal-alignment: center; vertical-alignment: center; }
+                                        TouchArea {
+                                            clicked => {
+                                                root.settings-staleness-days = root.settings-staleness-days + 1;
+                                            }
+                                        }
+                                    }
+                                    Rectangle { horizontal-stretch: 1; }
+                                }
+                            }
+
+                            Rectangle {
+                                height: 44px;
+                                background: EinkTheme.canvas-bg;
+                                HorizontalLayout {
+                                    padding-left: 16px; padding-right: 16px; spacing: 8px;
+                                    Text {
+                                        text: "Engage lane";
+                                        font-size: 13px; color: EinkTheme.btn-fg;
+                                        vertical-alignment: center; width: 100px;
+                                    }
+                                    for lid in ["now", "next", "later"]: Rectangle {
+                                        property <bool> sel: root.settings-engage-lane == lid;
+                                        width: 56px; height: 28px;
+                                        background: sel ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+                                        border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                                        Text { text: lid; font-size: 11px;
+                                               color: sel ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                                               horizontal-alignment: center; vertical-alignment: center; }
+                                        TouchArea { clicked => { root.settings-engage-lane = lid; } }
+                                    }
+                                    Rectangle { horizontal-stretch: 1; }
+                                }
+                            }
+
+                            Rectangle {
+                                height: 44px;
+                                background: EinkTheme.canvas-bg;
+                                HorizontalLayout {
+                                    padding-left: 16px; padding-right: 16px; spacing: 8px;
+                                    Text {
+                                        text: "Capture lane";
+                                        font-size: 13px; color: EinkTheme.btn-fg;
+                                        vertical-alignment: center; width: 100px;
+                                    }
+                                    for lid in ["now", "next", "later", "someday"]: Rectangle {
+                                        property <bool> sel: root.settings-capture-lane == lid;
+                                        width: 64px; height: 28px;
+                                        background: sel ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+                                        border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                                        Text { text: lid; font-size: 11px;
+                                               color: sel ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                                               horizontal-alignment: center; vertical-alignment: center; }
+                                        TouchArea { clicked => { root.settings-capture-lane = lid; } }
+                                    }
+                                    Rectangle { horizontal-stretch: 1; }
+                                }
+                            }
+
+                            Rectangle {
+                                height: 44px;
+                                background: EinkTheme.canvas-bg;
+                                HorizontalLayout {
+                                    padding-left: 16px; padding-right: 16px; spacing: 12px;
+                                    Text {
+                                        text: "Clarify after capture";
+                                        font-size: 13px; color: EinkTheme.btn-fg;
+                                        vertical-alignment: center; horizontal-stretch: 1;
+                                    }
+                                    Rectangle {
+                                        width: 72px; height: 28px;
+                                        background: root.settings-clarify-after-capture ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+                                        border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                                        Text {
+                                            text: root.settings-clarify-after-capture ? "On" : "Off";
+                                            font-size: 12px;
+                                            color: root.settings-clarify-after-capture ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                                            horizontal-alignment: center; vertical-alignment: center;
+                                        }
+                                        TouchArea {
+                                            clicked => {
+                                                root.settings-clarify-after-capture = !root.settings-clarify-after-capture;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            Rectangle {
+                                height: 36px;
+                                background: EinkTheme.canvas-bg;
+                                Text {
+                                    text: "Context presets (space-separated)";
+                                    font-size: 12px; color: EinkTheme.text-secondary;
+                                    x: 16px; vertical-alignment: center; height: parent.height;
+                                }
+                            }
+                            Rectangle {
+                                height: 40px;
+                                background: EinkTheme.canvas-bg;
+                                Rectangle {
+                                    x: 16px; width: parent.width - 32px; height: 36px;
+                                    border-radius: 4px; border-width: 2px;
+                                    border-color: EinkTheme.btn-border;
+                                    TextInput {
+                                        x: 8px; width: parent.width - 16px; height: parent.height;
+                                        font-size: 13px; color: EinkTheme.btn-fg;
+                                        text <=> root.settings-context-presets;
+                                        vertical-alignment: center; single-line: true;
+                                    }
+                                }
+                            }
+
+                            Rectangle { height: 32px; background: EinkTheme.canvas-bg; }
+                        }
+                    }
+                }
             }
         }
     }
@@ -5735,16 +6168,16 @@ export component EphemerisPage inherits Window {
         opacity: 0.95;
 
         Rectangle {
-            x: (parent.width - 440px) / 2;
-            y: (parent.height - 420px) / 2;
-            width: 440px; height: 420px;
+            x: (parent.width - 460px) / 2;
+            y: (parent.height - 560px) / 2;
+            width: 460px; height: 560px;
             background: EinkTheme.canvas-bg;
             border-radius: 8px;
             border-width: 3px;
             border-color: EinkTheme.chrome-border;
 
             VerticalLayout {
-                padding: 20px; spacing: 12px;
+                padding: 16px; spacing: 8px;
 
                 Text {
                     text: root.task-dialog-is-edit ? "Edit Task" : "New Task";
@@ -5758,7 +6191,7 @@ export component EphemerisPage inherits Window {
                     font-size: 11px; color: EinkTheme.text-secondary;
                 }
                 Rectangle {
-                    height: 44px;
+                    height: 40px;
                     border-radius: 4px; border-width: 2px;
                     border-color: EinkTheme.btn-border;
                     background: EinkTheme.canvas-bg;
@@ -5775,11 +6208,29 @@ export component EphemerisPage inherits Window {
                 }
 
                 Text {
+                    text: "Lane";
+                    font-size: 11px; color: EinkTheme.text-secondary;
+                }
+                HorizontalLayout {
+                    spacing: 6px; alignment: start;
+                    for lid in ["now", "next", "later", "waiting", "someday"]: Rectangle {
+                        property <bool> sel: root.task-dialog-lane == lid;
+                        height: 28px; width: 70px;
+                        background: sel ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+                        border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                        Text { text: lid; font-size: 11px;
+                               color: sel ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                               horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea { clicked => { root.task-dialog-lane = lid; } }
+                    }
+                }
+
+                Text {
                     text: "Due (YYYY-MM-DD)";
                     font-size: 11px; color: EinkTheme.text-secondary;
                 }
                 Rectangle {
-                    height: 40px;
+                    height: 36px;
                     border-radius: 4px; border-width: 2px;
                     border-color: EinkTheme.btn-border;
                     background: EinkTheme.canvas-bg;
@@ -5797,11 +6248,53 @@ export component EphemerisPage inherits Window {
                 }
 
                 Text {
+                    text: "Contexts (space-separated)";
+                    font-size: 11px; color: EinkTheme.text-secondary;
+                }
+                Rectangle {
+                    height: 36px;
+                    border-radius: 4px; border-width: 2px;
+                    border-color: EinkTheme.btn-border;
+                    background: EinkTheme.canvas-bg;
+
+                    TextInput {
+                        x: 8px; y: 0px;
+                        width: parent.width - 16px;
+                        height: parent.height;
+                        font-size: 14px; color: EinkTheme.btn-fg;
+                        text <=> root.task-dialog-contexts;
+                        vertical-alignment: center;
+                        single-line: true;
+                    }
+                }
+
+                Text {
+                    text: "Waiting for";
+                    font-size: 11px; color: EinkTheme.text-secondary;
+                }
+                Rectangle {
+                    height: 36px;
+                    border-radius: 4px; border-width: 2px;
+                    border-color: EinkTheme.btn-border;
+                    background: EinkTheme.canvas-bg;
+
+                    TextInput {
+                        x: 8px; y: 0px;
+                        width: parent.width - 16px;
+                        height: parent.height;
+                        font-size: 14px; color: EinkTheme.btn-fg;
+                        text <=> root.task-dialog-waiting;
+                        vertical-alignment: center;
+                        single-line: true;
+                    }
+                }
+
+                Text {
                     text: "Tags (space-separated)";
                     font-size: 11px; color: EinkTheme.text-secondary;
                 }
                 Rectangle {
-                    height: 40px;
+                    height: 36px;
                     border-radius: 4px; border-width: 2px;
                     border-color: EinkTheme.btn-border;
                     background: EinkTheme.canvas-bg;
@@ -5818,36 +6311,43 @@ export component EphemerisPage inherits Window {
                 }
 
                 HorizontalLayout {
-                    spacing: 8px; alignment: center;
+                    spacing: 6px; alignment: center;
 
                     Rectangle {
-                        width: 80px; height: 34px;
+                        width: 70px; height: 32px;
                         background: root.task-dialog-priority == 0 ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
                         border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
-                        Text { text: "High"; font-size: 13px;
+                        Text { text: "Urgent"; font-size: 12px;
                                color: root.task-dialog-priority == 0 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
                                horizontal-alignment: center; vertical-alignment: center; }
                         TouchArea { clicked => { root.task-dialog-priority = 0; } }
                     }
-
                     Rectangle {
-                        width: 80px; height: 34px;
+                        width: 70px; height: 32px;
                         background: root.task-dialog-priority == 1 ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
                         border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
-                        Text { text: "Medium"; font-size: 13px;
+                        Text { text: "High"; font-size: 12px;
                                color: root.task-dialog-priority == 1 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
                                horizontal-alignment: center; vertical-alignment: center; }
                         TouchArea { clicked => { root.task-dialog-priority = 1; } }
                     }
-
                     Rectangle {
-                        width: 80px; height: 34px;
+                        width: 70px; height: 32px;
                         background: root.task-dialog-priority == 2 ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
                         border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
-                        Text { text: "Low"; font-size: 13px;
+                        Text { text: "Med"; font-size: 12px;
                                color: root.task-dialog-priority == 2 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
                                horizontal-alignment: center; vertical-alignment: center; }
                         TouchArea { clicked => { root.task-dialog-priority = 2; } }
+                    }
+                    Rectangle {
+                        width: 70px; height: 32px;
+                        background: root.task-dialog-priority == 3 ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+                        border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                        Text { text: "Low"; font-size: 12px;
+                               color: root.task-dialog-priority == 3 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                               horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea { clicked => { root.task-dialog-priority = 3; } }
                     }
                 }
 
@@ -5855,7 +6355,7 @@ export component EphemerisPage inherits Window {
                     spacing: 16px; alignment: center;
 
                     Rectangle {
-                        width: 120px; height: 48px;
+                        width: 120px; height: 44px;
                         background: EinkTheme.btn-bg;
                         border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
                         Text { text: "Cancel"; font-size: 15px; color: EinkTheme.btn-fg;
@@ -5864,7 +6364,7 @@ export component EphemerisPage inherits Window {
                     }
 
                     Rectangle {
-                        width: 120px; height: 48px;
+                        width: 120px; height: 44px;
                         background: EinkTheme.btn-active-bg;
                         border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
                         Text { text: "Save"; font-size: 15px; color: EinkTheme.btn-active-fg;
@@ -5877,14 +6377,235 @@ export component EphemerisPage inherits Window {
                                         root.task-dialog-title,
                                         root.task-dialog-priority,
                                         root.task-dialog-due,
-                                        root.task-dialog-tags);
+                                        root.task-dialog-tags,
+                                        root.task-dialog-lane,
+                                        root.task-dialog-contexts,
+                                        root.task-dialog-waiting);
                                 } else {
                                     root.task-confirm-add(
                                         root.task-dialog-title,
                                         root.task-dialog-priority,
                                         root.task-dialog-due,
-                                        root.task-dialog-tags);
+                                        root.task-dialog-tags,
+                                        root.task-dialog-lane,
+                                        root.task-dialog-contexts,
+                                        root.task-dialog-waiting);
                                 }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Weekly review overlay ────────────────────────────────────────────
+    review-dialog := Rectangle {
+        visible: root.review-visible;
+        x: 0; y: 0;
+        width: parent.width;
+        height: parent.height;
+        background: EinkTheme.chrome-bg;
+        opacity: 0.95;
+
+        Rectangle {
+            x: (parent.width - 440px) / 2;
+            y: (parent.height - 360px) / 2;
+            width: 440px; height: 360px;
+            background: EinkTheme.canvas-bg;
+            border-radius: 8px;
+            border-width: 3px;
+            border-color: EinkTheme.chrome-border;
+
+            VerticalLayout {
+                padding: 20px; spacing: 12px;
+
+                Text {
+                    text: "Weekly review";
+                    font-size: 16px; font-weight: 700;
+                    color: EinkTheme.btn-fg;
+                    horizontal-alignment: center;
+                }
+                Text {
+                    text: root.review-progress;
+                    font-size: 12px; color: EinkTheme.text-secondary;
+                    horizontal-alignment: center;
+                }
+                if root.review-stale: Text {
+                    text: "Stale — needs a look";
+                    font-size: 12px; color: EinkTheme.btn-fg;
+                    horizontal-alignment: center;
+                }
+                Text {
+                    text: root.review-lane-label;
+                    font-size: 12px; color: EinkTheme.text-secondary;
+                    horizontal-alignment: center;
+                }
+                Text {
+                    text: root.review-title;
+                    font-size: 18px; font-weight: 700;
+                    color: EinkTheme.btn-fg;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: root.review-meta;
+                    font-size: 12px; color: EinkTheme.text-secondary;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+
+                HorizontalLayout {
+                    spacing: 8px; alignment: center;
+                    Rectangle {
+                        width: 100px; height: 40px;
+                        background: EinkTheme.btn-active-bg;
+                        border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                        Text { text: "Looks good"; font-size: 12px; color: EinkTheme.btn-active-fg;
+                               horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea { clicked => { root.review-confirm(); } }
+                    }
+                    Rectangle {
+                        width: 72px; height: 40px;
+                        background: EinkTheme.btn-bg;
+                        border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                        Text { text: "Edit"; font-size: 12px; color: EinkTheme.btn-fg;
+                               horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea { clicked => { root.review-edit(); } }
+                    }
+                    Rectangle {
+                        width: 72px; height: 40px;
+                        background: EinkTheme.btn-bg;
+                        border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                        Text { text: "Done"; font-size: 12px; color: EinkTheme.btn-fg;
+                               horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea { clicked => { root.review-done(); } }
+                    }
+                    Rectangle {
+                        width: 72px; height: 40px;
+                        background: EinkTheme.btn-bg;
+                        border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                        Text { text: "Skip"; font-size: 12px; color: EinkTheme.btn-fg;
+                               horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea { clicked => { root.review-skip(); } }
+                    }
+                }
+                Rectangle {
+                    width: 120px; height: 36px;
+                    background: EinkTheme.btn-bg;
+                    border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                    Text { text: "Close"; font-size: 13px; color: EinkTheme.btn-fg;
+                           horizontal-alignment: center; vertical-alignment: center; }
+                    TouchArea { clicked => { root.review-close(); } }
+                }
+            }
+        }
+    }
+
+    // ── Clarify after capture ────────────────────────────────────────────
+    clarify-dialog := Rectangle {
+        visible: root.clarify-visible;
+        x: 0; y: 0;
+        width: parent.width;
+        height: parent.height;
+        background: EinkTheme.chrome-bg;
+        opacity: 0.95;
+
+        Rectangle {
+            x: (parent.width - 440px) / 2;
+            y: (parent.height - 400px) / 2;
+            width: 440px; height: 400px;
+            background: EinkTheme.canvas-bg;
+            border-radius: 8px;
+            border-width: 3px;
+            border-color: EinkTheme.chrome-border;
+
+            VerticalLayout {
+                padding: 20px; spacing: 10px;
+
+                Text {
+                    text: "Clarify";
+                    font-size: 16px; font-weight: 700;
+                    color: EinkTheme.btn-fg;
+                    horizontal-alignment: center;
+                }
+                Text {
+                    text: root.clarify-title;
+                    font-size: 14px; color: EinkTheme.btn-fg;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: "If it takes under two minutes, do it now — otherwise pick a lane.";
+                    font-size: 11px; color: EinkTheme.text-secondary;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+
+                Text { text: "Lane"; font-size: 11px; color: EinkTheme.text-secondary; }
+                HorizontalLayout {
+                    spacing: 6px; alignment: start;
+                    for lid in ["now", "next", "later", "waiting", "someday"]: Rectangle {
+                        property <bool> sel: root.clarify-lane == lid;
+                        height: 28px; width: 70px;
+                        background: sel ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+                        border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                        Text { text: lid; font-size: 11px;
+                               color: sel ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                               horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea { clicked => { root.clarify-lane = lid; } }
+                    }
+                }
+
+                Text { text: "Contexts"; font-size: 11px; color: EinkTheme.text-secondary; }
+                Rectangle {
+                    height: 36px;
+                    border-radius: 4px; border-width: 2px;
+                    border-color: EinkTheme.btn-border;
+                    TextInput {
+                        x: 8px; width: parent.width - 16px; height: parent.height;
+                        font-size: 13px; color: EinkTheme.btn-fg;
+                        text <=> root.clarify-contexts;
+                        vertical-alignment: center; single-line: true;
+                    }
+                }
+
+                Text { text: "Waiting for"; font-size: 11px; color: EinkTheme.text-secondary; }
+                Rectangle {
+                    height: 36px;
+                    border-radius: 4px; border-width: 2px;
+                    border-color: EinkTheme.btn-border;
+                    TextInput {
+                        x: 8px; width: parent.width - 16px; height: parent.height;
+                        font-size: 13px; color: EinkTheme.btn-fg;
+                        text <=> root.clarify-waiting;
+                        vertical-alignment: center; single-line: true;
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 16px; alignment: center;
+                    Rectangle {
+                        width: 120px; height: 44px;
+                        background: EinkTheme.btn-bg;
+                        border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                        Text { text: "Skip"; font-size: 14px; color: EinkTheme.btn-fg;
+                               horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea { clicked => { root.clarify-skip(); } }
+                    }
+                    Rectangle {
+                        width: 120px; height: 44px;
+                        background: EinkTheme.btn-active-bg;
+                        border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                        Text { text: "Save"; font-size: 14px; color: EinkTheme.btn-active-fg;
+                               horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea {
+                            clicked => {
+                                root.clarify-save(
+                                    root.clarify-task-id,
+                                    root.clarify-lane,
+                                    root.clarify-contexts,
+                                    root.clarify-waiting);
                             }
                         }
                     }
