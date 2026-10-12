@@ -5572,7 +5572,7 @@ fn sort_recordings(recordings: &mut [AppRecording], sort: &str) {
                 .then(b.created_at.cmp(&a.created_at))
         }),
         // Newest first
-        _ => recordings.sort_by(|a, b| b.created_at.cmp(&a.created_at)),
+        _ => recordings.sort_by_key(|r| std::cmp::Reverse(r.created_at)),
     }
 }
 
@@ -8196,7 +8196,7 @@ fn build_full_task_list(tasks: &[Task], now: u64, filter: &str, sort: &str) -> V
         }),
         "added" => {
             // preserve original order but keep open tasks above today's done
-            v.sort_by(|a, b| a.6.cmp(&b.6))
+            v.sort_by_key(|a| a.6)
         }
         _ => {
             // priority, with open tasks before closed when mixed

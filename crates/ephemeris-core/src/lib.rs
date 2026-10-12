@@ -83,7 +83,7 @@ pub use prioritizer::{rank_tasks, task_score};
 pub use stroke_htr::{
     ctc_decode_with_lm, ctc_greedy_decode, ctc_prefix_beam_decode, decode_charset,
     default_htr_language_context, default_line_gap, featurize_line, group_strokes_into_lines,
-    CharBigramLm, CtcBeamConfig, HtrLexicon, StrokeLine,
+    CharBigramLm, CtcBeamConfig, CtcFrame, HtrLexicon, StrokeLine,
 };
 pub use task_cache::TaskCache;
 #[cfg(feature = "sqlite")]

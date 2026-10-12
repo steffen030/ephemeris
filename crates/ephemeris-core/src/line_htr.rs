@@ -191,7 +191,7 @@ pub fn prepare_line_htr_input(
     }
 
     // Right-pad to multiple of 4 with white.
-    let pad_w = ((tw + LINE_HTR_WIDTH_ALIGN - 1) / LINE_HTR_WIDTH_ALIGN) * LINE_HTR_WIDTH_ALIGN;
+    let pad_w = tw.div_ceil(LINE_HTR_WIDTH_ALIGN) * LINE_HTR_WIDTH_ALIGN;
     let pad_w = pad_w.min(LINE_HTR_MAX_WIDTH).max(tw);
     let mut pixels = vec![1.0f32; (pad_w as usize) * (LINE_HTR_HEIGHT as usize)];
     // If th < 64 (extreme shrink), center vertically on white.

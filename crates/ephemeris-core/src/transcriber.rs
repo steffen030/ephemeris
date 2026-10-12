@@ -3,15 +3,17 @@
 //! Preferred path (ephemeris-5g2): [`CascadingTranscriber`] — online stroke HTR
 //! when strokes + model are available, else [`RasterOcrTranscriber`] (Tesseract).
 
+#[cfg(feature = "htr")]
 use crate::line_htr::{
-    ctc_greedy_decode_logits, decode_line_alphabet, line_logits_confidence, prepare_line_htr_input,
-    split_ink_line_bands, DE_HTR_V2_ALPHABET,
+    ctc_greedy_decode_logits, decode_line_alphabet, line_logits_confidence, DE_HTR_V2_ALPHABET,
 };
+use crate::line_htr::{prepare_line_htr_input, split_ink_line_bands};
 use crate::model::{Point, Stroke, Tool};
 #[cfg(feature = "htr")]
 use crate::stroke_htr::{
     ctc_decode_with_lm, ctc_softmax_confidence, decode_charset_with_blank,
-    default_htr_language_context, features_to_tensor, CharBigramLm, CtcBeamConfig, HtrLexicon,
+    default_htr_language_context, features_to_tensor, CharBigramLm, CtcBeamConfig, CtcFrame,
+    HtrLexicon,
 };
 use crate::stroke_htr::{default_line_gap, featurize_line, group_strokes_into_lines};
 #[cfg(feature = "ocr")]
@@ -445,11 +447,13 @@ impl StrokeHtrTranscriber {
         let blank = sess.blank_index.min(c.saturating_sub(1));
         // Prefix beam + char LM / lexicon (ASR-style context on device).
         let path = ctc_decode_with_lm(
-            &logits,
-            time,
-            c,
-            blank,
-            &sess.charset,
+            CtcFrame {
+                log_probs: &logits,
+                time_steps: time,
+                num_classes: c,
+                blank,
+                charset: &sess.charset,
+            },
             sess.beam,
             Some(&sess.lm),
             Some(&sess.lexicon),
@@ -600,7 +604,8 @@ impl LineImageHtrTranscriber {
         Self {
             enabled,
             model_dir,
-            ..Self::default()
+            #[cfg(feature = "htr")]
+            session: Mutex::new(None),
         }
     }
 
@@ -981,7 +986,9 @@ impl Transcriber for RasterOcrTranscriber {
 }
 
 /// Prepared OCR image + transform back to the source raster coordinates.
+#[cfg(any(feature = "ocr", test))]
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // gray/dpi used by OCR invoke; origins by remap
 struct OcrPrepared {
     gray: Vec<u8>,
     width: u32,
@@ -998,9 +1005,11 @@ struct OcrPrepared {
 }
 
 /// Ink darkness threshold (gray8); below this counts as ink.
+#[cfg(any(feature = "ocr", test))]
 const INK_THRESHOLD: u8 = 200;
 
 /// Crop to ink, thicken thin strokes, upscale, and pick a PSM for handwriting.
+#[cfg(any(feature = "ocr", test))]
 fn prepare_ocr_image(width: u32, height: u32, gray8: &[u8]) -> Option<OcrPrepared> {
     let expected = (width as usize).saturating_mul(height as usize);
     if width == 0 || height == 0 || gray8.len() < expected {
@@ -1065,6 +1074,7 @@ fn prepare_ocr_image(width: u32, height: u32, gray8: &[u8]) -> Option<OcrPrepare
     })
 }
 
+#[cfg(any(feature = "ocr", test))]
 fn ink_bbox(width: u32, height: u32, gray8: &[u8]) -> Option<(u32, u32, u32, u32)> {
     let mut min_x = width;
     let mut min_y = height;
@@ -1089,6 +1099,7 @@ fn ink_bbox(width: u32, height: u32, gray8: &[u8]) -> Option<(u32, u32, u32, u32
     }
 }
 
+#[cfg(any(feature = "ocr", test))]
 fn dilate_ink(gray: &[u8], w: u32, h: u32, radius: i32) -> Vec<u8> {
     if radius <= 0 {
         return gray.to_vec();
@@ -1119,6 +1130,7 @@ fn dilate_ink(gray: &[u8], w: u32, h: u32, radius: i32) -> Vec<u8> {
     out
 }
 
+#[cfg(any(feature = "ocr", test))]
 fn nearest_upscale(gray: &[u8], w: u32, h: u32, scale: u32) -> (u32, u32, Vec<u8>) {
     let scale = scale.max(1);
     if scale == 1 {
@@ -1147,6 +1159,7 @@ fn nearest_upscale(gray: &[u8], w: u32, h: u32, scale: u32) -> (u32, u32, Vec<u8
 /// - tiny / square-ish → single word/char (8)
 /// - wide short strip → single line (7)
 /// - otherwise sparse text (11) — better than block PSM 6 for notes
+#[cfg(any(feature = "ocr", test))]
 fn choose_ocr_psm(crop_w: u32, crop_h: u32) -> u8 {
     let short = crop_w.min(crop_h);
     let long = crop_w.max(crop_h);
@@ -1159,6 +1172,7 @@ fn choose_ocr_psm(crop_w: u32, crop_h: u32) -> u8 {
     }
 }
 
+#[cfg(feature = "ocr")]
 fn remap_ocr_spans(spans: Vec<TextSpan>, prep: &OcrPrepared) -> Vec<TextSpan> {
     let inv = if prep.scale > 0.0 {
         1.0 / prep.scale

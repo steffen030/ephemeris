@@ -477,20 +477,32 @@ impl BeamState {
     }
 }
 
+/// Shared CTC frame layout for beam / LM decode helpers.
+#[derive(Debug, Clone, Copy)]
+pub struct CtcFrame<'a> {
+    /// Row-major `[T * C]` **log**-probabilities (OnlineHTR LogSoftmax).
+    pub log_probs: &'a [f32],
+    pub time_steps: usize,
+    pub num_classes: usize,
+    pub blank: usize,
+    pub charset: &'a str,
+}
+
 /// Prefix beam search over CTC log-probabilities (Hannun-style) with optional
 /// character LM and lexicon rescoring of the final beam.
-///
-/// `log_probs` is row-major `[T * C]` **log**-probabilities (OnlineHTR LogSoftmax).
 pub fn ctc_prefix_beam_decode(
-    log_probs: &[f32],
-    time_steps: usize,
-    num_classes: usize,
-    blank: usize,
+    frame: CtcFrame<'_>,
     config: CtcBeamConfig,
     lm: Option<&CharBigramLm>,
     lexicon: Option<&HtrLexicon>,
-    charset: &str,
 ) -> Vec<usize> {
+    let CtcFrame {
+        log_probs,
+        time_steps,
+        num_classes,
+        blank,
+        charset,
+    } = frame;
     if time_steps == 0 || num_classes == 0 || log_probs.len() < time_steps * num_classes {
         return Vec::new();
     }
@@ -524,11 +536,10 @@ pub fn ctc_prefix_beam_decode(
                 e.pb = log_add(e.pb, p);
             }
 
-            for c in 0..num_classes {
+            for (c, &lp) in row.iter().enumerate() {
                 if c == blank {
                     continue;
                 }
-                let lp = row[c];
 
                 if last == Some(c) {
                     // Emitting `c` again without a blank stays on the same
@@ -612,27 +623,19 @@ pub fn ctc_prefix_beam_decode(
 
 /// Decode with beam+LM when helpful; fall back to greedy if beam is empty.
 pub fn ctc_decode_with_lm(
-    log_probs: &[f32],
-    time_steps: usize,
-    num_classes: usize,
-    blank: usize,
-    charset: &str,
+    frame: CtcFrame<'_>,
     config: CtcBeamConfig,
     lm: Option<&CharBigramLm>,
     lexicon: Option<&HtrLexicon>,
 ) -> Vec<usize> {
-    let beam = ctc_prefix_beam_decode(
-        log_probs,
-        time_steps,
-        num_classes,
-        blank,
-        config,
-        lm,
-        lexicon,
-        charset,
-    );
+    let beam = ctc_prefix_beam_decode(frame, config, lm, lexicon);
     if beam.is_empty() {
-        ctc_greedy_decode(log_probs, time_steps, num_classes, blank)
+        ctc_greedy_decode(
+            frame.log_probs,
+            frame.time_steps,
+            frame.num_classes,
+            frame.blank,
+        )
     } else {
         beam
     }
@@ -751,10 +754,13 @@ mod tests {
         ];
         let greedy = ctc_greedy_decode(&log_probs, 3, 3, 2);
         let beam = ctc_prefix_beam_decode(
-            &log_probs,
-            3,
-            3,
-            2,
+            CtcFrame {
+                log_probs: &log_probs,
+                time_steps: 3,
+                num_classes: 3,
+                blank: 2,
+                charset: "ab",
+            },
             CtcBeamConfig {
                 beam_width: 4,
                 lm_weight: 0.0,
@@ -762,7 +768,6 @@ mod tests {
             },
             None,
             None,
-            "ab",
         );
         assert_eq!(greedy, vec![0, 1]);
         assert_eq!(beam, greedy);
@@ -776,14 +781,12 @@ mod tests {
         let blank = 0usize;
         // timesteps: t, h, e/x
         // classes: 0=blank, 1=t, 2=h, 3=e, 4=x
-        let mut log_probs = vec![-20.0f32; 3 * 5];
-        // t
-        log_probs[0 * 5 + 1] = 0.0;
-        // h
-        log_probs[1 * 5 + 2] = 0.0;
-        // prefer x slightly over e acoustically
-        log_probs[2 * 5 + 4] = -0.1;
-        log_probs[2 * 5 + 3] = -0.3;
+        let mut log_probs = vec![-20.0f32; 15];
+        // t @ t=0 class 1; h @ t=1 class 2; prefer x over e at t=2
+        log_probs[1] = 0.0;
+        log_probs[7] = 0.0;
+        log_probs[14] = -0.1;
+        log_probs[13] = -0.3;
 
         let greedy = ctc_greedy_decode(&log_probs, 3, 5, blank);
         let greedy_text = decode_charset_with_blank(&greedy, charset, blank);
@@ -791,10 +794,13 @@ mod tests {
 
         let lex = HtrLexicon::from_word_list("the\n");
         let beam = ctc_prefix_beam_decode(
-            &log_probs,
-            3,
-            5,
-            blank,
+            CtcFrame {
+                log_probs: &log_probs,
+                time_steps: 3,
+                num_classes: 5,
+                blank,
+                charset,
+            },
             CtcBeamConfig {
                 beam_width: 8,
                 lm_weight: 0.0,
@@ -802,7 +808,6 @@ mod tests {
             },
             None,
             Some(&lex),
-            charset,
         );
         let beam_text = decode_charset_with_blank(&beam, charset, blank);
         assert_eq!(beam_text, "the");
