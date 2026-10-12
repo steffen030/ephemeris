@@ -52,6 +52,7 @@ pub mod obsidian;
 pub mod pdf_export;
 pub mod prioritizer;
 pub mod profile_manager;
+pub mod line_htr;
 pub mod stroke_htr;
 pub mod stroke_persistence;
 pub mod task_cache;
@@ -75,17 +76,23 @@ pub use pdf_export::{
     raster_export_hash, PdfExportOptions, RasterPage,
 };
 pub use prioritizer::{rank_tasks, task_score};
+pub use line_htr::{
+    prepare_line_htr_input, split_ink_line_bands, DE_HTR_V2_ALPHABET, ImageLineBand, LineHtrInput,
+    LINE_HTR_HEIGHT, LINE_HTR_MAX_WIDTH,
+};
 pub use stroke_htr::{
-    ctc_greedy_decode, decode_charset, default_line_gap, featurize_line, group_strokes_into_lines,
-    StrokeLine,
+    ctc_decode_with_lm, ctc_greedy_decode, ctc_prefix_beam_decode, decode_charset,
+    default_htr_language_context, default_line_gap, featurize_line, group_strokes_into_lines,
+    CharBigramLm, CtcBeamConfig, HtrLexicon, StrokeLine,
 };
 pub use task_cache::TaskCache;
 #[cfg(feature = "sqlite")]
 pub use task_provider::LocalTaskProvider;
 pub use task_provider::{ProviderCapabilities, TaskProvider};
 pub use transcriber::{
-    mean_confidence, parse_tesseract_tsv, CascadingTranscriber, FakeTranscriber, NoOpTranscriber,
-    RasterOcrTranscriber, StrokeHtrTranscriber, TextSpan, Transcriber,
+    mean_confidence, parse_tesseract_tsv, CascadingTranscriber, FakeTranscriber,
+    LineImageHtrTranscriber, NoOpTranscriber, RasterOcrTranscriber, StrokeHtrTranscriber, TextSpan,
+    Transcriber,
 };
 pub use vault_export::{
     export_note_markdown, notebook_export_dir, notebook_export_rel, path_under_export_subdir,

@@ -1020,6 +1020,24 @@ impl EphemerisUi {
             .on_task_search_changed(move |q| handler(q.to_string()));
     }
 
+    /// Recordings-list search query changed.
+    pub fn on_rec_search_changed<F>(&self, mut handler: F)
+    where
+        F: FnMut(String) + 'static,
+    {
+        self.component
+            .on_rec_search_changed(move |q| handler(q.to_string()));
+    }
+
+    /// Recordings-list sort mode changed.
+    pub fn on_rec_sort_changed<F>(&self, mut handler: F)
+    where
+        F: FnMut(String) + 'static,
+    {
+        self.component
+            .on_rec_sort_changed(move |s| handler(s.to_string()));
+    }
+
     // ── Profile switcher API ──────────────────────────────────────────────
 
     pub fn set_profile_list(&self, list: slint::ModelRc<ProfileEntry>) {
@@ -1314,6 +1332,22 @@ impl EphemerisUi {
 
     pub fn on_settings_htr_delete<F: FnMut() + 'static>(&self, handler: F) {
         self.component.on_settings_htr_delete(handler);
+    }
+
+    pub fn set_line_htr_model_installed(&self, v: bool) {
+        self.component.set_line_htr_model_installed(v);
+    }
+
+    pub fn set_line_htr_downloading(&self, v: bool) {
+        self.component.set_line_htr_downloading(v);
+    }
+
+    pub fn on_settings_line_htr_download<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_settings_line_htr_download(handler);
+    }
+
+    pub fn on_settings_line_htr_delete<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_settings_line_htr_delete(handler);
     }
 
     pub fn on_settings_profile_add<F>(&self, mut handler: F)
