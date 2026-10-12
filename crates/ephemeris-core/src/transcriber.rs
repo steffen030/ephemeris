@@ -4,8 +4,8 @@
 //! when strokes + model are available, else [`RasterOcrTranscriber`] (Tesseract).
 
 use crate::line_htr::{
-    decode_line_alphabet, line_logits_confidence, prepare_line_htr_input, split_ink_line_bands,
-    ctc_greedy_decode_logits, DE_HTR_V2_ALPHABET,
+    ctc_greedy_decode_logits, decode_line_alphabet, line_logits_confidence, prepare_line_htr_input,
+    split_ink_line_bands, DE_HTR_V2_ALPHABET,
 };
 use crate::model::{Point, Stroke, Tool};
 #[cfg(feature = "htr")]
@@ -222,10 +222,7 @@ fn effective_cascade_score(spans: &[TextSpan]) -> f32 {
 /// Unknown confidences (`< 0`) count as `0.5`. When a neural result is below
 /// `min_htr_confidence` and another candidate scores higher, the stronger one
 /// wins (same spirit as the old HTR→OCR gate).
-fn pick_best_cascade_spans(
-    candidates: &[&[TextSpan]],
-    min_htr_confidence: f32,
-) -> Vec<TextSpan> {
+fn pick_best_cascade_spans(candidates: &[&[TextSpan]], min_htr_confidence: f32) -> Vec<TextSpan> {
     let mut best: Option<(f32, &[TextSpan])> = None;
     for spans in candidates.iter().copied().filter(|s| !s.is_empty()) {
         let mut score = effective_cascade_score(spans);
@@ -659,7 +656,10 @@ impl LineImageHtrTranscriber {
     }
 
     #[cfg(feature = "htr")]
-    fn infer_line_image(&self, input: &crate::line_htr::LineHtrInput) -> crate::Result<(String, f32)> {
+    fn infer_line_image(
+        &self,
+        input: &crate::line_htr::LineHtrInput,
+    ) -> crate::Result<(String, f32)> {
         use rten_tensor::{AsView, Layout, NdTensor};
 
         self.ensure_session()?;
@@ -695,9 +695,7 @@ impl LineImageHtrTranscriber {
                     .map_err(|e| crate::AppError::InvalidInput(format!("line HTR infer: {e}")))?
                     .into_iter()
                     .next()
-                    .ok_or_else(|| {
-                        crate::AppError::InvalidInput("line HTR: no outputs".into())
-                    })?,
+                    .ok_or_else(|| crate::AppError::InvalidInput("line HTR: no outputs".into()))?,
                 _ => sess
                     .model
                     .run_one(tensor.view().into(), None)
@@ -781,7 +779,11 @@ fn load_line_htr_meta(dir: &std::path::Path) -> (String, usize, String, String) 
         .and_then(|r| serde_json::from_str::<Meta>(&r).ok());
 
     let alphabet = alphabet_from_file
-        .or_else(|| meta.as_ref().map(|m| m.alphabet.clone()).filter(|s| !s.is_empty()))
+        .or_else(|| {
+            meta.as_ref()
+                .map(|m| m.alphabet.clone())
+                .filter(|s| !s.is_empty())
+        })
         .unwrap_or_else(|| DE_HTR_V2_ALPHABET.to_string());
     let blank = meta.as_ref().map(|m| m.blank_index).unwrap_or(0);
     let input = meta
@@ -1313,10 +1315,7 @@ pub fn parse_tesseract_tsv(tsv: &str) -> Vec<TextSpan> {
 /// Prefer Tesseract `line` indices when present; otherwise cluster by `y`
 /// using a fraction of median span height. Within a line, join with spaces.
 pub fn spans_to_multiline_text(spans: &[TextSpan]) -> String {
-    let nonempty: Vec<&TextSpan> = spans
-        .iter()
-        .filter(|s| !s.text.trim().is_empty())
-        .collect();
+    let nonempty: Vec<&TextSpan> = spans.iter().filter(|s| !s.text.trim().is_empty()).collect();
     if nonempty.is_empty() {
         return String::new();
     }

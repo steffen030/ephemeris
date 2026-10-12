@@ -4955,9 +4955,10 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
                     Err(msg) => {
                         tracing::error!("Line HTR download failed: {msg}");
                         self.ui.set_line_htr_downloading(false);
-                        self.ui.set_line_htr_model_installed(find_line_htr_model_installed(
-                            &self.config.borrow(),
-                        ));
+                        self.ui
+                            .set_line_htr_model_installed(find_line_htr_model_installed(
+                                &self.config.borrow(),
+                            ));
                     }
                 }
                 if let Some(d) = &self.display {
@@ -5927,8 +5928,7 @@ fn find_line_htr_model_installed(config: &ephemeris_core::Config) -> bool {
 
 /// Download DE·HTR v2 int8 ONNX (~10.4 MB) from Hugging Face + write charset/meta.
 fn download_line_htr_model(config: &ephemeris_core::Config) -> Result<(), String> {
-    const MODEL_URL: &str =
-        "https://huggingface.co/naeyn/de-htr-web-v2/resolve/main/model.onnx";
+    const MODEL_URL: &str = "https://huggingface.co/naeyn/de-htr-web-v2/resolve/main/model.onnx";
     let dest_dir = resolve_line_htr_model_dir(config);
     std::fs::create_dir_all(&dest_dir).map_err(|e| format!("mkdir failed: {e}"))?;
     let model_path = dest_dir.join("model.onnx");

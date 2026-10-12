@@ -390,7 +390,13 @@ impl CharBigramLm {
     }
 
     /// Log-prob of emitting `next` after prefix ending in `prev` (None = BOS).
-    pub fn log_prob(&self, prev: Option<usize>, next: usize, blank: usize, alphabet_len: usize) -> f32 {
+    pub fn log_prob(
+        &self,
+        prev: Option<usize>,
+        next: usize,
+        blank: usize,
+        alphabet_len: usize,
+    ) -> f32 {
         let prev_slot = prev
             .and_then(|p| self.slot_for_label(p, blank, alphabet_len))
             .unwrap_or(0);
@@ -538,8 +544,7 @@ pub fn ctc_prefix_beam_decode(
                     // A *new* occurrence of `c` requires the blank path first.
                     let mut p_new = beam.pb + lp;
                     if let Some(lm) = lm {
-                        p_new += config.lm_weight
-                            * lm.log_prob(last, c, blank, alphabet_len);
+                        p_new += config.lm_weight * lm.log_prob(last, c, blank, alphabet_len);
                     }
                     let mut new_prefix = beam.prefix.clone();
                     new_prefix.push(c);
@@ -552,8 +557,7 @@ pub fn ctc_prefix_beam_decode(
                 } else {
                     let mut p_ext = total + lp;
                     if let Some(lm) = lm {
-                        p_ext += config.lm_weight
-                            * lm.log_prob(last, c, blank, alphabet_len);
+                        p_ext += config.lm_weight * lm.log_prob(last, c, blank, alphabet_len);
                     }
                     let mut new_prefix = beam.prefix.clone();
                     new_prefix.push(c);
@@ -592,10 +596,18 @@ pub fn ctc_prefix_beam_decode(
             // Fold bonus into pb so score() picks it up.
             b.pb = log_add(b.pb, bonus);
         }
-        beams.sort_by(|a, b| b.score().partial_cmp(&a.score()).unwrap_or(std::cmp::Ordering::Equal));
+        beams.sort_by(|a, b| {
+            b.score()
+                .partial_cmp(&a.score())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
     }
 
-    beams.into_iter().next().map(|b| b.prefix).unwrap_or_default()
+    beams
+        .into_iter()
+        .next()
+        .map(|b| b.prefix)
+        .unwrap_or_default()
 }
 
 /// Decode with beam+LM when helpful; fall back to greedy if beam is empty.
@@ -610,7 +622,14 @@ pub fn ctc_decode_with_lm(
     lexicon: Option<&HtrLexicon>,
 ) -> Vec<usize> {
     let beam = ctc_prefix_beam_decode(
-        log_probs, time_steps, num_classes, blank, config, lm, lexicon, charset,
+        log_probs,
+        time_steps,
+        num_classes,
+        blank,
+        config,
+        lm,
+        lexicon,
+        charset,
     );
     if beam.is_empty() {
         ctc_greedy_decode(log_probs, time_steps, num_classes, blank)

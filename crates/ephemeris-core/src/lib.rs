@@ -46,13 +46,13 @@ pub fn init_tracing() {
 #[cfg(feature = "caldav")]
 pub mod caldav;
 pub mod calendar_cache;
+pub mod line_htr;
 pub mod markdown_tasks;
 pub mod note_search;
 pub mod obsidian;
 pub mod pdf_export;
 pub mod prioritizer;
 pub mod profile_manager;
-pub mod line_htr;
 pub mod stroke_htr;
 pub mod stroke_persistence;
 pub mod task_cache;
@@ -66,6 +66,10 @@ pub use aggregation::AggregationService;
 #[cfg(feature = "caldav")]
 pub use caldav::{default_sync_window, CalDavCalendar, CalDavClient, CalDavConfig};
 pub use calendar_cache::CalendarCache;
+pub use line_htr::{
+    prepare_line_htr_input, split_ink_line_bands, ImageLineBand, LineHtrInput, DE_HTR_V2_ALPHABET,
+    LINE_HTR_HEIGHT, LINE_HTR_MAX_WIDTH,
+};
 pub use markdown_tasks::{MarkdownTaskExtractor, DEFAULT_TASKS_INBOX};
 pub use note_search::{
     markdown_to_blocks, markdown_to_plain, search_events, search_local_notes, search_tasks,
@@ -76,10 +80,6 @@ pub use pdf_export::{
     raster_export_hash, PdfExportOptions, RasterPage,
 };
 pub use prioritizer::{rank_tasks, task_score};
-pub use line_htr::{
-    prepare_line_htr_input, split_ink_line_bands, DE_HTR_V2_ALPHABET, ImageLineBand, LineHtrInput,
-    LINE_HTR_HEIGHT, LINE_HTR_MAX_WIDTH,
-};
 pub use stroke_htr::{
     ctc_decode_with_lm, ctc_greedy_decode, ctc_prefix_beam_decode, decode_charset,
     default_htr_language_context, default_line_gap, featurize_line, group_strokes_into_lines,
