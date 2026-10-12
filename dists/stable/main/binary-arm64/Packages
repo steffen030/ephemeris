@@ -146,3 +146,27 @@ Description: Ephemeris — e-ink planner and note-taking app
  (model downloaded from Settings). Handwriting OCR uses the system
  Tesseract packages listed under Depends.
 
+Package: ephemeris
+Version: 0.1.8
+Architecture: arm64
+Maintainer: Steffen Galan <steffen.galan@gmail.com>
+Installed-Size: 45640
+Depends: libxkbcommon0, libwayland-client0, tesseract-ocr, tesseract-ocr-eng
+Recommends: tesseract-ocr-deu
+Filename: pool/main/e/ephemeris/ephemeris_0.1.8_arm64.deb
+Size: 12829320
+MD5sum: f5e97daf7d91bed6d2624ea4d5c6f413
+SHA1: 4a4b648c9063d565f36fbb558d8cf16f48ae5eaf
+SHA256: e28c91f0dddd6893a7f44746403f8577d1cf68645938a891a056371c4e35d822
+Section: utils
+Priority: optional
+Homepage: https://github.com/steffen030/ephemeris
+Description: Ephemeris — e-ink planner and note-taking app
+ Ephemeris is a planner and note-taking application focused on e-ink
+ devices with pens (e.g. PineNote). It manages profiles, calendars,
+ tasks, and handwritten notes.
+ .
+ This package bundles whisper-cli for on-device voice transcription
+ (model downloaded from Settings). Handwriting OCR uses the system
+ Tesseract packages listed under Depends.
+
