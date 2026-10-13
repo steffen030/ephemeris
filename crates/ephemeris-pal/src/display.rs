@@ -766,6 +766,7 @@ mod tests {
                 ly0: 0,
                 lw_span: 2,
                 lh_span: 2,
+                filter: ScaleFilter::Bilinear,
             },
         );
         let gray = |px: u32| (sb[px as usize] & 0xff) as u8;
