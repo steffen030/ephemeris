@@ -836,10 +836,14 @@ export component EphemerisPage inherits Window {
     callback connection-toggle-aggregated(int);    // index
     callback connection-cycle-profile(int);        // retained for API compat; unused in new UI
 
-    // ── Swipe detection ──────────────────────────────────────────────────
+    // ── Page-flip swipe detection (finger/mouse; pen gated in app) ────────
+    // Book-style edge turns only — not full-canvas scrubbing:
+    //   right border → left into page  → swipe-left  (next / create)
+    //   left border  → right into page → swipe-right (previous)
     private property <float> swipe-start-x: 0;
     private property <float> swipe-start-y: 0;
     private property <float> swipe-threshold: 50;
+    private property <float> page-swipe-edge: 48;
 
     callback canvas-touch(float, float);
     callback swipe-left();
@@ -863,6 +867,7 @@ export component EphemerisPage inherits Window {
                     root.swipe-start-y = self.mouse-y / 1px;
                     root.canvas-touch(self.mouse-x / 1px, self.mouse-y / 1px);
                 } else if (event.kind == PointerEventKind.up) {
+                    // Swipe math in floats (Slint TouchArea coords are lengths).
                     if (
                         (self.mouse-x / 1px - root.swipe-start-x >= root.swipe-threshold ||
                          root.swipe-start-x - self.mouse-x / 1px >= root.swipe-threshold) &&
@@ -870,9 +875,15 @@ export component EphemerisPage inherits Window {
                          (self.mouse-y / 1px - root.swipe-start-y) * (self.mouse-y / 1px - root.swipe-start-y))
                     ) {
                         if (self.mouse-x / 1px > root.swipe-start-x) {
-                            root.swipe-right();
+                            // Finger moved right: only from left border.
+                            if (root.swipe-start-x <= root.page-swipe-edge) {
+                                root.swipe-right();
+                            }
                         } else {
-                            root.swipe-left();
+                            // Finger moved left: only from right border.
+                            if (root.swipe-start-x >= parent.width / 1px - root.page-swipe-edge) {
+                                root.swipe-left();
+                            }
                         }
                     }
                 }
@@ -3074,6 +3085,28 @@ export component EphemerisPage inherits Window {
             }
         }
 
+    }
+
+    // Page X/Y — visible only while the note burger menu is open.
+    note-page-indicator := Rectangle {
+        visible: root.drawing-menu-open && root.is-canvas-context;
+        x: parent.width - 100px;
+        y: parent.height - 40px;
+        width: 90px;
+        height: 28px;
+        background: EinkTheme.chrome-bg;
+        border-width: 1px;
+        border-color: EinkTheme.chrome-border;
+        border-radius: 4px;
+        Text {
+            text: "\{root.page-index}/\{root.page-count}";
+            font-size: 13px;
+            color: EinkTheme.btn-fg;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            width: parent.width;
+            height: parent.height;
+        }
     }
 
     // See-text: first-class reading view for OCR / transcribed note text.
@@ -7598,17 +7631,19 @@ export component EphemerisPage inherits Window {
 
     // ── Drawing mode burger button (top-right corner) ─────────────────────
     // On top of everything (last in z-order); only visible when canvas is active.
+    // Closed state uses a filled chrome chip (not a faint outline) so it stays
+    // readable on PineNote / e-ink where 0.3 opacity washes out.
     drawing-burger := Rectangle {
         visible: root.is-canvas-context;
         x: parent.width - 52px;
         y: 8px;
         width: 44px;
         height: 44px;
-        background: root.drawing-menu-open ? EinkTheme.btn-active-bg : transparent;
+        background: root.drawing-menu-open ? EinkTheme.btn-active-bg : EinkTheme.chrome-bg;
         border-radius: 22px;
-        border-width: root.drawing-menu-open ? 2px : 1px;
-        border-color: root.drawing-menu-open ? EinkTheme.btn-border : EinkTheme.text-secondary;
-        opacity: root.drawing-menu-open ? 1.0 : 0.3;
+        border-width: 2px;
+        border-color: EinkTheme.btn-border;
+        opacity: 1.0;
 
         Text {
             text: root.drawing-menu-open ? Icons.close : Icons.menu;

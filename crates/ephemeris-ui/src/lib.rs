@@ -60,7 +60,8 @@
 //! implementation all pages live in memory.
 //!
 //! Swipe gestures in the `.slint` UI fire `swipe-left` / `swipe-right`
-//! callbacks.  Wire them to [`EphemerisUi::prev_page`] / [`EphemerisUi::next_page`]
+//! callbacks from book-style edge turns (right→left = next, left→right =
+//! previous).  Wire them to [`EphemerisUi::next_page`] / [`EphemerisUi::prev_page`]
 //! from the application layer, or use the convenience method
 //! [`EphemerisUi::wire_swipe_navigation`].
 //!
@@ -288,12 +289,20 @@ const BURGER_H: u32 = 44;
 const BURGER_RIGHT_PAD: u32 = 8; // parent.width - 52
 const BURGER_Y: u32 = 8;
 
+/// Bottom-right page X/Y chip (`note-page-indicator` in `main.slint`).
+const PAGE_INDICATOR_W: u32 = 90;
+const PAGE_INDICATOR_H: u32 = 28;
+const PAGE_INDICATOR_RIGHT_PAD: u32 = 10; // parent.width - 100
+const PAGE_INDICATOR_BOTTOM_PAD: u32 = 12; // parent.height - 40
+
 /// Copy pre-ink Slint luma back over opaque chrome so `min()` ink blend does
 /// not bleed through the nav rail, drawing menu, or burger button.
 fn restore_chrome_rects(buf: &mut PixelBuf, pre_ink: &[u8], width: u32, height: u32) {
     let stride = width as usize;
     let menu_x = width.saturating_sub(DRAWING_MENU_W + DRAWING_MENU_RIGHT_PAD);
     let burger_x = width.saturating_sub(BURGER_W + BURGER_RIGHT_PAD);
+    let page_x = width.saturating_sub(PAGE_INDICATOR_W + PAGE_INDICATOR_RIGHT_PAD);
+    let page_y = height.saturating_sub(PAGE_INDICATOR_H + PAGE_INDICATOR_BOTTOM_PAD);
 
     let rects = [
         // Nav rail (full height).
@@ -311,6 +320,13 @@ fn restore_chrome_rects(buf: &mut PixelBuf, pre_ink: &[u8], width: u32, height: 
             BURGER_Y.min(height),
             BURGER_W.min(width.saturating_sub(burger_x)),
             BURGER_H.min(height.saturating_sub(BURGER_Y)),
+        ),
+        // Page X/Y indicator (menu-open only; harmless when absent).
+        (
+            page_x,
+            page_y,
+            PAGE_INDICATOR_W.min(width.saturating_sub(page_x)),
+            PAGE_INDICATOR_H.min(height.saturating_sub(page_y)),
         ),
     ];
 
@@ -2365,7 +2381,8 @@ impl EphemerisUi {
     }
 
     /// Wire the `.slint` `swipe-left` / `swipe-right` callbacks to
-    /// [`prev_page`] / [`next_page`] respectively, using a shared `Rc<Self>`.
+    /// [`next_page`] / [`prev_page`] respectively (book-style edge turns),
+    /// using a shared `Rc<Self>`.
     ///
     /// This is a convenience helper; you can also call [`on_swipe_left`] /
     /// [`on_swipe_right`] manually if you need custom logic between gestures.
@@ -2377,12 +2394,12 @@ impl EphemerisUi {
     pub fn wire_swipe_navigation(ui: Rc<Self>) {
         let ui_left = ui.clone();
         ui.on_swipe_left(move || {
-            ui_left.prev_page();
+            ui_left.next_page();
         });
 
         let ui_right = ui.clone();
         ui.on_swipe_right(move || {
-            ui_right.next_page();
+            ui_right.prev_page();
         });
     }
 
@@ -3705,24 +3722,20 @@ mod tests {
     }
 
     /// swipe-left callback emitted from `.slint` wires correctly to
-    /// `prev_page` via `wire_swipe_navigation`.
+    /// `next_page` via `wire_swipe_navigation` (right-edge → left = next).
     #[test]
-    fn swipe_left_callback_wires_to_prev_page() {
+    fn swipe_left_callback_wires_to_next_page() {
         let ui = Rc::new(EphemerisUi::new(800, 600).expect("UI construction failed"));
-
-        // Create two pages so we have somewhere to go back from.
-        ui.next_page();
-        assert_eq!(ui.current_page_index(), (2, 2));
 
         EphemerisUi::wire_swipe_navigation(ui.clone());
 
-        // Simulate the `.slint` swipe-left callback firing.
+        // Simulate the `.slint` swipe-left callback firing — auto-creates page.
         ui.component.invoke_swipe_left();
 
         assert_eq!(
             ui.current_page_index(),
-            (1, 2),
-            "swipe-left must call prev_page"
+            (2, 2),
+            "swipe-left must call next_page (auto-create)"
         );
     }
 
@@ -3790,20 +3803,24 @@ mod tests {
     }
 
     /// `swipe-right` callback emitted from `.slint` wires correctly to
-    /// `next_page` via `wire_swipe_navigation`.
+    /// `prev_page` via `wire_swipe_navigation` (left-edge → right = previous).
     #[test]
-    fn swipe_right_callback_wires_to_next_page() {
+    fn swipe_right_callback_wires_to_prev_page() {
         let ui = Rc::new(EphemerisUi::new(800, 600).expect("UI construction failed"));
+
+        // Create two pages so we have somewhere to go back from.
+        ui.next_page();
+        assert_eq!(ui.current_page_index(), (2, 2));
 
         EphemerisUi::wire_swipe_navigation(ui.clone());
 
-        // Simulate the `.slint` swipe-right callback firing — auto-creates page.
+        // Simulate the `.slint` swipe-right callback firing.
         ui.component.invoke_swipe_right();
 
         assert_eq!(
             ui.current_page_index(),
-            (2, 2),
-            "swipe-right must call next_page (auto-create)"
+            (1, 2),
+            "swipe-right must call prev_page"
         );
     }
 
