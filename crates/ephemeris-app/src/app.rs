@@ -3345,7 +3345,9 @@ impl App {
             });
         }
 
-        // ── In-note page swipe: pull right = next/create, pull left = previous ─
+        // ── In-note page flip (finger/mouse only; Slint edge-gates the start) ─
+        // Book-style: right border → left (swipe-left) = next/create;
+        // left border → right (swipe-right) = previous when it exists.
         {
             let ui_rc = ui.clone();
             let ui2 = ui.clone_component();
@@ -3357,7 +3359,7 @@ impl App {
             let cfg2 = config.clone();
             let swipe_ok = page_swipe_allowed.clone();
             let swipe_done = page_swipe_handled.clone();
-            ui.on_swipe_right(move || {
+            ui.on_swipe_left(move || {
                 if !swipe_ok.get() || !ui_rc.is_canvas_active() {
                     return;
                 }
@@ -3394,7 +3396,7 @@ impl App {
             let cfg2 = config.clone();
             let swipe_ok = page_swipe_allowed.clone();
             let swipe_done = page_swipe_handled.clone();
-            ui.on_swipe_left(move || {
+            ui.on_swipe_right(move || {
                 if !swipe_ok.get() || !ui_rc.is_canvas_active() {
                     return;
                 }
