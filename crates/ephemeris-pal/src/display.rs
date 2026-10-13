@@ -170,6 +170,10 @@ pub struct DesktopWindow {
     /// Transparent 1×1 cursor — `set_cursor_visible(false)` alone is unreliable
     /// on Wayland/Phosh when the stylus is mirrored as a pointer.
     blank_cursor: winit::window::CustomCursor,
+    /// Hides Mutter's tablet-tool cursor via `zwp_tablet_tool_v2.set_cursor`
+    /// on winit's `wl_display` (Linux + `wayland` feature). Evdev stays the
+    /// ink source; this queue only clears the compositor cursor sprite.
+    tablet_cursor: Option<crate::input::TabletCursorHider>,
 }
 
 impl DesktopWindow {
@@ -222,6 +226,17 @@ impl DesktopWindow {
         window.set_cursor(blank_cursor.clone());
         window.set_cursor_visible(false);
 
+        let tablet_cursor = match crate::input::TabletCursorHider::new(window.as_ref()) {
+            Ok(h) => {
+                log::info!("tablet cursor hider active (zwp_tablet_tool_v2.set_cursor)");
+                Some(h)
+            }
+            Err(e) => {
+                log::debug!("tablet cursor hider unavailable: {e}");
+                None
+            }
+        };
+
         let ctx = softbuffer::Context::new(window.clone())
             .map_err(|e| DisplayError::init(e.to_string()))?;
 
@@ -245,6 +260,7 @@ impl DesktopWindow {
             width,
             height,
             blank_cursor,
+            tablet_cursor,
         })
     }
 
@@ -328,9 +344,20 @@ impl DesktopWindow {
     }
 
     /// Hide the OS pointer (pen-first note canvas). Safe to call repeatedly.
+    ///
+    /// Affects the `wl_pointer` / mouse cursor only. On PineNote the stylus
+    /// cursor is cleared by [`Self::poll_tablet_cursor`] via tablet_v2.
     pub fn hide_cursor(&self) {
         self.window.set_cursor(self.blank_cursor.clone());
         self.window.set_cursor_visible(false);
+    }
+
+    /// Dispatch pending `zwp_tablet_tool_v2` events and hide the tool cursor
+    /// on proximity. Call from the winit `about_to_wait` hook.
+    pub fn poll_tablet_cursor(&mut self) {
+        if let Some(h) = &mut self.tablet_cursor {
+            h.poll();
+        }
     }
 
     /// Returns the window's current scale factor (physical / logical pixels).

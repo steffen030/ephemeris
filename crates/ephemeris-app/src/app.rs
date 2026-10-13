@@ -5421,17 +5421,12 @@ impl WinitHandler {
                 // Do not persist mid-stroke / mid-erase — sync disk I/O on every
                 // sample freezes PineNote. Persist on pointer release only.
             }
-            if let Some(d) = &self.display {
-                d.hide_cursor();
-            }
             self.request_redraw_coalesced();
-        } else if let Some(d) = &self.display {
-            // Keep OS cursor hidden over the note canvas (macOS / Wayland re-show).
-            if self.ui.is_canvas_active() {
-                d.hide_cursor();
-            }
+        } else {
             // Idle moves over a static note canvas: skip redraw wake (eink).
             // Overlays / chrome swipe / peek still need Slint frames.
+            // Stylus cursor is cleared by DesktopWindow::poll_tablet_cursor
+            // (tablet_v2); wl_pointer hide stays on focus/startup.
             let need = self.chrome_peeking
                 || self.chrome_swipe_start.is_some()
                 || !self.ui.is_canvas_active()
@@ -5500,9 +5495,6 @@ impl WinitHandler {
         {
             self.is_drawing = true;
             self.last_ink_pressure = pressure.max(0.05);
-            if let Some(d) = &self.display {
-                d.hide_cursor();
-            }
             let cy = ly - STATUS_BAR_H as f32;
             self.ui.feed_input(
                 &InputEvent::PenDown(PenSample {
@@ -5660,9 +5652,6 @@ impl WinitHandler {
                 }
                 InputEvent::Hover { x, y } => {
                     self.cursor_pos = (x, y);
-                    if let Some(d) = &self.display {
-                        d.hide_cursor();
-                    }
                     self.ui.dispatch_pointer_moved(x, y);
                 }
                 _ => {}
@@ -5684,6 +5673,11 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         #[cfg(target_os = "linux")]
         self.drain_pen_events();
+        // Hide Mutter tablet-tool cursor (zwp_tablet_tool_v2.set_cursor on
+        // winit's wl_display). Must run on the same connection as the window.
+        if let Some(d) = &mut self.display {
+            d.poll_tablet_cursor();
+        }
         // Kiosk watchdog: re-cover the output unless we're peeking the panel.
         // Skip while drawing — enter_kiosk/resize resets softbuffer age→0 and
         // forces a full-panel rewrite mid-stroke (PineNote force-quit).

@@ -25,6 +25,7 @@
 pub mod mock;
 pub mod palm;
 pub mod stylus_map;
+pub mod tablet_cursor;
 pub mod wayland;
 
 #[cfg(target_os = "linux")]
@@ -32,6 +33,7 @@ pub mod evdev_pen;
 
 pub use palm::{PalmRejector, PalmRejectorConfig};
 pub use stylus_map::{digitizer_to_window, orient_axes, window_to_ui};
+pub use tablet_cursor::TabletCursorHider;
 pub use wayland::WaylandInput;
 
 #[cfg(target_os = "linux")]
