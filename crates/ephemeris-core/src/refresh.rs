@@ -160,9 +160,12 @@ impl RefreshScheduler {
         if source == DamageSource::ScreenChange {
             return RefreshMode::Clear;
         }
-        // Periodic full flush: this frame would be the Nth fast/partial.
+        // Defer periodic Full while live ink is flowing — a full softbuffer
+        // rewrite mid-stroke freezes drawing (esp. PineNote / HiDPI). The
+        // since_full counter still advances so the next UI/idle frame clears
+        // ghosting promptly after the pen lifts.
         let interval = self.config.full_refresh_interval;
-        if interval != 0 && self.since_full + 1 >= interval {
+        if source != DamageSource::Ink && interval != 0 && self.since_full + 1 >= interval {
             return RefreshMode::Full;
         }
         match source {
@@ -308,7 +311,8 @@ mod tests {
 
         let mut seq = Vec::new();
         for _ in 0..9 {
-            sched.submit(Rect::new(0, 0, 4, 4), DamageSource::Ink);
+            // UI frames (not ink) take the periodic Full — ink stays Fast.
+            sched.submit(Rect::new(0, 0, 4, 4), DamageSource::Ui);
             seq.push(sched.flush().unwrap().mode);
         }
 
@@ -316,17 +320,33 @@ mod tests {
         assert_eq!(
             seq,
             vec![
-                RefreshMode::Fast,
-                RefreshMode::Fast,
-                RefreshMode::Fast,
+                RefreshMode::Partial,
+                RefreshMode::Partial,
+                RefreshMode::Partial,
                 RefreshMode::Full,
-                RefreshMode::Fast,
-                RefreshMode::Fast,
-                RefreshMode::Fast,
+                RefreshMode::Partial,
+                RefreshMode::Partial,
+                RefreshMode::Partial,
                 RefreshMode::Full,
-                RefreshMode::Fast,
+                RefreshMode::Partial,
             ]
         );
+    }
+
+    #[test]
+    fn ink_never_gets_periodic_full() {
+        let cfg = RefreshConfig {
+            full_refresh_interval: 4,
+            ..RefreshConfig::default()
+        };
+        let mut sched = RefreshScheduler::new(cfg);
+        for _ in 0..20 {
+            sched.submit(Rect::new(0, 0, 4, 4), DamageSource::Ink);
+            assert_eq!(modes(&sched.flush()), Some(RefreshMode::Fast));
+        }
+        // Counter advanced; the next UI frame should Full immediately.
+        sched.submit(Rect::new(0, 0, 40, 40), DamageSource::Ui);
+        assert_eq!(modes(&sched.flush()), Some(RefreshMode::Full));
     }
 
     #[test]

@@ -95,10 +95,13 @@ sudo usermod -aG input "$USER"
 # log out and back in, then relaunch Ephemeris
 ```
 
-Optional: `EPHEMERIS_SIZE=WxH` overrides the design UI resolution (default
-`800x1067`, upscaled to the panel). `EPHEMERIS_GRAB_PEN=1` takes exclusive
-evdev grab of the digitiser. `EPHEMERIS_WINDOWED=1` disables borderless
-fullscreen (decorated maximized window — useful on a desktop monitor).
+Optional: `EPHEMERIS_SIZE=WxH` overrides the design UI resolution. Linux kiosk
+defaults to `1404x1872` (1:1 with the PineNote panel — half-res bilinear
+upscale freezes ink on RK3566). Desktop/windowed defaults to `800x1067`.
+`EPHEMERIS_GRAB_PEN=1` takes exclusive evdev grab of the digitiser.
+`EPHEMERIS_WINDOWED=1` disables borderless fullscreen (decorated maximized
+window — useful on a desktop monitor). `EPHEMERIS_INK_TRACE=1` logs each
+softbuffer present (mode, 1:1 vs bilinear, timing) for ink latency debugging.
 
 The public keyring also lives in-tree at
 [`packaging/keys/`](packaging/keys/). Full release and packaging notes:
