@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.12](https://github.com/steffen030/ephemeris/compare/v0.1.11...v0.1.12) (2026-10-13)
+
+
+### Bug Fixes
+
+* stop PineNote ink force-quit and improve stroke present ([#32](https://github.com/steffen030/ephemeris/issues/32)) ([35e419b](https://github.com/steffen030/ephemeris/commit/35e419b384ab8a420edc59fc86b72995b90d34c3))
+
 ## [0.1.11](https://github.com/steffen030/ephemeris/compare/v0.1.10...v0.1.11) (2026-10-13)
 
 
