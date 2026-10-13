@@ -1324,14 +1324,14 @@ pub fn parse_tesseract_tsv(tsv: &str) -> Vec<TextSpan> {
     spans
 }
 
-/// Join recognised spans into multi-line plain text (reading order).
+/// Group recognised spans into reading-order lines (top-to-bottom, left-to-right).
 ///
 /// Prefer Tesseract `line` indices when present; otherwise cluster by `y`
-/// using a fraction of median span height. Within a line, join with spaces.
-pub fn spans_to_multiline_text(spans: &[TextSpan]) -> String {
+/// using a fraction of median span height. Spans with blank text are dropped.
+pub fn group_spans_into_lines(spans: &[TextSpan]) -> Vec<Vec<TextSpan>> {
     let nonempty: Vec<&TextSpan> = spans.iter().filter(|s| !s.text.trim().is_empty()).collect();
     if nonempty.is_empty() {
-        return String::new();
+        return Vec::new();
     }
 
     let use_line_idx = nonempty.iter().all(|s| s.line >= 0);
@@ -1342,23 +1342,22 @@ pub fn spans_to_multiline_text(spans: &[TextSpan]) -> String {
                 .cmp(&b.line)
                 .then(a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal))
         });
-        let mut lines: Vec<String> = Vec::new();
+        let mut lines: Vec<Vec<TextSpan>> = Vec::new();
         let mut cur_line = order[0].line;
-        let mut words: Vec<&str> = Vec::new();
+        let mut cur: Vec<TextSpan> = Vec::new();
         for s in order {
             if s.line != cur_line {
-                if !words.is_empty() {
-                    lines.push(words.join(" "));
-                    words.clear();
+                if !cur.is_empty() {
+                    lines.push(std::mem::take(&mut cur));
                 }
                 cur_line = s.line;
             }
-            words.push(s.text.trim());
+            cur.push(s.clone());
         }
-        if !words.is_empty() {
-            lines.push(words.join(" "));
+        if !cur.is_empty() {
+            lines.push(cur);
         }
-        return lines.join("\n");
+        return lines;
     }
 
     order.sort_by(|a, b| {
@@ -1371,21 +1370,37 @@ pub fn spans_to_multiline_text(spans: &[TextSpan]) -> String {
     let median_h = heights[heights.len() / 2];
     let thresh = (median_h * 0.55).max(8.0);
 
-    let mut lines: Vec<String> = Vec::new();
-    let mut words: Vec<&str> = Vec::new();
+    let mut lines: Vec<Vec<TextSpan>> = Vec::new();
+    let mut cur: Vec<TextSpan> = Vec::new();
     let mut line_y = order[0].y;
     for s in order {
-        if (s.y - line_y).abs() > thresh && !words.is_empty() {
-            lines.push(words.join(" "));
-            words.clear();
+        if (s.y - line_y).abs() > thresh && !cur.is_empty() {
+            lines.push(std::mem::take(&mut cur));
             line_y = s.y;
         }
-        words.push(s.text.trim());
+        cur.push(s.clone());
     }
-    if !words.is_empty() {
-        lines.push(words.join(" "));
+    if !cur.is_empty() {
+        lines.push(cur);
     }
-    lines.join("\n")
+    lines
+}
+
+/// Join recognised spans into multi-line plain text (reading order).
+///
+/// Lines come from [`group_spans_into_lines`]; within a line, words are
+/// joined with spaces.
+pub fn spans_to_multiline_text(spans: &[TextSpan]) -> String {
+    group_spans_into_lines(spans)
+        .iter()
+        .map(|line| {
+            line.iter()
+                .map(|s| s.text.trim())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(feature = "ocr")]
@@ -1410,8 +1425,9 @@ fn write_pgm(path: &Path, width: u32, height: u32, gray8: &[u8]) -> crate::Resul
     Ok(())
 }
 
-/// Simple stroke → gray8 raster for the stroke-based [`Transcriber`] path.
-fn rasterize_strokes(strokes: &[Stroke]) -> (u32, u32, Vec<u8>) {
+/// Simple stroke → gray8 raster for the stroke-based [`Transcriber`] path
+/// (also used by `htr-eval`, which has no screen raster).
+pub fn rasterize_strokes(strokes: &[Stroke]) -> (u32, u32, Vec<u8>) {
     let mut min_x = f32::MAX;
     let mut min_y = f32::MAX;
     let mut max_x = f32::MIN;

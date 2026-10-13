@@ -52,6 +52,7 @@ pub fn init_tracing() {
 #[cfg(feature = "caldav")]
 pub mod caldav;
 pub mod calendar_cache;
+pub mod htr_eval;
 pub mod line_htr;
 pub mod markdown_tasks;
 pub mod note_search;

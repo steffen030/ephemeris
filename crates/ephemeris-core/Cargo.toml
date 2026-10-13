@@ -28,6 +28,11 @@ ocr = []
 # downloaded at runtime (Settings); CI can omit this feature.
 htr = ["dep:rten", "dep:rten-tensor"]
 
+[[bin]]
+name = "htr-eval"
+path = "src/bin/htr-eval.rs"
+required-features = ["htr"]
+
 [dependencies]
 ephemeris-pal = { workspace = true }
 rusqlite = { workspace = true }
