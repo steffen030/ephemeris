@@ -249,10 +249,18 @@ impl InkEngine {
             },
             InputEvent::PenUp(s) => match self.active.take() {
                 Some(mut b) => {
-                    // Tip sample updates total_damage; Finished must damage the
-                    // whole stroke so the smoothed committed raster presents
-                    // (tip-only left raw in-progress pixels on screen).
-                    let _ = b.push_sample(s, t_ms, true);
+                    // Tip-up often reports pressure 0 — if we store that, Catmull
+                    // interpolates width to a needle tip. Hold last contact
+                    // pressure while anchoring the lift position.
+                    let mut tip = s.clone();
+                    if tip.pressure < 0.05 {
+                        if let Some(prev) = b.points.last() {
+                            tip.pressure = prev.pressure;
+                        } else {
+                            tip.pressure = 0.5;
+                        }
+                    }
+                    let _ = b.push_sample(&tip, t_ms, true);
                     let sample_union = b.total_damage;
                     let stroke = b.finish(self.cfg.spline_segments);
                     let damage = finished_stroke_damage(sample_union, &stroke);
@@ -482,6 +490,31 @@ mod tests {
                 && damage.max_y >= need.max_y - 1e-3,
             "Finished damage {damage:?} must cover stroke bbox {need:?}"
         );
+    }
+
+    #[test]
+    fn pen_up_zero_pressure_keeps_tip_width() {
+        // Tip-up with pressure 0 must not write a needle endpoint.
+        let mut engine = InkEngine::new(InkConfig::default());
+        assert!(matches!(
+            engine.update_now(&InputEvent::PenDown(sample(0.0, 0.0, 0.7))),
+            InkUpdate::Started
+        ));
+        assert!(matches!(
+            engine.update_now(&InputEvent::PenMove(sample(20.0, 0.0, 0.7))),
+            InkUpdate::Extended { .. }
+        ));
+        match engine.update_now(&InputEvent::PenUp(sample(40.0, 0.0, 0.0))) {
+            InkUpdate::Finished { stroke, .. } => {
+                let tip = stroke.points.last().unwrap();
+                assert!(
+                    tip.pressure >= 0.5,
+                    "tip pressure {} must hold contact width, not collapse",
+                    tip.pressure
+                );
+            }
+            other => panic!("expected Finished, got {other:?}"),
+        }
     }
 
     #[test]
