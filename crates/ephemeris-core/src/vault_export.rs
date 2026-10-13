@@ -1,22 +1,27 @@
 //! Export Ephemeris notes into an Obsidian vault subfolder (ADR ephemeris-mry).
 //!
-//! Layout: `{vault}/{export_subdir}/{Notebook}/{…}/{Note}.md`
-//! Unfiled notes use the `notes` segment (e.g. `{export_subdir}/notes/{Note}.md`).
-//! Nested notebooks become nested directories. Optional PDF sibling `{Note}.pdf`
-//! is linked from the markdown when present.
+//! Layout: `{vault}/{export_subdir}/Notes/{Notebook}/{…}/{Note}.md`
+//! Unfiled notes: `{export_subdir}/Notes/{Note}.md` (empty notebook segments).
+//! Nested Ephemeris notebooks become nested directories *under* `Notes/`, never
+//! beside it. Optional PDF sibling `{Note}.pdf` is linked from the markdown
+//! when present.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Default vault-relative export root (notebooks live under this).
+/// Default vault-relative export root (`Notes/` lives under this).
 pub const DEFAULT_EXPORT_SUBDIR: &str = "Ephemeris";
+
+/// Folder under the export root that holds all note markdown/PDF exports.
+pub const NOTES_EXPORT_FOLDER: &str = "Notes";
 
 /// Payload for writing one note into the vault.
 #[derive(Debug, Clone)]
 pub struct VaultNoteExport {
     /// Display path for frontmatter (e.g. `"Work / Ideas"`).
     pub notebook_title: String,
-    /// Sanitized folder segments under the export root (nested hierarchy).
+    /// Sanitized notebook folder segments under `{export_subdir}/Notes/`
+    /// (empty = unfiled, file lives directly in `Notes/`).
     pub notebook_segments: Vec<String>,
     pub note_title: String,
     pub note_id: u32,
@@ -27,25 +32,26 @@ pub struct VaultNoteExport {
     pub pdf_vault_rel: Option<String>,
 }
 
-/// Absolute directory for a note's notebook under the export root.
+/// Absolute directory for a note under `{export_subdir}/Notes/{segments…}`.
 pub fn notebook_export_dir(
     vault_path: &Path,
     export_subdir: &Path,
     segments: &[String],
 ) -> PathBuf {
-    let mut dir = vault_path.join(export_subdir);
+    let mut dir = vault_path.join(export_subdir).join(NOTES_EXPORT_FOLDER);
     for seg in segments {
         dir.push(seg);
     }
     dir
 }
 
-/// Vault-relative path (`/` separators) for a file under the notebook dir.
+/// Vault-relative path (`/` separators) for a file under the Notes tree.
 pub fn notebook_export_rel(export_subdir: &Path, segments: &[String], file_name: &str) -> String {
     let mut parts: Vec<String> = Vec::new();
     for c in export_subdir.components() {
         parts.push(c.as_os_str().to_string_lossy().into_owned());
     }
+    parts.push(NOTES_EXPORT_FOLDER.to_string());
     for seg in segments {
         parts.push(seg.clone());
     }
@@ -61,12 +67,7 @@ pub fn export_note_markdown(
     export_subdir: &Path,
     note: &VaultNoteExport,
 ) -> crate::Result<PathBuf> {
-    let segments = if note.notebook_segments.is_empty() {
-        vec![sanitize_component(&note.notebook_title)]
-    } else {
-        note.notebook_segments.clone()
-    };
-    let dir = notebook_export_dir(vault_path, export_subdir, &segments);
+    let dir = notebook_export_dir(vault_path, export_subdir, &note.notebook_segments);
     fs::create_dir_all(&dir).map_err(crate::AppError::Io)?;
 
     let note_stem = sanitize_component(&note.note_title);
@@ -181,7 +182,7 @@ mod tests {
     }
 
     #[test]
-    fn export_writes_nested_notebook_dirs() {
+    fn export_writes_nested_notebook_dirs_under_notes() {
         let tmp = TempDir::new().unwrap();
         let vault = tmp.path();
         let note = VaultNoteExport {
@@ -194,11 +195,28 @@ mod tests {
             pdf_vault_rel: None,
         };
         let path = export_note_markdown(vault, Path::new("Ephemeris"), &note).unwrap();
-        assert!(path.ends_with("Ephemeris/Work/Ideas/Meeting Notes.md"));
+        assert!(path.ends_with("Ephemeris/Notes/Work/Ideas/Meeting Notes.md"));
         let body = fs::read_to_string(&path).unwrap();
         assert!(body.contains("ephemeris_note_id: 7"));
         assert!(body.contains("Hello from OCR"));
         assert!(body.contains("notebook: \"Work / Ideas\""));
+    }
+
+    #[test]
+    fn export_unfiled_lives_directly_in_notes() {
+        let tmp = TempDir::new().unwrap();
+        let note = VaultNoteExport {
+            notebook_title: "Notes".into(),
+            notebook_segments: vec![],
+            note_title: "Loose".into(),
+            note_id: 3,
+            created_at: 0,
+            text_content: None,
+            pdf_vault_rel: None,
+        };
+        let path = export_note_markdown(tmp.path(), Path::new("Ephemeris"), &note).unwrap();
+        assert!(path.ends_with("Ephemeris/Notes/Loose.md"));
+        assert!(!path.to_string_lossy().contains("Ephemeris/Notes/Notes/"));
     }
 
     #[test]
@@ -211,7 +229,7 @@ mod tests {
             note_id: 1,
             created_at: 0,
             text_content: None,
-            pdf_vault_rel: Some("Ephemeris/N/T.pdf".into()),
+            pdf_vault_rel: Some("Ephemeris/Notes/N/T.pdf".into()),
         };
         let path = export_note_markdown(tmp.path(), Path::new("Ephemeris"), &note).unwrap();
         let body = fs::read_to_string(path).unwrap();
@@ -244,8 +262,20 @@ mod tests {
         ];
         let n = sync_notes_to_vault(tmp.path(), Path::new("Ephemeris"), &notes).unwrap();
         assert_eq!(n, 2);
-        assert!(tmp.path().join("Ephemeris/A/One.md").exists());
-        assert!(tmp.path().join("Ephemeris/B/Two.md").exists());
+        assert!(tmp.path().join("Ephemeris/Notes/A/One.md").exists());
+        assert!(tmp.path().join("Ephemeris/Notes/B/Two.md").exists());
+    }
+
+    #[test]
+    fn notebook_export_rel_includes_notes_folder() {
+        let rel = notebook_export_rel(
+            Path::new("Ephemeris"),
+            &["Work".into(), "Ideas".into()],
+            "n.pdf",
+        );
+        assert_eq!(rel, "Ephemeris/Notes/Work/Ideas/n.pdf");
+        let unfiled = notebook_export_rel(Path::new("Ephemeris"), &[], "loose.md");
+        assert_eq!(unfiled, "Ephemeris/Notes/loose.md");
     }
 
     #[test]

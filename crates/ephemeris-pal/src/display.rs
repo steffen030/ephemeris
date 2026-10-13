@@ -210,6 +210,11 @@ impl DesktopWindow {
             apply_borderless_fullscreen(&window);
         }
 
+        // Pen-first / e-ink: hide the OS pointer. Hover and CursorMoved still
+        // drive Slint hit-testing; a visible cursor tracks the stylus and looks
+        // wrong on the note canvas (and wasted ink on partial refresh).
+        window.set_cursor_visible(false);
+
         let ctx = softbuffer::Context::new(window.clone())
             .map_err(|e| DisplayError::init(e.to_string()))?;
 
@@ -464,8 +469,9 @@ struct SoftbufferBlit {
 /// Copy a logical gray rectangle into the softbuffer XRGB8888 surface.
 ///
 /// When logical and physical sizes match (PineNote design scale 1), this is a
-/// direct 1:1 write. Otherwise each physical pixel samples nearest-neighbour
-/// from the logical buffer (Retina / fractional DPI).
+/// direct 1:1 write. Otherwise each physical pixel is bilinear-sampled from
+/// the logical buffer (Retina / design-scale upscale). Nearest-neighbour made
+/// ink strokes and UI text look blocky at ~1.75× on the PineNote panel.
 fn blit_gray_to_softbuffer(sb: &mut [u32], buf: &PixelBuf, g: SoftbufferBlit) {
     if g.lw_span == 0 || g.lh_span == 0 {
         return;
@@ -490,11 +496,29 @@ fn blit_gray_to_softbuffer(sb: &mut [u32], buf: &PixelBuf, g: SoftbufferBlit) {
     let py0 = g.ly0 * g.phys_h / g.logical_h;
     let px1 = (lx1 * g.phys_w).div_ceil(g.logical_w);
     let py1 = (ly1 * g.phys_h).div_ceil(g.logical_h);
+    let sx = g.logical_w as f32 / g.phys_w as f32;
+    let sy = g.logical_h as f32 / g.phys_h as f32;
+    let max_lx = g.logical_w.saturating_sub(1);
+    let max_ly = g.logical_h.saturating_sub(1);
     for py in py0..py1.min(g.phys_h) {
+        let fy = (py as f32 + 0.5) * sy - 0.5;
+        let y0 = fy.floor().max(0.0) as usize;
+        let y1 = (y0 + 1).min(max_ly);
+        let ty = (fy - y0 as f32).clamp(0.0, 1.0);
+        let row0 = y0 * g.logical_w;
+        let row1 = y1 * g.logical_w;
         for px in px0..px1.min(g.phys_w) {
-            let lx = (px * g.logical_w / g.phys_w).min(g.logical_w - 1);
-            let ly = (py * g.logical_h / g.phys_h).min(g.logical_h - 1);
-            let gray = buf.data.get(ly * g.logical_w + lx).copied().unwrap_or(255) as u32;
+            let fx = (px as f32 + 0.5) * sx - 0.5;
+            let x0 = fx.floor().max(0.0) as usize;
+            let x1 = (x0 + 1).min(max_lx);
+            let tx = (fx - x0 as f32).clamp(0.0, 1.0);
+            let g00 = buf.data.get(row0 + x0).copied().unwrap_or(255) as f32;
+            let g10 = buf.data.get(row0 + x1).copied().unwrap_or(255) as f32;
+            let g01 = buf.data.get(row1 + x0).copied().unwrap_or(255) as f32;
+            let g11 = buf.data.get(row1 + x1).copied().unwrap_or(255) as f32;
+            let top = g00 + (g10 - g00) * tx;
+            let bot = g01 + (g11 - g01) * tx;
+            let gray = (top + (bot - top) * ty).round().clamp(0.0, 255.0) as u32;
             sb[py * g.phys_w + px] = (gray << 16) | (gray << 8) | gray;
         }
     }
@@ -644,5 +668,41 @@ mod tests {
             }
             _ => panic!("expected Present error"),
         }
+    }
+
+    #[test]
+    fn bilinear_upscale_blends_neighbours() {
+        // 2×2 logical → 4×4 physical: centre of the top-left physical
+        // quadrant should sit between black (0,0) and white neighbours.
+        let mut buf = PixelBuf::new(2, 2);
+        buf.set_pixel(0, 0, 0);
+        buf.set_pixel(1, 0, 255);
+        buf.set_pixel(0, 1, 255);
+        buf.set_pixel(1, 1, 255);
+        let mut sb = vec![0u32; 16];
+        blit_gray_to_softbuffer(
+            &mut sb,
+            &buf,
+            SoftbufferBlit {
+                logical_w: 2,
+                logical_h: 2,
+                phys_w: 4,
+                phys_h: 4,
+                lx0: 0,
+                ly0: 0,
+                lw_span: 2,
+                lh_span: 2,
+            },
+        );
+        let gray = |px: u32| (sb[px as usize] & 0xff) as u8;
+        // Exact logical corners stay extreme after upscale.
+        assert_eq!(gray(0), 0);
+        assert_eq!(gray(3), 255);
+        // Interior sample must blend (not snap to 0 or 255 like NN).
+        let mid = gray(5); // physical (1,1)
+        assert!(
+            (1..255).contains(&mid),
+            "expected bilinear blend at (1,1), got {mid}"
+        );
     }
 }
