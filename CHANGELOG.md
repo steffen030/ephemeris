@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.11](https://github.com/steffen030/ephemeris/compare/v0.1.10...v0.1.11) (2026-10-13)
+
+
+### Bug Fixes
+
+* note canvas UX regressions and vault Notes/ export layout ([#30](https://github.com/steffen030/ephemeris/issues/30)) ([53a24bb](https://github.com/steffen030/ephemeris/commit/53a24bb76b8a06352ac5b13f0bb62857310ede09))
+
 ## [0.1.10](https://github.com/steffen030/ephemeris/compare/v0.1.9...v0.1.10) (2026-10-13)
 
 
