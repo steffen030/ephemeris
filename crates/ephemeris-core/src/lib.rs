@@ -103,7 +103,7 @@ pub use transcriber::{
 };
 pub use vault_export::{
     export_note_markdown, notebook_export_dir, notebook_export_rel, path_under_export_subdir,
-    sync_notes_to_vault, VaultNoteExport, DEFAULT_EXPORT_SUBDIR,
+    sync_notes_to_vault, VaultNoteExport, DEFAULT_EXPORT_SUBDIR, NOTES_EXPORT_FOLDER,
 };
 pub use vault_git::{
     commit_and_push as vault_git_commit_and_push, is_git_repo, pull as vault_git_pull,

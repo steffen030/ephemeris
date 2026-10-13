@@ -5765,6 +5765,11 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
                         }
                     }
                     self.ui.request_screen_change();
+                    // Softbuffer path only paints on RedrawRequested — without
+                    // this the overlay stays stuck on "Recognising…".
+                    if let Some(d) = &self.display {
+                        d.request_redraw();
+                    }
                 }
             }
         }
@@ -7199,13 +7204,16 @@ fn notebook_display_path(notebooks: &[AppNotebook], id: u32) -> String {
 }
 
 /// Display title + sanitized path segments for vault note export.
+///
+/// Segments are nested under `{export_subdir}/Notes/` (see
+/// [`ephemeris_core::notebook_export_dir`]). Unfiled notes use an empty
+/// segment list so the file lands directly in `Notes/`.
 fn notebook_export_parts(
     notebooks: &[AppNotebook],
     notebook_id: Option<u32>,
 ) -> (String, Vec<String>) {
     match notebook_id {
-        // Unfiled notes live under `{export_subdir}/notes/…` (not "Root").
-        None => ("Notes".to_string(), vec!["notes".to_string()]),
+        None => ("Notes".to_string(), vec![]),
         Some(id) => {
             let mut parts = Vec::new();
             let mut cur = Some(id);
