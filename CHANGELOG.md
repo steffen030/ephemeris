@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.13](https://github.com/steffen030/ephemeris/compare/v0.1.12...v0.1.13) (2026-10-13)
+
+
+### Bug Fixes
+
+* restore readable PineNote chrome and cheap Fast presents ([#34](https://github.com/steffen030/ephemeris/issues/34)) ([d9220df](https://github.com/steffen030/ephemeris/commit/d9220dfc219990a9cbf7547b6fd5f4ec7f01810f))
+
 ## [0.1.12](https://github.com/steffen030/ephemeris/compare/v0.1.11...v0.1.12) (2026-10-13)
 
 
