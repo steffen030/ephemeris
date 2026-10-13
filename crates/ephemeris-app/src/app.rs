@@ -5104,6 +5104,7 @@ impl App {
             pointer_source: PointerSource::Mouse,
             is_drawing: false,
             redraw_pending: false,
+            last_ink_pressure: 0.5,
             data_dir,
             notes: notes.clone(),
             notebooks: notebooks.clone(),
@@ -5153,12 +5154,12 @@ impl App {
     }
 }
 
-/// Design UI size: `EPHEMERIS_SIZE=WxH`, else panel-native on Linux kiosk.
+/// Design UI size: `EPHEMERIS_SIZE=WxH`, else ~½ PineNote portrait so chrome
+/// upscales to ~1.75× on a 1404×1872 panel (icons/text readable on e-ink).
 ///
-/// PineNote softbuffer presents physical pixels. A half-res logical buffer
-/// (800×1067 → 1404×1872) forces bilinear sampling on every ink present and
-/// freezes RK3566 hard enough for GNOME's force-quit dialog. Prefer 1:1 on
-/// the device; desktop/windowed builds keep the lighter half-res default.
+/// Do **not** default to panel-native 1404×1872 — that makes chrome tiny.
+/// Fast ink presents use nearest-neighbour upscale (see `display.rs`) so the
+/// half-res → panel blit stays cheap enough not to force-quit on RK3566.
 fn probe_window_size() -> (u32, u32) {
     if let Ok(raw) = std::env::var("EPHEMERIS_SIZE") {
         if let Some((w, h)) = raw.split_once('x').or_else(|| raw.split_once('X')) {
@@ -5168,14 +5169,9 @@ fn probe_window_size() -> (u32, u32) {
                 }
             }
         }
-        tracing::warn!("Ignoring invalid EPHEMERIS_SIZE={raw:?} (expected e.g. 1404x1872)");
+        tracing::warn!("Ignoring invalid EPHEMERIS_SIZE={raw:?} (expected e.g. 800x1067)");
     }
-    #[cfg(target_os = "linux")]
-    if kiosk_enabled() {
-        // PineNote portrait panel (physical). Matches softbuffer surface → 1:1 blit.
-        return (1404, 1872);
-    }
-    // Desktop / windowed: half-res portrait aspect for lighter Retina upscale.
+    // Keep PineNote portrait aspect (1404∶1872 ≈ 3∶4).
     (800, 1067)
 }
 
@@ -5216,6 +5212,9 @@ struct WinitHandler {
     /// Wayland `buffer_mut` blocks until the back buffer is released; per-sample
     /// `request_redraw` wedges the UI thread on PineNote (force-quit dialog).
     redraw_pending: bool,
+    /// Last contact pressure while drawing — PenUp often reports 0 and would
+    /// otherwise collapse stroke tip width via Catmull-Rom.
+    last_ink_pressure: f32,
     /// Directory where per-note pixel data is saved.
     data_dir: PathBuf,
     /// Shared note list — used to map page_idx → note_id for persistence.
@@ -5404,6 +5403,9 @@ impl WinitHandler {
             self.ui.dispatch_pointer_moved(lx, ly);
         }
         if self.is_drawing {
+            if pressure > 0.05 {
+                self.last_ink_pressure = pressure;
+            }
             let cy = ly - STATUS_BAR_H as f32;
             if cy >= 0.0 {
                 self.ui.feed_input(
@@ -5419,9 +5421,12 @@ impl WinitHandler {
                 // Do not persist mid-stroke / mid-erase — sync disk I/O on every
                 // sample freezes PineNote. Persist on pointer release only.
             }
+            if let Some(d) = &self.display {
+                d.hide_cursor();
+            }
             self.request_redraw_coalesced();
         } else if let Some(d) = &self.display {
-            // Keep OS cursor hidden over the note canvas (macOS re-shows it).
+            // Keep OS cursor hidden over the note canvas (macOS / Wayland re-show).
             if self.ui.is_canvas_active() {
                 d.hide_cursor();
             }
@@ -5494,6 +5499,7 @@ impl WinitHandler {
             && self.canvas_touch_down.get()
         {
             self.is_drawing = true;
+            self.last_ink_pressure = pressure.max(0.05);
             if let Some(d) = &self.display {
                 d.hide_cursor();
             }
@@ -5602,7 +5608,8 @@ impl WinitHandler {
                 &InputEvent::PenUp(PenSample {
                     x: lx,
                     y: cy,
-                    pressure: 0.0,
+                    // Hold last contact pressure — 0.0 collapses tip width.
+                    pressure: self.last_ink_pressure,
                     tilt: 0.0,
                     in_range: true,
                 }),
@@ -5642,6 +5649,9 @@ impl WinitHandler {
                 }
                 InputEvent::PenUp(s) => {
                     self.pointer_source = PointerSource::Pen;
+                    if s.pressure > 0.05 {
+                        self.last_ink_pressure = s.pressure;
+                    }
                     self.handle_pointer_release(s.x, s.y);
                 }
                 InputEvent::PenButton { pressed } => {
@@ -5650,6 +5660,9 @@ impl WinitHandler {
                 }
                 InputEvent::Hover { x, y } => {
                     self.cursor_pos = (x, y);
+                    if let Some(d) = &self.display {
+                        d.hide_cursor();
+                    }
                     self.ui.dispatch_pointer_moved(x, y);
                 }
                 _ => {}

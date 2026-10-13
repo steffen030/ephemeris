@@ -167,6 +167,9 @@ pub struct DesktopWindow {
     surface: softbuffer::Surface<Arc<winit::window::Window>, Arc<winit::window::Window>>,
     width: u32,
     height: u32,
+    /// Transparent 1×1 cursor — `set_cursor_visible(false)` alone is unreliable
+    /// on Wayland/Phosh when the stylus is mirrored as a pointer.
+    blank_cursor: winit::window::CustomCursor,
 }
 
 impl DesktopWindow {
@@ -210,12 +213,14 @@ impl DesktopWindow {
             apply_borderless_fullscreen(&window);
         }
 
-        // Pen-first / e-ink: hide the OS pointer. Hover and CursorMoved still
-        // drive Slint hit-testing; a visible cursor tracks the stylus and looks
-        // wrong on the note canvas (and wasted ink on partial refresh).
-        // macOS can re-show the cursor after focus changes — re-assert via
-        // [`DesktopWindow::hide_cursor`].
-        hide_os_cursor(&window);
+        // Transparent cursor + visibility hide — Wayland often ignores
+        // set_cursor_visible alone when the digitiser is also a pointer.
+        let blank_cursor = event_loop.create_custom_cursor(
+            winit::window::CustomCursor::from_rgba(vec![0, 0, 0, 0], 1, 1, 0, 0)
+                .map_err(|e| DisplayError::init(e.to_string()))?,
+        );
+        window.set_cursor(blank_cursor.clone());
+        window.set_cursor_visible(false);
 
         let ctx = softbuffer::Context::new(window.clone())
             .map_err(|e| DisplayError::init(e.to_string()))?;
@@ -239,6 +244,7 @@ impl DesktopWindow {
             surface,
             width,
             height,
+            blank_cursor,
         })
     }
 
@@ -323,7 +329,8 @@ impl DesktopWindow {
 
     /// Hide the OS pointer (pen-first note canvas). Safe to call repeatedly.
     pub fn hide_cursor(&self) {
-        hide_os_cursor(&self.window);
+        self.window.set_cursor(self.blank_cursor.clone());
+        self.window.set_cursor_visible(false);
     }
 
     /// Returns the window's current scale factor (physical / logical pixels).
@@ -341,10 +348,6 @@ impl DesktopWindow {
     pub fn logical_size(&self) -> (u32, u32) {
         (self.width, self.height)
     }
-}
-
-fn hide_os_cursor(window: &winit::window::Window) {
-    window.set_cursor_visible(false);
 }
 
 fn apply_borderless_fullscreen(window: &winit::window::Window) {
@@ -390,6 +393,13 @@ impl Display for DesktopWindow {
         let age = sb.age();
         let full =
             matches!(mode, RefreshMode::Full | RefreshMode::Clear) || damage.is_empty() || age == 0;
+        // Fast ink: nearest (cheap). Clear/Full/age0: bilinear (sharp chrome).
+        // Bilinear every Fast damage rect at ~1.75× on 1404×1872 freezes RK3566.
+        let filter = if full || matches!(mode, RefreshMode::Full | RefreshMode::Clear) {
+            ScaleFilter::Bilinear
+        } else {
+            ScaleFilter::Nearest
+        };
         let one_to_one = lw == phys_w && lh == phys_h;
         let ink_trace = std::env::var_os("EPHEMERIS_INK_TRACE").is_some();
         let t0 = if ink_trace {
@@ -411,6 +421,7 @@ impl Display for DesktopWindow {
                     ly0: 0,
                     lw_span: lw,
                     lh_span: lh,
+                    filter,
                 },
             );
             sb.present()
@@ -450,6 +461,7 @@ impl Display for DesktopWindow {
                         ly0: ly0 as usize,
                         lw_span: (lx1 - lx0) as usize,
                         lh_span: (ly1 - ly0) as usize,
+                        filter,
                     },
                 );
                 if let (Some(w), Some(h)) = (NonZeroU32::new(pw), NonZeroU32::new(ph)) {
@@ -480,13 +492,22 @@ impl Display for DesktopWindow {
                     .sum()
             };
             log::info!(
-                "ink_trace present mode={mode:?} full={full} 1:1={one_to_one} age={age} logical={lw}x{lh} phys={phys_w}x{phys_h} damage_px={area} took={:?}",
+                "ink_trace present mode={mode:?} full={full} filter={filter:?} 1:1={one_to_one} age={age} logical={lw}x{lh} phys={phys_w}x{phys_h} damage_px={area} took={:?}",
                 t0.elapsed()
             );
         }
 
         Ok(())
     }
+}
+
+/// Upscale filter when logical UI ≠ physical softbuffer size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScaleFilter {
+    /// Integer sample — cheap enough for live ink on PineNote.
+    Nearest,
+    /// 4-tap — sharp chrome on Clear/Full; too expensive every pen sample.
+    Bilinear,
 }
 
 /// Geometry for copying a logical gray rect into a physical softbuffer surface.
@@ -499,14 +520,13 @@ struct SoftbufferBlit {
     ly0: usize,
     lw_span: usize,
     lh_span: usize,
+    filter: ScaleFilter,
 }
 
 /// Copy a logical gray rectangle into the softbuffer XRGB8888 surface.
 ///
-/// When logical and physical sizes match (PineNote design scale 1), this is a
-/// direct 1:1 write. Otherwise each physical pixel is bilinear-sampled from
-/// the logical buffer (Retina / design-scale upscale). Nearest-neighbour made
-/// ink strokes and UI text look blocky at ~1.75× on the PineNote panel.
+/// When logical and physical sizes match this is a direct 1:1 write. Otherwise
+/// physical pixels are sampled from the logical buffer with [`ScaleFilter`].
 fn blit_gray_to_softbuffer(sb: &mut [u32], buf: &PixelBuf, g: SoftbufferBlit) {
     if g.lw_span == 0 || g.lh_span == 0 {
         return;
@@ -535,26 +555,45 @@ fn blit_gray_to_softbuffer(sb: &mut [u32], buf: &PixelBuf, g: SoftbufferBlit) {
     let sy = g.logical_h as f32 / g.phys_h as f32;
     let max_lx = g.logical_w.saturating_sub(1);
     let max_ly = g.logical_h.saturating_sub(1);
-    for py in py0..py1.min(g.phys_h) {
-        let fy = (py as f32 + 0.5) * sy - 0.5;
-        let y0 = fy.floor().max(0.0) as usize;
-        let y1 = (y0 + 1).min(max_ly);
-        let ty = (fy - y0 as f32).clamp(0.0, 1.0);
-        let row0 = y0 * g.logical_w;
-        let row1 = y1 * g.logical_w;
-        for px in px0..px1.min(g.phys_w) {
-            let fx = (px as f32 + 0.5) * sx - 0.5;
-            let x0 = fx.floor().max(0.0) as usize;
-            let x1 = (x0 + 1).min(max_lx);
-            let tx = (fx - x0 as f32).clamp(0.0, 1.0);
-            let g00 = buf.data.get(row0 + x0).copied().unwrap_or(255) as f32;
-            let g10 = buf.data.get(row0 + x1).copied().unwrap_or(255) as f32;
-            let g01 = buf.data.get(row1 + x0).copied().unwrap_or(255) as f32;
-            let g11 = buf.data.get(row1 + x1).copied().unwrap_or(255) as f32;
-            let top = g00 + (g10 - g00) * tx;
-            let bot = g01 + (g11 - g01) * tx;
-            let gray = (top + (bot - top) * ty).round().clamp(0.0, 255.0) as u32;
-            sb[py * g.phys_w + px] = (gray << 16) | (gray << 8) | gray;
+
+    match g.filter {
+        ScaleFilter::Nearest => {
+            for py in py0..py1.min(g.phys_h) {
+                let ly = ((py as f32 + 0.5) * sy).floor() as usize;
+                let ly = ly.min(max_ly);
+                let row = ly * g.logical_w;
+                let sb_row = py * g.phys_w;
+                for px in px0..px1.min(g.phys_w) {
+                    let lx = ((px as f32 + 0.5) * sx).floor() as usize;
+                    let lx = lx.min(max_lx);
+                    let gray = buf.data.get(row + lx).copied().unwrap_or(255) as u32;
+                    sb[sb_row + px] = (gray << 16) | (gray << 8) | gray;
+                }
+            }
+        }
+        ScaleFilter::Bilinear => {
+            for py in py0..py1.min(g.phys_h) {
+                let fy = (py as f32 + 0.5) * sy - 0.5;
+                let y0 = fy.floor().max(0.0) as usize;
+                let y1 = (y0 + 1).min(max_ly);
+                let ty = (fy - y0 as f32).clamp(0.0, 1.0);
+                let row0 = y0 * g.logical_w;
+                let row1 = y1 * g.logical_w;
+                for px in px0..px1.min(g.phys_w) {
+                    let fx = (px as f32 + 0.5) * sx - 0.5;
+                    let x0 = fx.floor().max(0.0) as usize;
+                    let x1 = (x0 + 1).min(max_lx);
+                    let tx = (fx - x0 as f32).clamp(0.0, 1.0);
+                    let g00 = buf.data.get(row0 + x0).copied().unwrap_or(255) as f32;
+                    let g10 = buf.data.get(row0 + x1).copied().unwrap_or(255) as f32;
+                    let g01 = buf.data.get(row1 + x0).copied().unwrap_or(255) as f32;
+                    let g11 = buf.data.get(row1 + x1).copied().unwrap_or(255) as f32;
+                    let top = g00 + (g10 - g00) * tx;
+                    let bot = g01 + (g11 - g01) * tx;
+                    let gray = (top + (bot - top) * ty).round().clamp(0.0, 255.0) as u32;
+                    sb[py * g.phys_w + px] = (gray << 16) | (gray << 8) | gray;
+                }
+            }
         }
     }
 }
@@ -727,6 +766,7 @@ mod tests {
                 ly0: 0,
                 lw_span: 2,
                 lh_span: 2,
+                filter: ScaleFilter::Bilinear,
             },
         );
         let gray = |px: u32| (sb[px as usize] & 0xff) as u8;
