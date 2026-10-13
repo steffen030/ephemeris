@@ -136,6 +136,13 @@ pub struct Config {
     #[serde(default = "default_pen_only_drawing")]
     pub pen_only_drawing: bool,
 
+    /// Template for auto-titles when creating a note.
+    ///
+    /// Tokens: `yyyy` / `mm` / `dd` (local date) and `{n}` (discrete increasing
+    /// counter). Default: `yyyy-mm-dd Note {n}`.
+    #[serde(default = "default_note_title_pattern")]
+    pub note_title_pattern: String,
+
     /// Configurable GTD horizon lanes (Now / Next / Later / …).
     #[serde(default = "default_task_lanes")]
     pub task_lanes: Vec<TaskLaneConfig>,
@@ -297,6 +304,10 @@ fn default_pen_only_drawing() -> bool {
     true
 }
 
+fn default_note_title_pattern() -> String {
+    "yyyy-mm-dd Note {n}".to_string()
+}
+
 fn default_htr_enabled() -> bool {
     true
 }
@@ -325,11 +336,50 @@ impl Default for Config {
             line_htr_enabled: default_line_htr_enabled(),
             line_htr_model_dir: None,
             pen_only_drawing: default_pen_only_drawing(),
+            note_title_pattern: default_note_title_pattern(),
             task_lanes: default_task_lanes(),
             task_engage: TaskEngageConfig::default(),
             custom: HashMap::new(),
         }
     }
+}
+
+/// Expand [`Config::note_title_pattern`] for a new note.
+///
+/// Recognises `yyyy`, `mm`, `dd` (local calendar date) and `{n}` (counter).
+/// Empty / whitespace patterns fall back to the compiled-in default.
+pub fn format_note_title(pattern: &str, n: u32, date: chrono::NaiveDate) -> String {
+    use chrono::Datelike;
+    let pat = {
+        let t = pattern.trim();
+        if t.is_empty() {
+            default_note_title_pattern()
+        } else {
+            t.to_string()
+        }
+    };
+    let chars: Vec<char> = pat.chars().collect();
+    let mut out = String::with_capacity(pat.len() + 8);
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i..].starts_with(&['{', 'n', '}']) {
+            out.push_str(&n.to_string());
+            i += 3;
+        } else if chars[i..].starts_with(&['y', 'y', 'y', 'y']) {
+            out.push_str(&format!("{:04}", date.year()));
+            i += 4;
+        } else if chars[i..].starts_with(&['m', 'm']) {
+            out.push_str(&format!("{:02}", date.month()));
+            i += 2;
+        } else if chars[i..].starts_with(&['d', 'd']) {
+            out.push_str(&format!("{:02}", date.day()));
+            i += 2;
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 // ── Load / save ──────────────────────────────────────────────────────────────
@@ -692,6 +742,20 @@ mod tests {
             .save_to(&path)
             .expect("save with deep path");
         assert!(path.exists());
+    }
+
+    #[test]
+    fn note_title_pattern_expands_date_and_counter() {
+        let d = chrono::NaiveDate::from_ymd_opt(2026, 10, 13).unwrap();
+        assert_eq!(
+            format_note_title("yyyy-mm-dd Note {n}", 7, d),
+            "2026-10-13 Note 7"
+        );
+        assert_eq!(
+            format_note_title("", 3, d),
+            "2026-10-13 Note 3"
+        );
+        assert_eq!(format_note_title("Scratch {n}", 1, d), "Scratch 1");
     }
 
     // ── serialization smoke ───────────────────────────────────────────────────

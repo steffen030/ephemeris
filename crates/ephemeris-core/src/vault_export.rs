@@ -1,6 +1,7 @@
 //! Export Ephemeris notes into an Obsidian vault subfolder (ADR ephemeris-mry).
 //!
 //! Layout: `{vault}/{export_subdir}/{Notebook}/{…}/{Note}.md`
+//! Unfiled notes use the `notes` segment (e.g. `{export_subdir}/notes/{Note}.md`).
 //! Nested notebooks become nested directories. Optional PDF sibling `{Note}.pdf`
 //! is linked from the markdown when present.
 

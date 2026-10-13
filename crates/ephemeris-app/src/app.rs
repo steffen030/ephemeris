@@ -1,4 +1,4 @@
-use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, Timelike, Utc};
+use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveDateTime, Timelike, Utc};
 use ephemeris_core::ics::IcsReader;
 use ephemeris_core::ink::InkUpdate;
 use ephemeris_core::model::Tool;
@@ -8,10 +8,10 @@ use ephemeris_core::{
     markdown_to_blocks, markdown_to_plain, resolve_lane, review_queue, search_events,
     search_local_notes, search_tasks, set_lane_tag, strip_inline_markdown, sync_notes_to_vault,
     sync_tags_from_structured, to_agenda_entries, AgendaRange, CalendarEvent, CascadingTranscriber,
-    Config, EngageFilter, EventId, LineImageHtrTranscriber, MarkdownTaskExtractor,
-    PdfExportOptions, ProfileId, RasterOcrTranscriber, RasterPage, SearchHit, StrokeHtrTranscriber,
-    Task, TaskContext, TaskContextKind, TaskId, TaskPriority, TaskProvider, VaultFtsIndex,
-    VaultNoteExport,
+    format_note_title, Config, EngageFilter, EventId, LineImageHtrTranscriber,
+    MarkdownTaskExtractor, PdfExportOptions, ProfileId, RasterOcrTranscriber, RasterPage,
+    SearchHit, StrokeHtrTranscriber, Task, TaskContext, TaskContextKind, TaskId, TaskPriority,
+    TaskProvider, VaultFtsIndex, VaultNoteExport,
 };
 #[cfg(target_os = "linux")]
 use ephemeris_pal::input::{EvdevPenSource, PenTarget};
@@ -45,6 +45,248 @@ const CHROME_SWIPE_MIN_DY: f32 = 20.0;
 
 /// Debounce flag for background vault git commit/push.
 static VAULT_GIT_PUSH_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// How long ink can sit dirty before a background vault OCR/PDF batch runs.
+const VAULT_EXPORT_BATCH_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+/// Coalesce local page `.bin` / strokes JSON writes so rapid strokes do not
+/// stall the UI thread on flash I/O. Leave-note still flushes synchronously.
+const LOCAL_PAGE_WRITE_DEBOUNCE: Duration = Duration::from_millis(400);
+
+/// Coalesces vault OCR/PDF export so it never runs on the ink hot path.
+///
+/// Dirty notes flush on note leave (`flush_soon`) or after
+/// [`VAULT_EXPORT_BATCH_INTERVAL`]. Structural index changes set
+/// `needs_full_sync` for one deferred library pass (same cascade quality).
+struct VaultExportQueue {
+    dirty: RefCell<HashSet<u32>>,
+    needs_full_sync: Cell<bool>,
+    flush_soon: Cell<bool>,
+    last_flush_at: Cell<Instant>,
+    active: Arc<AtomicBool>,
+}
+
+impl VaultExportQueue {
+    fn new() -> Self {
+        Self {
+            dirty: RefCell::new(HashSet::new()),
+            needs_full_sync: Cell::new(false),
+            flush_soon: Cell::new(false),
+            last_flush_at: Cell::new(Instant::now()),
+            active: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn mark(&self, note_id: u32) {
+        self.dirty.borrow_mut().insert(note_id);
+    }
+
+    fn mark_full_sync(&self) {
+        self.needs_full_sync.set(true);
+    }
+
+    fn request_flush_soon(&self) {
+        self.flush_soon.set(true);
+    }
+
+    fn has_pending(&self) -> bool {
+        self.needs_full_sync.get()
+            || self.flush_soon.get()
+            || !self.dirty.borrow().is_empty()
+            || self.active.load(Ordering::Relaxed)
+    }
+
+    /// Start a background flush when leave-note was requested or the batch
+    /// interval elapsed. Returns true if a worker was spawned.
+    fn try_flush(
+        &self,
+        config: &Config,
+        notes: &[AppNote],
+        notebooks: &[AppNotebook],
+        data_dir: &Path,
+        connections: &[AppConnection],
+    ) -> bool {
+        // Export is driven by per-profile vault connections, not the legacy
+        // single `config.vault_path` (which may point at another profile).
+        if !connections.iter().any(|c| c.kind == "vault") {
+            self.dirty.borrow_mut().clear();
+            self.needs_full_sync.set(false);
+            self.flush_soon.set(false);
+            return false;
+        }
+        if self.active.load(Ordering::Relaxed) {
+            return false;
+        }
+        let force = self.flush_soon.replace(false);
+        let due = self.last_flush_at.get().elapsed() >= VAULT_EXPORT_BATCH_INTERVAL;
+        if !force && !due {
+            return false;
+        }
+        let full = self.needs_full_sync.replace(false);
+        let ids: Vec<u32> = self.dirty.borrow_mut().drain().collect();
+        if !full && ids.is_empty() {
+            return false;
+        }
+        if self
+            .active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            // Race: put work back.
+            if full {
+                self.needs_full_sync.set(true);
+            }
+            self.dirty.borrow_mut().extend(ids);
+            return false;
+        }
+        self.last_flush_at.set(Instant::now());
+        let config = config.clone();
+        let notes = notes.to_vec();
+        let notebooks = notebooks.to_vec();
+        let data_dir = data_dir.to_path_buf();
+        let connections = connections.to_vec();
+        let active = Arc::clone(&self.active);
+        std::thread::spawn(move || {
+            if full {
+                sync_notes_export_to_vault(&config, &notes, &notebooks, &data_dir, &connections);
+            } else {
+                let mut touched_vaults = Vec::new();
+                for note_id in ids {
+                    if let Some(vault) = export_single_note_to_vault_no_git(
+                        &config,
+                        &notes,
+                        &notebooks,
+                        &data_dir,
+                        &connections,
+                        note_id,
+                    ) {
+                        if !touched_vaults.iter().any(|p: &PathBuf| p == &vault) {
+                            touched_vaults.push(vault);
+                        }
+                    }
+                }
+                for vault in &touched_vaults {
+                    schedule_vault_git_push_for(&config, vault);
+                }
+            }
+            active.store(false, Ordering::Release);
+        });
+        true
+    }
+}
+
+/// Latest local page raster+strokes waiting for a debounced disk write.
+struct PendingPageWrite {
+    note_id: u32,
+    doc_page: usize,
+    width: u32,
+    height: u32,
+    pixels: Vec<u8>,
+    strokes: Vec<ephemeris_core::Stroke>,
+}
+
+/// Debounced async writer for note page `.bin` + strokes JSON.
+struct LocalPageWriteQueue {
+    pending: Mutex<Option<PendingPageWrite>>,
+    last_queued_at: Mutex<Instant>,
+    active: Arc<AtomicBool>,
+    data_dir: PathBuf,
+}
+
+impl LocalPageWriteQueue {
+    fn new(data_dir: PathBuf) -> Self {
+        Self {
+            pending: Mutex::new(None),
+            last_queued_at: Mutex::new(Instant::now()),
+            active: Arc::new(AtomicBool::new(false)),
+            data_dir,
+        }
+    }
+
+    fn queue(&self, job: PendingPageWrite) {
+        if let Ok(mut g) = self.pending.lock() {
+            *g = Some(job);
+        }
+        if let Ok(mut t) = self.last_queued_at.lock() {
+            *t = Instant::now();
+        }
+    }
+
+    fn has_pending(&self) -> bool {
+        self.active.load(Ordering::Relaxed)
+            || self.pending.lock().map(|g| g.is_some()).unwrap_or(false)
+    }
+
+    /// Spawn a background write when debounce elapsed (or `force`).
+    fn try_flush_async(&self, force: bool) -> bool {
+        if self.active.load(Ordering::Relaxed) {
+            return false;
+        }
+        let ready = force
+            || self
+                .last_queued_at
+                .lock()
+                .map(|t| t.elapsed() >= LOCAL_PAGE_WRITE_DEBOUNCE)
+                .unwrap_or(true);
+        if !ready {
+            return false;
+        }
+        let job = match self.pending.lock() {
+            Ok(mut g) => g.take(),
+            Err(_) => None,
+        };
+        let Some(job) = job else {
+            return false;
+        };
+        if self
+            .active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            if let Ok(mut g) = self.pending.lock() {
+                if g.is_none() {
+                    *g = Some(job);
+                }
+            }
+            return false;
+        }
+        let data_dir = self.data_dir.clone();
+        let active = Arc::clone(&self.active);
+        std::thread::spawn(move || {
+            save_note_page_pixels(
+                &data_dir,
+                job.note_id,
+                job.doc_page,
+                job.width,
+                job.height,
+                &job.pixels,
+            );
+            save_note_page_strokes(&data_dir, job.note_id, job.doc_page, &job.strokes);
+            active.store(false, Ordering::Release);
+        });
+        true
+    }
+
+    /// Block until any in-flight write finishes, then write the latest pending
+    /// job on this thread (leave-note / switch-note durability).
+    fn flush_sync(&self) {
+        while self.active.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let job = self.pending.lock().ok().and_then(|mut g| g.take());
+        if let Some(job) = job {
+            save_note_page_pixels(
+                &self.data_dir,
+                job.note_id,
+                job.doc_page,
+                job.width,
+                job.height,
+                &job.pixels,
+            );
+            save_note_page_strokes(&self.data_dir, job.note_id, job.doc_page, &job.strokes);
+        }
+    }
+}
 
 /// Completed See-text recognition job (drained on the UI thread).
 struct SeeTextJobResult {
@@ -431,6 +673,11 @@ impl App {
         // Notebooks and notes (restored from disk or defaults).
         let notebooks: Rc<RefCell<Vec<AppNotebook>>> = Rc::new(RefCell::new(init_notebooks));
         let notes: Rc<RefCell<Vec<AppNote>>> = Rc::new(RefCell::new(init_notes));
+        // Deferred vault OCR/PDF (leave-note + 10‑minute batch).
+        let vault_export: Rc<VaultExportQueue> = Rc::new(VaultExportQueue::new());
+        // Debounced local page .bin / strokes JSON writes.
+        let local_page_writes: Rc<LocalPageWriteQueue> =
+            Rc::new(LocalPageWriteQueue::new(data_dir.clone()));
 
         // Restore ink pixels + stroke lists for all known notes (current doc page).
         for note in notes.borrow().iter() {
@@ -921,15 +1168,23 @@ impl App {
         {
             let conns_rc = connections.clone();
             let push = push_connections.clone();
+            let vault_ex = vault_export.clone();
             ui.on_connection_set_profile(move |idx, profile_id| {
                 let mut conns = conns_rc.borrow_mut();
                 let i = idx as usize;
+                let mut reassigned_vault = false;
                 if i < conns.len() {
+                    reassigned_vault = conns[i].kind == "vault";
                     conns[i].profile_id = profile_id.to_string();
                 }
                 save_connections(&conns);
                 drop(conns);
                 push();
+                // Vault moved onto a (possibly new) profile → backfill its notes.
+                if reassigned_vault {
+                    vault_ex.mark_full_sync();
+                    vault_ex.request_flush_soon();
+                }
             });
         }
 
@@ -1032,18 +1287,18 @@ impl App {
             let active_nb_nav = active_notebook_id.clone();
             let notes_nav = notes.clone();
             let data_dir_nav = data_dir.clone();
+            let vault_leave = vault_export.clone();
+            let writes_leave = local_page_writes.clone();
             ui.on_nav_notes_tapped(move || {
-                // Save current page state before switching views.
-                ui_rc.save_current_page();
-                {
-                    let active = ui2.get_active_note_id().to_string();
-                    flush_active_note_pixels(
-                        &ui_rc,
-                        &mut notes_nav.borrow_mut(),
-                        &data_dir_nav,
-                        &active,
-                    );
-                }
+                // Save + queue vault export before leaving the canvas.
+                leave_note_canvas(
+                    &ui_rc,
+                    &mut notes_nav.borrow_mut(),
+                    &data_dir_nav,
+                    ui2.get_active_note_id().as_str(),
+                    &vault_leave,
+                    &writes_leave,
+                );
                 active_nb_nav.set(0);
                 ui2.set_notes_search_query("".into());
                 push_nbs_nav();
@@ -1141,6 +1396,7 @@ impl App {
             let nb_seq2 = notebook_id_seq.clone();
             let data_dir2 = data_dir.clone();
             let cfg2 = config.clone();
+            let vault_ex = vault_export.clone();
             let push_del = push_notebooks.clone();
             let ui2 = ui.clone_component();
             ui.on_note_delete_tapped(move |id| {
@@ -1167,6 +1423,7 @@ impl App {
                     note_seq2.get(),
                     nb_seq2.get(),
                     &cfg2.borrow(),
+                    &vault_ex,
                 );
             });
         }
@@ -1179,6 +1436,7 @@ impl App {
             let nb_seq2 = notebook_id_seq.clone();
             let data_dir2 = data_dir.clone();
             let cfg2 = config.clone();
+            let vault_ex = vault_export.clone();
             let active_nb2 = active_notebook_id.clone();
             let push_del = push_notebooks.clone();
             let ui2 = ui.clone_component();
@@ -1227,6 +1485,7 @@ impl App {
                     note_seq2.get(),
                     nb_seq2.get(),
                     &cfg2.borrow(),
+                    &vault_ex,
                 );
             })
         };
@@ -1319,7 +1578,22 @@ impl App {
             let ui2 = ui.clone_component();
             let notes2 = notes.clone();
             let anchor_rc = current_note_anchor.clone();
+            let data_leave = data_dir.clone();
+            let vault_leave = vault_export.clone();
+            let writes_leave = local_page_writes.clone();
             ui.on_note_tapped(move |id| {
+                // Flush previous open note (if any) before switching.
+                let prev = ui2.get_active_note_id().to_string();
+                if !prev.is_empty() && prev != id.as_str() {
+                    leave_note_canvas(
+                        &ui_rc,
+                        &mut notes2.borrow_mut(),
+                        &data_leave,
+                        prev.as_str(),
+                        &vault_leave,
+                        &writes_leave,
+                    );
+                }
                 let notes = notes2.borrow();
                 if let Some(note) = notes.iter().find(|n| n.id.to_string() == id) {
                     let page_idx = note.page_index;
@@ -1484,6 +1758,7 @@ impl App {
             let active_nb2 = active_notebook_id.clone();
             let data_dir2 = data_dir.clone();
             let cfg2 = config.clone();
+            let vault_ex = vault_export.clone();
             let push_qn = push_notebooks.clone();
             ui.on_notebook_quick_new_note(move |nb_id| {
                 let nb_id_u32: u32 = nb_id.parse().unwrap_or(0);
@@ -1500,12 +1775,13 @@ impl App {
                     .find(|nb| nb.id == nb_id_u32)
                     .map(|nb| nb.profile_id.clone())
                     .unwrap_or_default();
+                let title = next_note_title(&cfg2.borrow(), new_id);
                 {
                     let mut ns = notes2.borrow_mut();
                     let idx = ns.len();
                     ns.push(AppNote {
                         id: new_id,
-                        title: format!("Note {}", new_id),
+                        title: title.clone(),
                         page_index: idx,
                         created_at: now_secs(),
                         updated_at: now_secs(),
@@ -1522,7 +1798,7 @@ impl App {
                 push_qn();
                 ui_rc.set_note_anchor_label("");
                 ui_rc.push_new_page();
-                ui_rc.set_page_title(&format!("Note {}", new_id));
+                ui_rc.set_page_title(&title);
                 ui_rc.set_page_index(1, 1);
                 ui2.set_active_paper("blank".into());
                 ui2.set_show_note_list(false);
@@ -1538,6 +1814,7 @@ impl App {
                     seq2.get(),
                     nb_seq2.get(),
                     &cfg2.borrow(),
+                    &vault_ex,
                 );
             });
         }
@@ -1552,6 +1829,7 @@ impl App {
             let nb_seq2 = notebook_id_seq.clone();
             let data_dir2 = data_dir.clone();
             let cfg2 = config.clone();
+            let vault_ex = vault_export.clone();
             let push_rn = push_notebooks.clone();
             ui.on_note_rename_confirm(move |id, new_title| {
                 let new_title = new_title.trim().to_string();
@@ -1579,6 +1857,7 @@ impl App {
                     note_seq2.get(),
                     nb_seq2.get(),
                     &cfg2.borrow(),
+                    &vault_ex,
                 );
             });
         }
@@ -1592,6 +1871,7 @@ impl App {
             let nb_seq2 = notebook_id_seq.clone();
             let data_dir2 = data_dir.clone();
             let cfg2 = config.clone();
+            let vault_ex = vault_export.clone();
             let push_mv = push_notebooks.clone();
             ui.on_note_move_confirm(move |note_id, notebook_id| {
                 let nb_id: u32 = notebook_id.parse().unwrap_or(0);
@@ -1611,6 +1891,7 @@ impl App {
                     note_seq2.get(),
                     nb_seq2.get(),
                     &cfg2.borrow(),
+                    &vault_ex,
                 );
             });
         }
@@ -1640,6 +1921,7 @@ impl App {
             let nb_seq2 = notebook_id_seq.clone();
             let data_dir2 = data_dir.clone();
             let cfg2 = config.clone();
+            let vault_ex = vault_export.clone();
             let push_nbs_ren = push_notebooks.clone();
             let active_nb_ren = active_notebook_id.clone();
             ui.on_notebook_rename_confirm(move |id, new_title| {
@@ -1676,6 +1958,7 @@ impl App {
                         note_seq2.get(),
                         nb_seq2.get(),
                         &cfg2.borrow(),
+                        &vault_ex,
                     );
                     return;
                 }
@@ -1694,6 +1977,7 @@ impl App {
                     note_seq2.get(),
                     nb_seq2.get(),
                     &cfg2.borrow(),
+                    &vault_ex,
                 );
             });
         }
@@ -1752,8 +2036,19 @@ impl App {
             let cal_day2 = cal_day.clone();
             let cal_sub_view2 = cal_sub_view.clone();
             let refresh = refresh_cal.clone();
+            let notes_leave = notes.clone();
+            let data_leave = data_dir.clone();
+            let vault_leave = vault_export.clone();
+            let writes_leave = local_page_writes.clone();
             ui.on_nav_calendar_tapped(move || {
-                ui_rc.save_current_page();
+                leave_note_canvas(
+                    &ui_rc,
+                    &mut notes_leave.borrow_mut(),
+                    &data_leave,
+                    ui2.get_active_note_id().as_str(),
+                    &vault_leave,
+                    &writes_leave,
+                );
                 let sv = cal_sub_view2.get();
                 refresh(cal_year2.get(), cal_month2.get(), cal_day2.get(), sv);
                 ui2.set_show_start_page(false);
@@ -1893,6 +2188,7 @@ impl App {
             let nb_seq2 = notebook_id_seq.clone();
             let data_dir2 = data_dir.clone();
             let cfg2 = config.clone();
+            let vault_ex = vault_export.clone();
             let cal_year2 = cal_year.clone();
             let cal_month2 = cal_month.clone();
             let cal_day2 = cal_day.clone();
@@ -1945,6 +2241,7 @@ impl App {
                             seq2.get(),
                             nb_seq2.get(),
                             &cfg2.borrow(),
+                            &vault_ex,
                         );
                         let ns = notes2.borrow();
                         let note = ns.iter().find(|n| n.id == new_id).unwrap();
@@ -1986,6 +2283,9 @@ impl App {
             let notes2 = notes.clone();
             let anchor_rc = current_note_anchor.clone();
             let refresh_cal_anchor = refresh_cal.clone();
+            let data_leave = data_dir.clone();
+            let vault_leave = vault_export.clone();
+            let writes_leave = local_page_writes.clone();
             ui.on_note_anchor_tapped(move || {
                 let anchor = anchor_rc.borrow().clone();
                 // Parse "cal:YYYY-MM-DD"
@@ -1999,7 +2299,14 @@ impl App {
                         ui_rc.set_cal_sub_view(0);
                         refresh_cal_anchor(y, m, d, 0);
                         refresh_day_note_ui(&ui_rc, &notes2.borrow(), y, m, d);
-                        ui_rc.save_current_page();
+                        leave_note_canvas(
+                            &ui_rc,
+                            &mut notes2.borrow_mut(),
+                            &data_leave,
+                            ui2.get_active_note_id().as_str(),
+                            &vault_leave,
+                            &writes_leave,
+                        );
                         ui2.set_show_calendar(true);
                         ui2.set_show_note_list(false);
                         ui2.set_show_notebook_list(false);
@@ -2116,8 +2423,19 @@ impl App {
             let ui_rc = ui.clone();
             let ui2 = ui.clone_component();
             let push_recs_nav = push_recordings.clone();
+            let notes_leave = notes.clone();
+            let data_leave = data_dir.clone();
+            let vault_leave = vault_export.clone();
+            let writes_leave = local_page_writes.clone();
             ui.on_nav_rec_tapped(move || {
-                ui_rc.save_current_page();
+                leave_note_canvas(
+                    &ui_rc,
+                    &mut notes_leave.borrow_mut(),
+                    &data_leave,
+                    ui2.get_active_note_id().as_str(),
+                    &vault_leave,
+                    &writes_leave,
+                );
                 push_recs_nav();
                 ui2.set_show_start_page(false);
                 ui2.set_show_task_view(false);
@@ -2538,8 +2856,19 @@ impl App {
             let tasks2 = tasks.clone();
             let cfg2 = config.clone();
             let filter_rc = active_profile_filter.clone();
+            let notes_leave = notes.clone();
+            let data_leave = data_dir.clone();
+            let vault_leave = vault_export.clone();
+            let writes_leave = local_page_writes.clone();
             ui.on_nav_tasks_tapped(move || {
-                ui_rc.save_current_page();
+                leave_note_canvas(
+                    &ui_rc,
+                    &mut notes_leave.borrow_mut(),
+                    &data_leave,
+                    ui2.get_active_note_id().as_str(),
+                    &vault_leave,
+                    &writes_leave,
+                );
                 {
                     let cfg = cfg2.borrow();
                     if let Some(ref vault) = cfg.vault_path {
@@ -3356,7 +3685,7 @@ impl App {
             let note_seq2 = note_id_seq.clone();
             let nb_seq2 = notebook_id_seq.clone();
             let data_dir2 = data_dir.clone();
-            let cfg2 = config.clone();
+            let vault_ex = vault_export.clone();
             let swipe_ok = page_swipe_allowed.clone();
             let swipe_done = page_swipe_handled.clone();
             ui.on_swipe_left(move || {
@@ -3375,14 +3704,15 @@ impl App {
                 switch_note_doc_page(&ui_rc, &data_dir2, note, target, true);
                 swipe_done.set(true);
                 drop(ns);
-                save_notes_index_and_sync_vault(
+                // Index only — never OCR the whole library on a page flip.
+                save_notes_index(
                     &data_dir2,
                     &notes2.borrow(),
                     &notebooks2.borrow(),
                     note_seq2.get(),
                     nb_seq2.get(),
-                    &cfg2.borrow(),
                 );
+                vault_ex.mark(note_id);
             });
         }
         {
@@ -3393,7 +3723,7 @@ impl App {
             let note_seq2 = note_id_seq.clone();
             let nb_seq2 = notebook_id_seq.clone();
             let data_dir2 = data_dir.clone();
-            let cfg2 = config.clone();
+            let vault_ex = vault_export.clone();
             let swipe_ok = page_swipe_allowed.clone();
             let swipe_done = page_swipe_handled.clone();
             ui.on_swipe_right(move || {
@@ -3415,14 +3745,14 @@ impl App {
                 switch_note_doc_page(&ui_rc, &data_dir2, note, target, false);
                 swipe_done.set(true);
                 drop(ns);
-                save_notes_index_and_sync_vault(
+                save_notes_index(
                     &data_dir2,
                     &notes2.borrow(),
                     &notebooks2.borrow(),
                     note_seq2.get(),
                     nb_seq2.get(),
-                    &cfg2.borrow(),
                 );
+                vault_ex.mark(note_id);
             });
         }
 
@@ -3504,6 +3834,7 @@ impl App {
                 let theme_idx = if cfg.theme == "dark" { 1 } else { 0 };
                 ui2.set_settings_theme_idx(theme_idx);
                 ui2.set_settings_pen_only(cfg.pen_only_drawing);
+                ui2.set_settings_note_title_pattern(cfg.note_title_pattern.as_str().into());
                 let vault = cfg
                     .vault_path
                     .as_ref()
@@ -3587,10 +3918,21 @@ impl App {
             let fts_paths2 = vault_fts_paths.clone();
             let conns2 = connections.clone();
             let filter_rc = active_profile_filter.clone();
+            let notes_leave = notes.clone();
+            let data_leave = data_dir.clone();
+            let vault_leave = vault_export.clone();
+            let writes_leave = local_page_writes.clone();
             ui.on_search_open(move || {
-                // Persist ink, then hide the canvas layer so strokes cannot
-                // bleed through the search overlay via min() compositing.
-                ui_rc.save_current_page();
+                // Persist ink + queue vault export, then hide the canvas so
+                // strokes cannot bleed through search via min() compositing.
+                leave_note_canvas(
+                    &ui_rc,
+                    &mut notes_leave.borrow_mut(),
+                    &data_leave,
+                    ui2.get_active_note_id().as_str(),
+                    &vault_leave,
+                    &writes_leave,
+                );
                 // Show search immediately — do not block the transition on a
                 // full vault walk when the FTS index is already warm.
                 ui2.set_show_start_page(false);
@@ -4111,6 +4453,15 @@ impl App {
                 let theme_idx = ui2.get_settings_theme_idx();
                 let theme = if theme_idx == 1 { "dark" } else { "light" };
                 let pen_only = ui2.get_settings_pen_only();
+                let note_title_pattern = {
+                    let s = ui2.get_settings_note_title_pattern();
+                    let trimmed = s.trim();
+                    if trimmed.is_empty() {
+                        "yyyy-mm-dd Note {n}".to_string()
+                    } else {
+                        trimmed.to_string()
+                    }
+                };
 
                 // Derive vault and ICS sources from the connections list.
                 let conns = conns_ss.borrow();
@@ -4154,6 +4505,7 @@ impl App {
                 let mut new_cfg = cfg2.borrow().clone();
                 new_cfg.theme = theme.to_string();
                 new_cfg.pen_only_drawing = pen_only;
+                new_cfg.note_title_pattern = note_title_pattern;
                 new_cfg.vault_path = if vault_str.is_empty() {
                     None
                 } else {
@@ -4359,6 +4711,7 @@ impl App {
             let fts2 = vault_fts.clone();
             let fts_paths2 = vault_fts_paths.clone();
             let tasks2 = tasks.clone();
+            let vault_ex = vault_export.clone();
             ui.on_fb_select_vault(move |path| {
                 let path_str = path.to_string();
                 let vault_path = expand_user_path(&path_str);
@@ -4379,7 +4732,7 @@ impl App {
                     kind: "vault".to_string(),
                     display,
                     value: vault_path.to_string_lossy().to_string(),
-                    profile_id,
+                    profile_id: profile_id.clone(),
                     allow_in_aggregated: true,
                     username: String::new(),
                     password: String::new(),
@@ -4436,6 +4789,16 @@ impl App {
                     work_pid,
                 );
                 schedule_vault_git_push(&cfg2.borrow());
+
+                // Newly attached export target: backfill this profile's
+                // historical notes (and any other profiles that already have
+                // vaults) on the next idle flush — not on the UI thread.
+                vault_ex.mark_full_sync();
+                vault_ex.request_flush_soon();
+                tracing::info!(
+                    "Queued historical note export for profile {profile_id} → {}",
+                    vault_path.display()
+                );
 
                 ui2.set_settings_vault_path(vault_path.to_string_lossy().as_ref().into());
                 ui2.set_connect_setup_export_subdir(
@@ -4604,6 +4967,7 @@ impl App {
             let active_nb2 = active_notebook_id.clone();
             let data_dir2 = data_dir.clone();
             let cfg2 = config.clone();
+            let vault_ex = vault_export.clone();
             let anchor_rc = current_note_anchor.clone();
             ui.on_create_profile_picked(move |intent, profile_id| {
                 let profile_id = profile_id.to_string();
@@ -4632,17 +4996,25 @@ impl App {
                         }
                     }
                     "note" | "ring-note" => {
+                        // All is aggregator-only — never create a note without a real profile.
+                        if profile_id.is_empty() {
+                            tracing::warn!(
+                                "Ignoring note create with empty profile (All is not a target)"
+                            );
+                            return;
+                        }
                         let from_ring = intent == "ring-note";
                         let new_id = seq2.get();
                         seq2.set(new_id + 1);
                         let nb_id = active_nb2.get();
                         let folder_id = if nb_id == 0 { None } else { Some(nb_id) };
+                        let title = next_note_title(&cfg2.borrow(), new_id);
                         {
                             let mut ns = notes2.borrow_mut();
                             let idx = ns.len();
                             ns.push(AppNote {
                                 id: new_id,
-                                title: format!("Note {}", new_id),
+                                title: title.clone(),
                                 page_index: idx,
                                 created_at: now_secs(),
                                 updated_at: now_secs(),
@@ -4658,7 +5030,7 @@ impl App {
                         *anchor_rc.borrow_mut() = String::new();
                         ui_rc.set_note_anchor_label("");
                         ui_rc.push_new_page();
-                        ui_rc.set_page_title(&format!("Note {}", new_id));
+                        ui_rc.set_page_title(&title);
                         ui_rc.set_page_index(1, 1);
                         ui2.set_active_paper("blank".into());
                         if from_ring {
@@ -4686,6 +5058,7 @@ impl App {
                             seq2.get(),
                             nb_seq2.get(),
                             &cfg2.borrow(),
+                            &vault_ex,
                         );
                     }
                     _ => {}
@@ -4735,6 +5108,9 @@ impl App {
             note_id_seq: note_id_seq.clone(),
             notebook_id_seq: notebook_id_seq.clone(),
             config: config.clone(),
+            connections: connections.clone(),
+            vault_export: vault_export.clone(),
+            local_page_writes: local_page_writes.clone(),
             rec_handle,
             recordings: recordings.clone(),
             rec_id_seq: rec_id_seq.clone(),
@@ -4833,6 +5209,12 @@ struct WinitHandler {
     note_id_seq: Rc<Cell<u32>>,
     notebook_id_seq: Rc<Cell<u32>>,
     config: Rc<RefCell<Config>>,
+    /// Per-profile vault/calendar connections (export targets).
+    connections: Rc<RefCell<Vec<AppConnection>>>,
+    /// Vault OCR/PDF deferred to leave-note / 10‑minute batch.
+    vault_export: Rc<VaultExportQueue>,
+    /// Debounced async local page raster/stroke writes.
+    local_page_writes: Rc<LocalPageWriteQueue>,
     /// Active recording handle (Some while recording is in progress).
     rec_handle: Rc<RefCell<Option<RecordingHandle>>>,
     /// Recordings list — needed so about_to_wait can persist transcription results.
@@ -5014,11 +5396,22 @@ impl WinitHandler {
                     }),
                     now_ms(),
                 );
-                self.persist_if_strokes_dirty();
+                // Do not persist mid-stroke / mid-erase — sync disk I/O on every
+                // sample freezes PineNote. Persist on pointer release only.
             }
-        }
-        if let Some(d) = &self.display {
-            d.request_redraw();
+            if let Some(d) = &self.display {
+                d.request_redraw();
+            }
+        } else if let Some(d) = &self.display {
+            // Idle moves over a static note canvas: skip redraw wake (eink).
+            // Overlays / chrome swipe / peek still need Slint frames.
+            let need = self.chrome_peeking
+                || self.chrome_swipe_start.is_some()
+                || !self.ui.is_canvas_active()
+                || self.ui.has_ink_damage();
+            if need {
+                d.request_redraw();
+            }
         }
     }
 
@@ -5079,7 +5472,6 @@ impl WinitHandler {
                 }),
                 now_ms(),
             );
-            self.persist_if_strokes_dirty();
         }
         if let Some(d) = &self.display {
             d.request_redraw();
@@ -5091,6 +5483,11 @@ impl WinitHandler {
         if !self.ui.take_strokes_dirty() {
             return;
         }
+        self.persist_note_page_and_schedule_export();
+    }
+
+    /// Queue debounced local page files; mark the note for deferred vault OCR/PDF.
+    fn persist_note_page_and_schedule_export(&mut self) {
         let page_idx = self.ui.current_page_idx();
         let note_info = self
             .notes
@@ -5103,13 +5500,15 @@ impl WinitHandler {
         };
         let pixels = self.ui.get_committed_pixels();
         let (w, h) = self.ui.canvas_size();
-        save_note_page_pixels(&self.data_dir, note_id, doc_page, w, h, &pixels);
-        save_note_page_strokes(
-            &self.data_dir,
+        let strokes = self.ui.get_page_strokes();
+        self.local_page_writes.queue(PendingPageWrite {
             note_id,
             doc_page,
-            &self.ui.get_page_strokes(),
-        );
+            width: w,
+            height: h,
+            pixels,
+            strokes,
+        });
         if let Some(note) = self.notes.borrow_mut().iter_mut().find(|n| n.id == note_id) {
             note.updated_at = now_secs();
             note.text_content = None;
@@ -5117,6 +5516,8 @@ impl WinitHandler {
         // Drop stale See-text so the next toggle re-OCRs instead of showing
         // text from before this ink change.
         self.ui.set_note_text_content("");
+        // Vault export waits for leave-note or the 10‑minute batch — never per stroke.
+        self.vault_export.mark(note_id);
     }
 
     fn handle_pointer_release(&mut self, lx: f32, ly: f32) {
@@ -5169,41 +5570,14 @@ impl WinitHandler {
                 }),
                 now_ms(),
             );
-            // Persist after pen commit; erase mid-gesture is handled via
-            // persist_if_strokes_dirty on move/down.
+            // Persist after pen commit / erase gesture end. Keep local disk
+            // writes on the UI thread (fast) but never run vault OCR/PDF here.
             if matches!(update, InkUpdate::Finished { .. }) || self.ui.take_strokes_dirty() {
-                let page_idx = self.ui.current_page_idx();
-                let note_info = self
-                    .notes
-                    .borrow()
-                    .iter()
-                    .find(|n| n.page_index == page_idx)
-                    .map(|n| (n.id, n.doc_page));
-                if let Some((note_id, doc_page)) = note_info {
-                    let pixels = self.ui.get_committed_pixels();
-                    let (w, h) = self.ui.canvas_size();
-                    save_note_page_pixels(&self.data_dir, note_id, doc_page, w, h, &pixels);
-                    save_note_page_strokes(
-                        &self.data_dir,
-                        note_id,
-                        doc_page,
-                        &self.ui.get_page_strokes(),
-                    );
-                    if let Some(note) = self.notes.borrow_mut().iter_mut().find(|n| n.id == note_id)
-                    {
-                        note.updated_at = now_secs();
-                        note.text_content = None;
-                    }
-                    self.ui.set_note_text_content("");
-                    export_single_note_to_vault(
-                        &self.config.borrow(),
-                        &self.notes.borrow(),
-                        &self.notebooks.borrow(),
-                        &self.data_dir,
-                        note_id,
-                    );
-                }
+                self.persist_note_page_and_schedule_export();
             }
+        } else {
+            // Clear / erase that finished without an active draw still needs save.
+            self.persist_if_strokes_dirty();
         }
         if let Some(d) = &self.display {
             d.request_redraw();
@@ -5332,6 +5706,18 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
             }
         }
 
+        // --- Debounced local page .bin / strokes JSON ---
+        self.local_page_writes.try_flush_async(false);
+
+        // --- Deferred vault OCR/PDF (leave-note or 10‑minute batch) ---
+        self.vault_export.try_flush(
+            &self.config.borrow(),
+            &self.notes.borrow(),
+            &self.notebooks.borrow(),
+            &self.data_dir,
+            &self.connections.borrow(),
+        );
+
         // --- Drain See-text recognition ---
         if let Ok(mut guard) = self.see_text_result.lock() {
             if let Some(job) = guard.take() {
@@ -5374,6 +5760,7 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
                                 self.note_id_seq.get(),
                                 self.notebook_id_seq.get(),
                                 &self.config.borrow(),
+                                &self.vault_export,
                             );
                         }
                     }
@@ -5454,12 +5841,33 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
             || self.line_htr_download_active.load(Ordering::Relaxed)
             || self.see_text_active.load(Ordering::Relaxed)
             || self.caldav_active.load(Ordering::Relaxed)
+            || self.vault_export.active.load(Ordering::Relaxed)
+            || self.local_page_writes.active.load(Ordering::Relaxed)
         {
-            // Keep waking while whisper / model download / See-text / CalDAV runs.
+            // Keep waking while whisper / model download / See-text / CalDAV /
+            // vault export / local page-write workers run.
             drop(h_opt);
             event_loop.set_control_flow(ControlFlow::WaitUntil(
                 Instant::now() + Duration::from_millis(500),
             ));
+        } else if self.local_page_writes.has_pending() {
+            drop(h_opt);
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + LOCAL_PAGE_WRITE_DEBOUNCE,
+            ));
+        } else if self.vault_export.has_pending() {
+            // Wake for the 10‑minute vault batch (or a leave-note flush_soon).
+            drop(h_opt);
+            let elapsed = self.vault_export.last_flush_at.get().elapsed();
+            let remaining = VAULT_EXPORT_BATCH_INTERVAL.saturating_sub(elapsed);
+            let wake = if self.vault_export.flush_soon.get() {
+                Duration::from_millis(50)
+            } else {
+                remaining
+                    .min(Duration::from_secs(60))
+                    .max(Duration::from_millis(500))
+            };
+            event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + wake));
         }
 
         // --- Drain completed CalDAV syncs ---
@@ -6796,7 +7204,8 @@ fn notebook_export_parts(
     notebook_id: Option<u32>,
 ) -> (String, Vec<String>) {
     match notebook_id {
-        None => ("Root".to_string(), vec!["Root".to_string()]),
+        // Unfiled notes live under `{export_subdir}/notes/…` (not "Root").
+        None => ("Notes".to_string(), vec!["notes".to_string()]),
         Some(id) => {
             let mut parts = Vec::new();
             let mut cur = Some(id);
@@ -6922,6 +7331,25 @@ fn note_preview_from_gray(w: u32, h: u32, gray: &[u8]) -> (bool, slint::Image) {
     }
     let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&rgba, tw, th);
     (true, slint::Image::from_rgba8(buffer))
+}
+
+/// Leave the note canvas: persist ink locally and request a soon vault export.
+fn leave_note_canvas(
+    ui: &EphemerisUi,
+    notes: &mut [AppNote],
+    data_dir: &Path,
+    active_note_id: &str,
+    vault_export: &VaultExportQueue,
+    local_writes: &LocalPageWriteQueue,
+) {
+    ui.save_current_page();
+    // Durability: drain debounced writer before leaving the canvas.
+    local_writes.flush_sync();
+    flush_active_note_pixels(ui, notes, data_dir, active_note_id);
+    if let Ok(id) = active_note_id.parse::<u32>() {
+        vault_export.mark(id);
+        vault_export.request_flush_soon();
+    }
 }
 
 /// Flush the live canvas of `active_note_id` to disk so gallery previews stay fresh.
@@ -7164,7 +7592,7 @@ fn save_notes_index(
     }
 }
 
-/// Persist notes index and mirror markdown sidecars into the configured vault.
+/// Persist notes index; defer vault OCR/PDF to leave-note / 10‑minute batch.
 fn save_notes_index_and_sync_vault(
     data_dir: &Path,
     notes: &[AppNote],
@@ -7172,40 +7600,76 @@ fn save_notes_index_and_sync_vault(
     note_id_seq: u32,
     notebook_id_seq: u32,
     config: &Config,
+    vault_export: &VaultExportQueue,
 ) {
     save_notes_index(data_dir, notes, notebooks, note_id_seq, notebook_id_seq);
-    sync_notes_export_to_vault(config, notes, notebooks, data_dir);
+    // Structural / metadata change: one deferred full library pass (same
+    // cascade as before) — never block the UI thread with OCR/PDF. Notes
+    // without a per-profile vault are skipped at flush time. The legacy
+    // `vault_path` flag is a cheap "any export configured" hint; flush uses
+    // per-profile connections as the source of truth.
+    if config.vault_path.is_some() {
+        vault_export.mark_full_sync();
+    }
 }
 
-/// Export one note's PDF + markdown sidecar into the vault (used on stroke end).
-fn export_single_note_to_vault(
+/// Profile id that owns a note for vault export (note → notebook fallback).
+fn note_export_profile_id(note: &AppNote, notebooks: &[AppNotebook]) -> String {
+    if !note.profile_id.is_empty() {
+        return note.profile_id.clone();
+    }
+    if let Some(nb_id) = note.notebook_id {
+        if let Some(nb) = notebooks.iter().find(|n| n.id == nb_id) {
+            if !nb.profile_id.is_empty() {
+                return nb.profile_id.clone();
+            }
+        }
+    }
+    String::new()
+}
+
+/// Absolute vault directory for `profile_id`, if that profile has a vault connection.
+fn vault_path_for_profile(connections: &[AppConnection], profile_id: &str) -> Option<PathBuf> {
+    if profile_id.is_empty() {
+        return None;
+    }
+    connections
+        .iter()
+        .find(|c| c.kind == "vault" && c.profile_id == profile_id)
+        .map(|c| expand_user_path(&c.value))
+        .filter(|p| p.is_dir())
+}
+
+/// Export one note's PDF + markdown without kicking git (batch caller pushes once).
+///
+/// Returns the vault path written when export ran; `None` when skipped (no
+/// note, or no vault connection for the note's profile).
+fn export_single_note_to_vault_no_git(
     config: &Config,
     notes: &[AppNote],
     notebooks: &[AppNotebook],
     data_dir: &Path,
+    connections: &[AppConnection],
     note_id: u32,
-) {
-    let Some(note) = notes.iter().find(|n| n.id == note_id) else {
-        return;
-    };
-    let Some(vault) = config.vault_path.as_ref() else {
-        return;
-    };
+) -> Option<PathBuf> {
+    let note = notes.iter().find(|n| n.id == note_id)?;
+    let profile_id = note_export_profile_id(note, notebooks);
+    let vault = vault_path_for_profile(connections, &profile_id)?;
     let (notebook_title, notebook_segments) = notebook_export_parts(notebooks, note.notebook_id);
     let export = build_vault_note_export(
         config,
-        vault,
+        &vault,
         data_dir,
         note,
         &notebook_title,
         &notebook_segments,
     );
     if let Err(e) =
-        ephemeris_core::export_note_markdown(vault, &config.vault_export_subdir, &export)
+        ephemeris_core::export_note_markdown(&vault, &config.vault_export_subdir, &export)
     {
         tracing::warn!("Vault markdown export for note {note_id} failed: {e}");
     }
-    schedule_vault_git_push(config);
+    Some(vault)
 }
 
 fn build_vault_note_export(
@@ -7287,35 +7751,61 @@ fn sync_notes_export_to_vault(
     notes: &[AppNote],
     notebooks: &[AppNotebook],
     data_dir: &Path,
+    connections: &[AppConnection],
 ) {
-    let Some(vault) = config.vault_path.as_ref() else {
-        return;
-    };
     let export_root = &config.vault_export_subdir;
-    let payload: Vec<VaultNoteExport> = notes
-        .iter()
-        .map(|n| {
-            let (notebook_title, notebook_segments) =
-                notebook_export_parts(notebooks, n.notebook_id);
-            build_vault_note_export(
-                config,
-                vault,
-                data_dir,
-                n,
-                &notebook_title,
-                &notebook_segments,
-            )
-        })
-        .collect();
-
-    match sync_notes_to_vault(vault, export_root, &payload) {
-        Ok(n) => tracing::debug!(
-            "Synced {n} notes to vault export under {}",
-            export_root.display()
-        ),
-        Err(e) => tracing::warn!("Vault note export sync failed: {e}"),
+    // Group notes by their profile's vault so one profile never writes into
+    // another profile's Obsidian folder. Profiles without a vault are skipped.
+    let mut by_vault: Vec<(PathBuf, Vec<VaultNoteExport>)> = Vec::new();
+    let mut skipped = 0usize;
+    for n in notes {
+        let profile_id = note_export_profile_id(n, notebooks);
+        let Some(vault) = vault_path_for_profile(connections, &profile_id) else {
+            skipped += 1;
+            continue;
+        };
+        let (notebook_title, notebook_segments) = notebook_export_parts(notebooks, n.notebook_id);
+        let export = build_vault_note_export(
+            config,
+            &vault,
+            data_dir,
+            n,
+            &notebook_title,
+            &notebook_segments,
+        );
+        if let Some((_, bucket)) = by_vault.iter_mut().find(|(p, _)| p == &vault) {
+            bucket.push(export);
+        } else {
+            by_vault.push((vault, vec![export]));
+        }
     }
-    schedule_vault_git_push(config);
+
+    let mut total = 0usize;
+    for (vault, payload) in &by_vault {
+        match sync_notes_to_vault(vault, export_root, payload) {
+            Ok(n) => {
+                total += n;
+                tracing::debug!(
+                    "Synced {n} notes to vault export under {}/{}",
+                    vault.display(),
+                    export_root.display()
+                );
+            }
+            Err(e) => tracing::warn!(
+                "Vault note export sync failed for {}: {e}",
+                vault.display()
+            ),
+        }
+        schedule_vault_git_push_for(config, vault);
+    }
+    if skipped > 0 {
+        tracing::debug!(
+            "Skipped {skipped} note(s) with no per-profile vault connection"
+        );
+    }
+    if total == 0 && by_vault.is_empty() {
+        tracing::debug!("No notes exported (no matching profile vaults)");
+    }
 }
 
 /// Push see-text content for the active note into the UI.
@@ -8070,20 +8560,25 @@ fn schedule_vault_git_pull(config: &Config) {
     });
 }
 
-/// Debounced background `git add/commit/push` after vault writes.
+/// Debounced background `git add/commit/push` for the legacy/active vault path.
 fn schedule_vault_git_push(config: &Config) {
+    if let Some(ref vault) = config.vault_path {
+        schedule_vault_git_push_for(config, vault);
+    }
+}
+
+/// Debounced background `git add/commit/push` after writes to a specific vault.
+fn schedule_vault_git_push_for(config: &Config, vault: &Path) {
     if !config.vault_git_enabled {
         return;
     }
-    let Some(vault) = config.vault_path.clone() else {
-        return;
-    };
-    if !ephemeris_core::is_git_repo(&vault) {
+    if !ephemeris_core::is_git_repo(vault) {
         return;
     }
     if VAULT_GIT_PUSH_PENDING.swap(true, Ordering::AcqRel) {
         return;
     }
+    let vault = vault.to_path_buf();
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_secs(3));
         VAULT_GIT_PUSH_PENDING.store(false, Ordering::Release);
@@ -8810,6 +9305,15 @@ fn priority_to_int(p: TaskPriority) -> i32 {
         TaskPriority::Medium => 2,
         TaskPriority::Low => 3,
     }
+}
+
+/// Next auto-title for a new note (`Config.note_title_pattern`, `{n}` = counter).
+fn next_note_title(config: &Config, n: u32) -> String {
+    format_note_title(
+        &config.note_title_pattern,
+        n,
+        Local::now().date_naive(),
+    )
 }
 
 fn now_secs() -> u64 {

@@ -345,8 +345,8 @@ impl Display for DesktopWindow {
     fn present(
         &mut self,
         buf: &PixelBuf,
-        _damage: &[Rect],
-        _mode: RefreshMode,
+        damage: &[Rect],
+        mode: RefreshMode,
     ) -> Result<(), DisplayError> {
         let phys = self.window.inner_size();
         let phys_w = phys.width as usize;
@@ -364,22 +364,123 @@ impl Display for DesktopWindow {
             .buffer_mut()
             .map_err(|e| DisplayError::present(e.to_string()))?;
 
-        // Nearest-neighbour upscale: each physical pixel maps back to its
-        // logical source pixel.  Handles any integer or fractional scale factor
-        // (e.g. 2× Retina, 1.5× fractional-DPI displays).
-        for py in 0..phys_h {
-            for px in 0..phys_w {
-                let lx = (px * lw / phys_w).min(lw - 1);
-                let ly = (py * lh / phys_h).min(lh - 1);
-                let g = buf.data.get(ly * lw + lx).copied().unwrap_or(255) as u32;
-                sb[py * phys_w + px] = (g << 16) | (g << 8) | g;
+        // Full refresh (or empty damage list): rewrite every physical pixel.
+        // Partial/Fast: only touch damage rects — critical for responsive ink
+        // on PineNote (1404×1872) where a full softbuffer present freezes.
+        // softbuffer age == 0 means the buffer contents are undefined, so we
+        // must rewrite the whole surface even for a Partial/Fast present.
+        let full = matches!(mode, RefreshMode::Full | RefreshMode::Clear)
+            || damage.is_empty()
+            || sb.age() == 0;
+
+        if full {
+            blit_gray_to_softbuffer(&mut sb, buf, lw, lh, phys_w, phys_h, 0, 0, lw, lh);
+            sb.present()
+                .map_err(|e| DisplayError::present(e.to_string()))?;
+        } else {
+            let mut sb_damage: Vec<softbuffer::Rect> = Vec::with_capacity(damage.len());
+            for r in damage {
+                if r.width == 0 || r.height == 0 {
+                    continue;
+                }
+                let lx0 = r.x.min(self.width.saturating_sub(1));
+                let ly0 = r.y.min(self.height.saturating_sub(1));
+                let lx1 = r.x.saturating_add(r.width).min(self.width);
+                let ly1 = r.y.saturating_add(r.height).min(self.height);
+                if lx1 <= lx0 || ly1 <= ly0 {
+                    continue;
+                }
+                // Map logical damage → physical buffer coordinates.
+                let px0 = (lx0 as u64 * phys_w as u64 / lw as u64) as u32;
+                let py0 = (ly0 as u64 * phys_h as u64 / lh as u64) as u32;
+                let px1 = ((lx1 as u64 * phys_w as u64 + lw as u64 - 1) / lw as u64) as u32;
+                let py1 = ((ly1 as u64 * phys_h as u64 + lh as u64 - 1) / lh as u64) as u32;
+                let pw = px1.saturating_sub(px0).min(phys.width.saturating_sub(px0));
+                let ph = py1.saturating_sub(py0).min(phys.height.saturating_sub(py0));
+                if pw == 0 || ph == 0 {
+                    continue;
+                }
+                blit_gray_to_softbuffer(
+                    &mut sb,
+                    buf,
+                    lw,
+                    lh,
+                    phys_w,
+                    phys_h,
+                    lx0 as usize,
+                    ly0 as usize,
+                    (lx1 - lx0) as usize,
+                    (ly1 - ly0) as usize,
+                );
+                if let (Some(w), Some(h)) = (NonZeroU32::new(pw), NonZeroU32::new(ph)) {
+                    sb_damage.push(softbuffer::Rect {
+                        x: px0,
+                        y: py0,
+                        width: w,
+                        height: h,
+                    });
+                }
+            }
+            if sb_damage.is_empty() {
+                sb.present()
+                    .map_err(|e| DisplayError::present(e.to_string()))?;
+            } else {
+                sb.present_with_damage(&sb_damage)
+                    .map_err(|e| DisplayError::present(e.to_string()))?;
             }
         }
 
-        sb.present()
-            .map_err(|e| DisplayError::present(e.to_string()))?;
-
         Ok(())
+    }
+}
+
+/// Copy a logical gray rectangle into the softbuffer XRGB8888 surface.
+///
+/// When logical and physical sizes match (PineNote design scale 1), this is a
+/// direct 1:1 write. Otherwise each physical pixel samples nearest-neighbour
+/// from the logical buffer (Retina / fractional DPI).
+fn blit_gray_to_softbuffer(
+    sb: &mut [u32],
+    buf: &PixelBuf,
+    lw: usize,
+    lh: usize,
+    phys_w: usize,
+    phys_h: usize,
+    lx0: usize,
+    ly0: usize,
+    lw_span: usize,
+    lh_span: usize,
+) {
+    if lw_span == 0 || lh_span == 0 {
+        return;
+    }
+    let lx1 = (lx0 + lw_span).min(lw);
+    let ly1 = (ly0 + lh_span).min(lh);
+
+    if lw == phys_w && lh == phys_h {
+        for ly in ly0..ly1 {
+            let row_off = ly * lw;
+            let sb_off = ly * phys_w;
+            for lx in lx0..lx1 {
+                let g = buf.data.get(row_off + lx).copied().unwrap_or(255) as u32;
+                sb[sb_off + lx] = (g << 16) | (g << 8) | g;
+            }
+        }
+        return;
+    }
+
+    // Physical span covering the logical rect (ceil on the far edge).
+    let px0 = lx0 * phys_w / lw;
+    let py0 = ly0 * phys_h / lh;
+    let px1 = ((lx1 * phys_w) + lw - 1) / lw;
+    let py1 = ((ly1 * phys_h) + lh - 1) / lh;
+    for py in py0..py1.min(phys_h) {
+        for px in px0..px1.min(phys_w) {
+            let lx = (px * lw / phys_w).min(lw - 1);
+            let ly = (py * lh / phys_h).min(lh - 1);
+            let g = buf.data.get(ly * lw + lx).copied().unwrap_or(255) as u32;
+            sb[py * phys_w + px] = (g << 16) | (g << 8) | g;
+        }
     }
 }
 

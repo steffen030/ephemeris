@@ -792,7 +792,7 @@ mod tests {
         write_md(tmp.path(), "Real.md", "# Real\n\nfindme-vault");
         write_md(
             tmp.path(),
-            "Ephemeris/Root/Local.md",
+            "Ephemeris/notes/Local.md",
             "# Local export\n\nfindme-export",
         );
 
