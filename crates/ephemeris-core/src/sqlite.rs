@@ -1357,6 +1357,7 @@ impl SqliteStore {
                     },
                     base_width: bw as f32,
                     points,
+                    t0_ms: 0,
                 }))
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -1406,6 +1407,7 @@ impl SqliteStore {
                 },
                 base_width: bw as f32,
                 points,
+                t0_ms: 0,
             });
         }
         Ok(out)

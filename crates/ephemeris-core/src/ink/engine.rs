@@ -172,6 +172,7 @@ impl StrokeBuilder {
             color: self.color,
             base_width: self.base_width,
             points: smoothed,
+            t0_ms: self.start_ms.map(u64::from).unwrap_or(0),
         }
     }
 }
@@ -297,6 +298,7 @@ mod tests {
             pressure,
             tilt: 0.0,
             in_range: true,
+            t_us: 0,
         }
     }
 
@@ -377,7 +379,11 @@ mod tests {
     fn hover_button_touch_are_idle() {
         let mut engine = InkEngine::new(InkConfig::default());
         assert_eq!(
-            engine.update_now(&InputEvent::Hover { x: 1.0, y: 2.0 }),
+            engine.update_now(&InputEvent::Hover {
+                x: 1.0,
+                y: 2.0,
+                t_us: 0,
+            }),
             InkUpdate::Idle
         );
         assert_eq!(

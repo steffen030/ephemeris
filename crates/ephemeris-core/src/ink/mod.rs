@@ -5,6 +5,7 @@
 //!
 //! * [`one_euro`] — adaptive low-pass smoothing of raw samples.
 //! * [`spline`] — centripetal Catmull-Rom resampling for a smooth curve.
+//! * [`replay`] — JSONL pen-capture parser / replayer using real timestamps.
 //! * [`width`] — pressure → stroke-width mapping.
 //! * [`engine`] — the [`InkEngine`] that ties it together and reports the
 //!   incremental damage rect for eink Fast-refresh.
@@ -14,6 +15,7 @@
 pub mod engine;
 pub mod eraser;
 pub mod one_euro;
+pub mod replay;
 pub mod spline;
 pub mod width;
 

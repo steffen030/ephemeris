@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use evdev::{AbsoluteAxisCode, Device, EventSummary, KeyCode, PropType};
@@ -236,6 +236,11 @@ fn run_device(
         };
 
         for ev in events {
+            let t_us = ev
+                .timestamp()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_micros() as u64)
+                .unwrap_or(0);
             match EventSummary::from(ev) {
                 EventSummary::AbsoluteAxis(_, AbsoluteAxisCode::ABS_X, val) => {
                     raw_x = val;
@@ -253,8 +258,8 @@ fn run_device(
                     if val == 0 && tip_down {
                         tip_down = false;
                         let sample = sample(
-                            raw_x, raw_y, raw_p, false, &target, digitizer, x_min, x_max, y_min,
-                            y_max, p_min, p_max,
+                            raw_x, raw_y, raw_p, false, t_us, &target, digitizer, x_min, x_max,
+                            y_min, y_max, p_min, p_max,
                         );
                         emit(&tx, &wake, InputEvent::PenUp(sample));
                     }
@@ -265,8 +270,8 @@ fn run_device(
                     }
                     let pressed = val != 0;
                     let s = sample(
-                        raw_x, raw_y, raw_p, pressed, &target, digitizer, x_min, x_max, y_min,
-                        y_max, p_min, p_max,
+                        raw_x, raw_y, raw_p, pressed, t_us, &target, digitizer, x_min, x_max,
+                        y_min, y_max, p_min, p_max,
                     );
                     if pressed && !tip_down {
                         tip_down = true;
@@ -285,6 +290,7 @@ fn run_device(
                         raw_y,
                         raw_p,
                         tip_down || in_range,
+                        t_us,
                         &target,
                         digitizer,
                         x_min,
@@ -297,7 +303,15 @@ fn run_device(
                     if tip_down {
                         emit(&tx, &wake, InputEvent::PenMove(s));
                     } else if in_range {
-                        emit(&tx, &wake, InputEvent::Hover { x: s.x, y: s.y });
+                        emit(
+                            &tx,
+                            &wake,
+                            InputEvent::Hover {
+                                x: s.x,
+                                y: s.y,
+                                t_us: s.t_us,
+                            },
+                        );
                     }
                 }
                 _ => {}
@@ -326,6 +340,7 @@ fn sample(
     raw_y: i32,
     raw_p: i32,
     in_contact: bool,
+    t_us: u64,
     target: &PenTarget,
     digitizer: (f32, f32),
     x_min: i32,
@@ -368,5 +383,6 @@ fn sample(
         pressure,
         tilt: 0.0,
         in_range: true,
+        t_us,
     }
 }

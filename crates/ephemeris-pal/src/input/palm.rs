@@ -121,6 +121,7 @@ mod tests {
             pressure: 0.5,
             tilt: 0.0,
             in_range: true,
+            t_us: 0,
         }
     }
 
@@ -147,7 +148,14 @@ mod tests {
     #[test]
     fn pen_hover_suppresses_immediate_touch() {
         let mut r = rejector();
-        r.filter(InputEvent::Hover { x: 10.0, y: 10.0 }, 100);
+        r.filter(
+            InputEvent::Hover {
+                x: 10.0,
+                y: 10.0,
+                t_us: 0,
+            },
+            100,
+        );
         assert!(r.filter(InputEvent::TouchBegin(touch(0)), 100).is_none());
     }
 
@@ -192,7 +200,16 @@ mod tests {
         assert!(r.filter(InputEvent::PenDown(pen(1.0, 1.0)), 0).is_some());
         assert!(r.filter(InputEvent::PenMove(pen(2.0, 2.0)), 8).is_some());
         assert!(r.filter(InputEvent::PenUp(pen(3.0, 3.0)), 16).is_some());
-        assert!(r.filter(InputEvent::Hover { x: 4.0, y: 4.0 }, 24).is_some());
+        assert!(r
+            .filter(
+                InputEvent::Hover {
+                    x: 4.0,
+                    y: 4.0,
+                    t_us: 0,
+                },
+                24
+            )
+            .is_some());
         assert!(r
             .filter(InputEvent::PenButton { pressed: false }, 32)
             .is_some());

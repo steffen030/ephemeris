@@ -120,6 +120,7 @@ impl MockInput {
             pressure,
             tilt,
             in_range: true,
+            t_us: 0,
         };
 
         let last = coords.len() - 1;
@@ -322,11 +323,12 @@ mod tests {
         let script = vec![ScriptEntry::immediate(InputEvent::Hover {
             x: 42.0,
             y: 99.0,
+            t_us: 0,
         })];
         let events = drain(MockInput::from_script(script));
 
         assert_eq!(events.len(), 1);
-        assert!(matches!(events[0], InputEvent::Hover { x, y } if x == 42.0 && y == 99.0));
+        assert!(matches!(events[0], InputEvent::Hover { x, y, .. } if x == 42.0 && y == 99.0));
     }
 
     // ── touch_gesture ────────────────────────────────────────────────────────
@@ -391,6 +393,7 @@ mod tests {
         let backend = MockInput::from_script(vec![ScriptEntry::immediate(InputEvent::Hover {
             x: 0.0,
             y: 0.0,
+            t_us: 0,
         })]);
         let rx = backend.receiver();
         backend.run().unwrap();

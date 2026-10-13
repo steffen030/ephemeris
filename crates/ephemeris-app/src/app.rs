@@ -24,7 +24,7 @@ use std::rc::Rc;
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Runtime;
@@ -5090,6 +5090,8 @@ impl App {
             };
             (source, Some(target))
         };
+        #[cfg(target_os = "linux")]
+        let ink_recorder = ephemeris_pal::input::InkRecorder::from_env();
 
         let mut handler = WinitHandler {
             _rt: self.rt,
@@ -5138,6 +5140,8 @@ impl App {
             push_recordings,
             #[cfg(target_os = "linux")]
             pen_source,
+            #[cfg(target_os = "linux")]
+            ink_recorder,
             #[cfg(target_os = "linux")]
             pen_target,
             chrome_peeking: false,
@@ -5273,6 +5277,9 @@ struct WinitHandler {
     /// Linux: separate digitiser (PineNote pen) via `/dev/input` — not wl_touch.
     #[cfg(target_os = "linux")]
     pen_source: Option<EvdevPenSource>,
+    /// `EPHEMERIS_INK_RECORD=/path.jsonl` — background JSONL pen capture.
+    #[cfg(target_os = "linux")]
+    ink_recorder: Option<ephemeris_pal::input::InkRecorder>,
     /// Shared with the evdev worker so resize / peek can refresh mapping.
     #[cfg(target_os = "linux")]
     pen_target: Option<Arc<PenTarget>>,
@@ -5380,7 +5387,7 @@ impl WinitHandler {
         self.sync_pen_geometry();
     }
 
-    fn handle_pointer_move(&mut self, lx: f32, ly: f32, pressure: f32) {
+    fn handle_pointer_move(&mut self, lx: f32, ly: f32, pressure: f32, t_us: u64) {
         use ephemeris_ui::STATUS_BAR_H;
         self.cursor_pos = (lx, ly);
         if self.chrome_swallow {
@@ -5415,8 +5422,9 @@ impl WinitHandler {
                         pressure,
                         tilt: 0.0,
                         in_range: true,
+                        t_us,
                     }),
-                    now_ms(),
+                    t_ms_from_us(t_us),
                 );
                 // Do not persist mid-stroke / mid-erase — sync disk I/O on every
                 // sample freezes PineNote. Persist on pointer release only.
@@ -5448,7 +5456,7 @@ impl WinitHandler {
         }
     }
 
-    fn handle_pointer_press(&mut self, lx: f32, ly: f32, pressure: f32) {
+    fn handle_pointer_press(&mut self, lx: f32, ly: f32, pressure: f32, t_us: u64) {
         use ephemeris_ui::{STATUS_BAR_H, TOOLBAR_H};
         let (_, ui_h) = self.ui.size();
         self.cursor_pos = (lx, ly);
@@ -5503,8 +5511,9 @@ impl WinitHandler {
                     pressure,
                     tilt: 0.0,
                     in_range: true,
+                    t_us,
                 }),
-                now_ms(),
+                t_ms_from_us(t_us),
             );
         }
         self.request_redraw_coalesced();
@@ -5556,7 +5565,7 @@ impl WinitHandler {
         self.vault_export.mark(note_id);
     }
 
-    fn handle_pointer_release(&mut self, lx: f32, ly: f32) {
+    fn handle_pointer_release(&mut self, lx: f32, ly: f32, t_us: u64) {
         use ephemeris_ui::STATUS_BAR_H;
         self.cursor_pos = (lx, ly);
         self.chrome_pointer_held = false;
@@ -5604,8 +5613,9 @@ impl WinitHandler {
                     pressure: self.last_ink_pressure,
                     tilt: 0.0,
                     in_range: true,
+                    t_us,
                 }),
-                now_ms(),
+                t_ms_from_us(t_us),
             );
             // Persist after pen commit / erase gesture end. Keep local disk
             // writes on the UI thread (fast) but never run vault OCR/PDF here.
@@ -5629,28 +5639,32 @@ impl WinitHandler {
         };
         let events: Vec<InputEvent> = src.try_iter().collect();
         for ev in events {
+            // Off-thread JSONL capture (EPHEMERIS_INK_RECORD); try_send only.
+            if let Some(rec) = &self.ink_recorder {
+                rec.record(&ev);
+            }
             match ev {
                 InputEvent::PenDown(s) => {
                     self.pointer_source = PointerSource::Pen;
                     self.page_swipe_allowed.set(false);
-                    self.handle_pointer_press(s.x, s.y, s.pressure);
+                    self.handle_pointer_press(s.x, s.y, s.pressure, s.t_us);
                 }
                 InputEvent::PenMove(s) => {
                     self.pointer_source = PointerSource::Pen;
-                    self.handle_pointer_move(s.x, s.y, s.pressure);
+                    self.handle_pointer_move(s.x, s.y, s.pressure, s.t_us);
                 }
                 InputEvent::PenUp(s) => {
                     self.pointer_source = PointerSource::Pen;
                     if s.pressure > 0.05 {
                         self.last_ink_pressure = s.pressure;
                     }
-                    self.handle_pointer_release(s.x, s.y);
+                    self.handle_pointer_release(s.x, s.y, s.t_us);
                 }
                 InputEvent::PenButton { pressed } => {
                     // Side button ≈ Ctrl (opens tool ring / modifier paths).
                     self.ctrl_held.set(pressed);
                 }
-                InputEvent::Hover { x, y } => {
+                InputEvent::Hover { x, y, .. } => {
                     self.cursor_pos = (x, y);
                     self.ui.dispatch_pointer_moved(x, y);
                 }
@@ -6019,7 +6033,7 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
 
             WindowEvent::CursorMoved { position, .. } => {
                 let (lx, ly) = self.map_to_ui(position);
-                self.handle_pointer_move(lx, ly, 0.6);
+                self.handle_pointer_move(lx, ly, 0.6, 0);
             }
 
             WindowEvent::MouseInput {
@@ -6032,10 +6046,10 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
                     winit::event::ElementState::Pressed => {
                         self.pointer_source = PointerSource::Mouse;
                         self.page_swipe_allowed.set(true);
-                        self.handle_pointer_press(lx, ly, 0.8);
+                        self.handle_pointer_press(lx, ly, 0.8, 0);
                     }
                     winit::event::ElementState::Released => {
-                        self.handle_pointer_release(lx, ly);
+                        self.handle_pointer_release(lx, ly, 0);
                     }
                 }
             }
@@ -6054,14 +6068,14 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
                     TouchPhase::Started => {
                         self.pointer_source = PointerSource::Finger;
                         self.page_swipe_allowed.set(true);
-                        self.handle_pointer_press(lx, ly, pressure);
+                        self.handle_pointer_press(lx, ly, pressure, 0);
                     }
                     TouchPhase::Moved => {
                         self.pointer_source = PointerSource::Finger;
-                        self.handle_pointer_move(lx, ly, pressure);
+                        self.handle_pointer_move(lx, ly, pressure, 0);
                     }
                     TouchPhase::Ended | TouchPhase::Cancelled => {
-                        self.handle_pointer_release(lx, ly);
+                        self.handle_pointer_release(lx, ly, 0);
                     }
                 }
             }
@@ -9383,6 +9397,22 @@ fn now_ms() -> u32 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u32
+}
+
+/// Ink-engine timestamp (ms) for a pointer sample.
+///
+/// `t_us == 0` (mouse / touch / synthetic) falls back to [`now_ms`]. Otherwise
+/// the kernel timestamp is mapped onto the `now_ms` clock via a process-static
+/// epoch pinned at the first stamped sample, so real pen inter-sample spacing
+/// is preserved (burst-delivered evdev packets no longer collapse onto one
+/// drain-time `now_ms()`).
+fn t_ms_from_us(t_us: u64) -> u32 {
+    if t_us == 0 {
+        return now_ms();
+    }
+    static EPOCH: OnceLock<(u64, u32)> = OnceLock::new();
+    let (epoch_us, epoch_ms) = *EPOCH.get_or_init(|| (t_us, now_ms()));
+    epoch_ms.wrapping_add((t_us.saturating_sub(epoch_us) / 1000) as u32)
 }
 
 fn sample_tasks_split(work: ProfileId, personal: ProfileId) -> Vec<Task> {

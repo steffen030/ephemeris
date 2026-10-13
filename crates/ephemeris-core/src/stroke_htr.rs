@@ -679,6 +679,7 @@ mod tests {
                 Point::new(x0, y, 0.5, 0.0, 0),
                 Point::new(x1, y, 0.5, 0.0, 100),
             ],
+            t0_ms: 0,
         }
     }
 

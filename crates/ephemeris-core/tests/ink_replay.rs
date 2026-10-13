@@ -211,6 +211,7 @@ fn move_without_down_is_ignored() {
         pressure: 0.5,
         tilt: 0.0,
         in_range: true,
+        t_us: 0,
     };
     let u = engine.update_now(&InputEvent::PenMove(sample));
     assert_eq!(u, InkUpdate::Idle);
@@ -221,7 +222,11 @@ fn move_without_down_is_ignored() {
 fn hover_and_touch_do_not_draw() {
     let mut engine = InkEngine::new(InkConfig::default());
     assert_eq!(
-        engine.update_now(&InputEvent::Hover { x: 1.0, y: 2.0 }),
+        engine.update_now(&InputEvent::Hover {
+            x: 1.0,
+            y: 2.0,
+            t_us: 0,
+        }),
         InkUpdate::Idle
     );
     assert_eq!(

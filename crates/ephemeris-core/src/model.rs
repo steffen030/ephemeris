@@ -565,6 +565,11 @@ pub struct Stroke {
     /// Nominal stroke width in logical pixels (pressure scales around this).
     pub base_width: f32,
     pub points: Vec<Point>,
+    /// Absolute start time of the stroke in milliseconds (the clock the input
+    /// source stamped the `PenDown` with). `0` = unknown (legacy / synthetic).
+    /// `Point::t_ms` stays stroke-relative; add `t0_ms` for absolute time.
+    #[serde(default)]
+    pub t0_ms: u64,
 }
 
 impl Stroke {
@@ -576,6 +581,7 @@ impl Stroke {
             color,
             base_width,
             points: Vec::new(),
+            t0_ms: 0,
         }
     }
 
