@@ -578,6 +578,19 @@ impl Stroke {
             points: Vec::new(),
         }
     }
+
+    /// Approximate centre-line AABB inflated by max rendered half-width + AA.
+    ///
+    /// Used for eraser region clears / damage so we do not re-raster the whole
+    /// page when removing a stroke.
+    pub fn approx_bbox(&self) -> crate::geom::Rect {
+        let mut r = crate::geom::Rect::empty();
+        for p in &self.points {
+            r.union_point(p.x, p.y);
+        }
+        // WidthConfig max_ratio is 1.6 — keep in sync with ink::width defaults.
+        r.inflate(self.base_width * 1.6 * 0.5 + 1.0)
+    }
 }
 
 // Compile-time assertion that all core model types are thread-safe.

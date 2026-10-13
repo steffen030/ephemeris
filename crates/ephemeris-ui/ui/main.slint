@@ -517,6 +517,8 @@ export component EphemerisPage inherits Window {
     in-out property <int> settings-theme-idx: 0;
     // When true, note canvas ink accepts pen (and desktop mouse) only — not finger.
     in-out property <bool> settings-pen-only: true;
+    // New-note title template (`yyyy`/`mm`/`dd` + `{n}`).
+    in-out property <string> settings-note-title-pattern: "yyyy-mm-dd Note {n}";
     in property <string> settings-vault-path: "";
     in property <[CalSource]> settings-cal-sources: [];
     in-out property <string> settings-new-url: "";
@@ -4288,6 +4290,40 @@ export component EphemerisPage inherits Window {
 
                         Rectangle { height: 2px; background: EinkTheme.chrome-border; }
 
+                        Rectangle {
+                            height: 72px;
+                            background: EinkTheme.canvas-bg;
+                            VerticalLayout {
+                                padding-left: 16px; padding-right: 16px;
+                                padding-top: 6px; padding-bottom: 6px;
+                                spacing: 4px;
+
+                                Text {
+                                    text: "New note title";
+                                    font-size: 14px; color: EinkTheme.btn-fg;
+                                    vertical-alignment: center;
+                                }
+                                Rectangle {
+                                    height: 32px;
+                                    border-radius: 4px; border-width: 2px;
+                                    border-color: EinkTheme.btn-border;
+                                    background: EinkTheme.canvas-bg;
+                                    TextInput {
+                                        x: 8px; width: parent.width - 16px; height: parent.height;
+                                        font-size: 13px; color: EinkTheme.btn-fg;
+                                        text <=> root.settings-note-title-pattern;
+                                        vertical-alignment: center; single-line: true;
+                                    }
+                                }
+                                Text {
+                                    text: "Tokens: yyyy mm dd · {n} = counter";
+                                    font-size: 11px; color: EinkTheme.text-secondary;
+                                }
+                            }
+                        }
+
+                        Rectangle { height: 2px; background: EinkTheme.chrome-border; }
+
                         if root.has-mic: Rectangle {
                             height: 36px;
                             background: EinkTheme.canvas-bg;
@@ -6827,12 +6863,14 @@ export component EphemerisPage inherits Window {
             }
         }
     }
-    Rectangle {
+    create-profile-picker-panel := Rectangle {
         visible: root.show-create-profile-picker;
         width: 280px;
-        // Recordings must belong to a real profile — All is aggregator-only.
-        property <int> row-count: root.profile-list.length + (root.create-picker-intent != "rec" ? 1 : 0);
-        height: 52px + row-count * 48px + 12px + 48px;
+        // All is aggregator-only — notes/recordings must pick a real profile.
+        // Notebook create may still offer All (unassigned / visible-in-all).
+        property <bool> show-all-row: root.create-picker-intent == "notebook";
+        property <int> row-count: root.profile-list.length + (create-profile-picker-panel.show-all-row ? 1 : 0);
+        height: 52px + create-profile-picker-panel.row-count * 48px + 12px + 48px;
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
         background: EinkTheme.chrome-bg;
@@ -6855,7 +6893,7 @@ export component EphemerisPage inherits Window {
                 }
             }
 
-            if root.create-picker-intent != "rec": Rectangle {
+            if create-profile-picker-panel.show-all-row: Rectangle {
                 height: 48px;
                 border-radius: 4px;
                 background: EinkTheme.btn-bg;

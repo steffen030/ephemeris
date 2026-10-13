@@ -21,7 +21,7 @@ pub mod sqlite;
 pub mod store;
 
 pub use action::{Action, ActionMap, ActionRouter, CanvasPoint, DefaultActionMap, RouterOutput};
-pub use config::{Config, TaskEngageConfig, TaskLaneConfig};
+pub use config::{format_note_title, Config, TaskEngageConfig, TaskLaneConfig};
 pub use error::{AppError, Result};
 pub use ink::{EraserConfig, EraserEngine, EraserUpdate, InkConfig, InkEngine, InkUpdate};
 pub use model::{
