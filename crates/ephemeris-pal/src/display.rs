@@ -116,16 +116,35 @@ impl Rect {
 
 /// Display abstraction for rendering pixel buffers.
 pub trait Display {
-    /// Get display size in pixels.
+    /// Get display size in logical (UI design) pixels.
     fn size(&self) -> (u32, u32);
 
-    /// Present a pixel buffer to the display.
+    /// Physical (panel) pixel size of the presented surface.
+    ///
+    /// Backends without HiDPI scaling report their logical size.
+    fn physical_size(&self) -> (u32, u32) {
+        self.size()
+    }
+
+    /// Present a logical-size pixel buffer; the backend scales it to the
+    /// physical surface if the two differ.
     fn present(
         &mut self,
         buf: &PixelBuf,
         damage: &[Rect],
         mode: RefreshMode,
     ) -> Result<(), DisplayError>;
+
+    /// Present a buffer already at [`Display::physical_size`] with damage in
+    /// physical pixels. Backends copy it 1:1 (no resampling).
+    fn present_physical(
+        &mut self,
+        buf: &PixelBuf,
+        damage: &[Rect],
+        mode: RefreshMode,
+    ) -> Result<(), DisplayError> {
+        self.present(buf, damage, mode)
+    }
 }
 
 // ── Desktop window backend (winit + softbuffer) ──────────────────────────────
@@ -181,8 +200,9 @@ impl DesktopWindow {
     /// `ApplicationHandler::resumed` callback.
     ///
     /// On HiDPI / Retina displays the softbuffer surface is sized to the
-    /// physical window dimensions and `present` upscales the 8-bpp logical
-    /// buffer to fill the physical surface.
+    /// physical window dimensions. [`Display::present_physical`] copies a
+    /// physical-size buffer 1:1; [`Display::present`] bilinear-upscales a
+    /// logical buffer.
     pub fn new(
         event_loop: &winit::event_loop::ActiveEventLoop,
         width: u32,
@@ -390,18 +410,48 @@ impl Display for DesktopWindow {
         (self.width, self.height)
     }
 
+    fn physical_size(&self) -> (u32, u32) {
+        DesktopWindow::physical_size(self)
+    }
+
     fn present(
         &mut self,
         buf: &PixelBuf,
         damage: &[Rect],
         mode: RefreshMode,
     ) -> Result<(), DisplayError> {
+        self.present_gray(buf, (self.width, self.height), damage, mode, "logical")
+    }
+
+    fn present_physical(
+        &mut self,
+        buf: &PixelBuf,
+        damage: &[Rect],
+        mode: RefreshMode,
+    ) -> Result<(), DisplayError> {
+        self.present_gray(buf, (buf.width, buf.height), damage, mode, "physical")
+    }
+}
+
+impl DesktopWindow {
+    /// Write a `src.0 × src.1` gray image (damage in the same space) to the
+    /// softbuffer surface. A source matching the surface is copied 1:1;
+    /// otherwise it is bilinear-resampled (resize races, logical callers).
+    fn present_gray(
+        &mut self,
+        buf: &PixelBuf,
+        src: (u32, u32),
+        damage: &[Rect],
+        mode: RefreshMode,
+        path: &'static str,
+    ) -> Result<(), DisplayError> {
         let phys = self.window.inner_size();
         let phys_w = phys.width as usize;
         let phys_h = phys.height as usize;
 
-        let lw = self.width as usize;
-        let lh = self.height as usize;
+        let (src_w, src_h) = src;
+        let lw = src_w as usize;
+        let lh = src_h as usize;
 
         if lw == 0 || lh == 0 || phys_w == 0 || phys_h == 0 {
             return Ok(());
@@ -420,13 +470,6 @@ impl Display for DesktopWindow {
         let age = sb.age();
         let full =
             matches!(mode, RefreshMode::Full | RefreshMode::Clear) || damage.is_empty() || age == 0;
-        // Fast ink: nearest (cheap). Clear/Full/age0: bilinear (sharp chrome).
-        // Bilinear every Fast damage rect at ~1.75× on 1404×1872 freezes RK3566.
-        let filter = if full || matches!(mode, RefreshMode::Full | RefreshMode::Clear) {
-            ScaleFilter::Bilinear
-        } else {
-            ScaleFilter::Nearest
-        };
         let one_to_one = lw == phys_w && lh == phys_h;
         let ink_trace = std::env::var_os("EPHEMERIS_INK_TRACE").is_some();
         let t0 = if ink_trace {
@@ -448,7 +491,6 @@ impl Display for DesktopWindow {
                     ly0: 0,
                     lw_span: lw,
                     lh_span: lh,
-                    filter,
                 },
             );
             sb.present()
@@ -459,10 +501,10 @@ impl Display for DesktopWindow {
                 if r.width == 0 || r.height == 0 {
                     continue;
                 }
-                let lx0 = r.x.min(self.width.saturating_sub(1));
-                let ly0 = r.y.min(self.height.saturating_sub(1));
-                let lx1 = r.x.saturating_add(r.width).min(self.width);
-                let ly1 = r.y.saturating_add(r.height).min(self.height);
+                let lx0 = r.x.min(src_w.saturating_sub(1));
+                let ly0 = r.y.min(src_h.saturating_sub(1));
+                let lx1 = r.x.saturating_add(r.width).min(src_w);
+                let ly1 = r.y.saturating_add(r.height).min(src_h);
                 if lx1 <= lx0 || ly1 <= ly0 {
                     continue;
                 }
@@ -488,7 +530,6 @@ impl Display for DesktopWindow {
                         ly0: ly0 as usize,
                         lw_span: (lx1 - lx0) as usize,
                         lh_span: (ly1 - ly0) as usize,
-                        filter,
                     },
                 );
                 if let (Some(w), Some(h)) = (NonZeroU32::new(pw), NonZeroU32::new(ph)) {
@@ -519,7 +560,7 @@ impl Display for DesktopWindow {
                     .sum()
             };
             log::info!(
-                "ink_trace present mode={mode:?} full={full} filter={filter:?} 1:1={one_to_one} age={age} logical={lw}x{lh} phys={phys_w}x{phys_h} damage_px={area} took={:?}",
+                "ink_trace present path={path} mode={mode:?} full={full} 1:1={one_to_one} age={age} src={lw}x{lh} phys={phys_w}x{phys_h} damage_px={area} took={:?}",
                 t0.elapsed()
             );
         }
@@ -528,16 +569,7 @@ impl Display for DesktopWindow {
     }
 }
 
-/// Upscale filter when logical UI ≠ physical softbuffer size.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ScaleFilter {
-    /// Integer sample — cheap enough for live ink on PineNote.
-    Nearest,
-    /// 4-tap — sharp chrome on Clear/Full; too expensive every pen sample.
-    Bilinear,
-}
-
-/// Geometry for copying a logical gray rect into a physical softbuffer surface.
+/// Geometry for copying a source gray rect into a physical softbuffer surface.
 struct SoftbufferBlit {
     logical_w: usize,
     logical_h: usize,
@@ -547,33 +579,35 @@ struct SoftbufferBlit {
     ly0: usize,
     lw_span: usize,
     lh_span: usize,
-    filter: ScaleFilter,
 }
 
-/// Copy a logical gray rectangle into the softbuffer XRGB8888 surface.
+/// Copy a source gray rectangle into the softbuffer XRGB8888 surface.
 ///
-/// When logical and physical sizes match this is a direct 1:1 write. Otherwise
-/// physical pixels are sampled from the logical buffer with [`ScaleFilter`].
+/// When source and physical sizes match this is a direct 1:1 write (the ink
+/// path). Otherwise physical pixels are bilinear-sampled from the source.
 fn blit_gray_to_softbuffer(sb: &mut [u32], buf: &PixelBuf, g: SoftbufferBlit) {
     if g.lw_span == 0 || g.lh_span == 0 {
         return;
     }
     let lx1 = (g.lx0 + g.lw_span).min(g.logical_w);
     let ly1 = (g.ly0 + g.lh_span).min(g.logical_h);
+    let stride = buf.stride as usize;
 
     if g.logical_w == g.phys_w && g.logical_h == g.phys_h {
+        if lx1 <= g.lx0 {
+            return;
+        }
         for ly in g.ly0..ly1 {
-            let row_off = ly * g.logical_w;
-            let sb_off = ly * g.phys_w;
-            for lx in g.lx0..lx1 {
-                let gray = buf.data.get(row_off + lx).copied().unwrap_or(255) as u32;
-                sb[sb_off + lx] = (gray << 16) | (gray << 8) | gray;
+            let src = &buf.data[ly * stride + g.lx0..ly * stride + lx1];
+            let dst = &mut sb[ly * g.phys_w + g.lx0..ly * g.phys_w + lx1];
+            for (d, &gray) in dst.iter_mut().zip(src) {
+                *d = u32::from(gray) * 0x0001_0101;
             }
         }
         return;
     }
 
-    // Physical span covering the logical rect (ceil on the far edge).
+    // Physical span covering the source rect (ceil on the far edge).
     let px0 = g.lx0 * g.phys_w / g.logical_w;
     let py0 = g.ly0 * g.phys_h / g.logical_h;
     let px1 = (lx1 * g.phys_w).div_ceil(g.logical_w);
@@ -583,44 +617,26 @@ fn blit_gray_to_softbuffer(sb: &mut [u32], buf: &PixelBuf, g: SoftbufferBlit) {
     let max_lx = g.logical_w.saturating_sub(1);
     let max_ly = g.logical_h.saturating_sub(1);
 
-    match g.filter {
-        ScaleFilter::Nearest => {
-            for py in py0..py1.min(g.phys_h) {
-                let ly = ((py as f32 + 0.5) * sy).floor() as usize;
-                let ly = ly.min(max_ly);
-                let row = ly * g.logical_w;
-                let sb_row = py * g.phys_w;
-                for px in px0..px1.min(g.phys_w) {
-                    let lx = ((px as f32 + 0.5) * sx).floor() as usize;
-                    let lx = lx.min(max_lx);
-                    let gray = buf.data.get(row + lx).copied().unwrap_or(255) as u32;
-                    sb[sb_row + px] = (gray << 16) | (gray << 8) | gray;
-                }
-            }
-        }
-        ScaleFilter::Bilinear => {
-            for py in py0..py1.min(g.phys_h) {
-                let fy = (py as f32 + 0.5) * sy - 0.5;
-                let y0 = fy.floor().max(0.0) as usize;
-                let y1 = (y0 + 1).min(max_ly);
-                let ty = (fy - y0 as f32).clamp(0.0, 1.0);
-                let row0 = y0 * g.logical_w;
-                let row1 = y1 * g.logical_w;
-                for px in px0..px1.min(g.phys_w) {
-                    let fx = (px as f32 + 0.5) * sx - 0.5;
-                    let x0 = fx.floor().max(0.0) as usize;
-                    let x1 = (x0 + 1).min(max_lx);
-                    let tx = (fx - x0 as f32).clamp(0.0, 1.0);
-                    let g00 = buf.data.get(row0 + x0).copied().unwrap_or(255) as f32;
-                    let g10 = buf.data.get(row0 + x1).copied().unwrap_or(255) as f32;
-                    let g01 = buf.data.get(row1 + x0).copied().unwrap_or(255) as f32;
-                    let g11 = buf.data.get(row1 + x1).copied().unwrap_or(255) as f32;
-                    let top = g00 + (g10 - g00) * tx;
-                    let bot = g01 + (g11 - g01) * tx;
-                    let gray = (top + (bot - top) * ty).round().clamp(0.0, 255.0) as u32;
-                    sb[py * g.phys_w + px] = (gray << 16) | (gray << 8) | gray;
-                }
-            }
+    for py in py0..py1.min(g.phys_h) {
+        let fy = (py as f32 + 0.5) * sy - 0.5;
+        let y0 = (fy.floor().max(0.0) as usize).min(max_ly);
+        let y1 = (y0 + 1).min(max_ly);
+        let ty = (fy - y0 as f32).clamp(0.0, 1.0);
+        let row0 = y0 * stride;
+        let row1 = y1 * stride;
+        for px in px0..px1.min(g.phys_w) {
+            let fx = (px as f32 + 0.5) * sx - 0.5;
+            let x0 = (fx.floor().max(0.0) as usize).min(max_lx);
+            let x1 = (x0 + 1).min(max_lx);
+            let tx = (fx - x0 as f32).clamp(0.0, 1.0);
+            let g00 = buf.data.get(row0 + x0).copied().unwrap_or(255) as f32;
+            let g10 = buf.data.get(row0 + x1).copied().unwrap_or(255) as f32;
+            let g01 = buf.data.get(row1 + x0).copied().unwrap_or(255) as f32;
+            let g11 = buf.data.get(row1 + x1).copied().unwrap_or(255) as f32;
+            let top = g00 + (g10 - g00) * tx;
+            let bot = g01 + (g11 - g01) * tx;
+            let gray = (top + (bot - top) * ty).round().clamp(0.0, 255.0) as u32;
+            sb[py * g.phys_w + px] = gray * 0x0001_0101;
         }
     }
 }
@@ -772,6 +788,39 @@ mod tests {
     }
 
     #[test]
+    fn physical_defaults_to_logical_size() {
+        let mut display = MockDesktop::new(80, 60).expect("should create");
+        assert_eq!(display.physical_size(), (80, 60));
+        let buf = PixelBuf::new(80, 60);
+        display
+            .present_physical(&buf, &[Rect::new(0, 0, 8, 8)], RefreshMode::Fast)
+            .expect("default present_physical forwards to present");
+    }
+
+    #[test]
+    fn one_to_one_blit_copies_damage_only() {
+        let mut buf = PixelBuf::new(4, 3);
+        buf.fill(10);
+        let mut sb = vec![0u32; 12];
+        blit_gray_to_softbuffer(
+            &mut sb,
+            &buf,
+            SoftbufferBlit {
+                logical_w: 4,
+                logical_h: 3,
+                phys_w: 4,
+                phys_h: 3,
+                lx0: 1,
+                ly0: 1,
+                lw_span: 2,
+                lh_span: 1,
+            },
+        );
+        let gray = 10u32 * 0x0001_0101;
+        assert_eq!(sb, [0, 0, 0, 0, 0, gray, gray, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
     fn bilinear_upscale_blends_neighbours() {
         // 2×2 logical → 4×4 physical: centre of the top-left physical
         // quadrant should sit between black (0,0) and white neighbours.
@@ -793,7 +842,6 @@ mod tests {
                 ly0: 0,
                 lw_span: 2,
                 lh_span: 2,
-                filter: ScaleFilter::Bilinear,
             },
         );
         let gray = |px: u32| (sb[px as usize] & 0xff) as u8;
