@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.1.9](https://github.com/steffen030/ephemeris/compare/v0.1.8...v0.1.9) (2026-10-13)
+
+
+### Features
+
+* GTD task lanes/Engage UI and land Dependabot cargo bumps ([#26](https://github.com/steffen030/ephemeris/issues/26)) ([09bb3eb](https://github.com/steffen030/ephemeris/commit/09bb3eb6c63b211cc5a5c1be212cd5e78eb7a3a3))
+
+
+### Bug Fixes
+
+* notes page-flip edge gestures and burger chrome ([#27](https://github.com/steffen030/ephemeris/issues/27)) ([693d827](https://github.com/steffen030/ephemeris/commit/693d8278a30465e40c94ba38986805dacb677c9e))
+* See-text handwriting cascade (async, beam LM, line HTR) ([#24](https://github.com/steffen030/ephemeris/issues/24)) ([c82e3dc](https://github.com/steffen030/ephemeris/commit/c82e3dc0ac9e48eb7f53bc85c7f4c837c595d688))
+
 ## [0.1.8](https://github.com/steffen030/ephemeris/compare/v0.1.7...v0.1.8) (2026-10-12)
 
 
