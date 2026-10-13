@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.10](https://github.com/steffen030/ephemeris/compare/v0.1.9...v0.1.10) (2026-10-13)
+
+
+### Features
+
+* defer vault export, isolate by profile, and polish note create ([#28](https://github.com/steffen030/ephemeris/issues/28)) ([23231a2](https://github.com/steffen030/ephemeris/commit/23231a20477b095fcb72a6e0e4e1c5f8b518a0b7))
+
 ## [0.1.9](https://github.com/steffen030/ephemeris/compare/v0.1.8...v0.1.9) (2026-10-13)
 
 
