@@ -388,9 +388,8 @@ impl Display for DesktopWindow {
         // softbuffer age == 0 means the buffer contents are undefined, so we
         // must rewrite the whole surface even for a Partial/Fast present.
         let age = sb.age();
-        let full = matches!(mode, RefreshMode::Full | RefreshMode::Clear)
-            || damage.is_empty()
-            || age == 0;
+        let full =
+            matches!(mode, RefreshMode::Full | RefreshMode::Clear) || damage.is_empty() || age == 0;
         let one_to_one = lw == phys_w && lh == phys_h;
         let ink_trace = std::env::var_os("EPHEMERIS_INK_TRACE").is_some();
         let t0 = if ink_trace {
