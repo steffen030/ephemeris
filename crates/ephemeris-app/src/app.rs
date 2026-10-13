@@ -181,7 +181,8 @@ struct PendingPageWrite {
     doc_page: usize,
     width: u32,
     height: u32,
-    pixels: Vec<u8>,
+    /// Shared ref to the live committed layer (no UI-thread memcpy).
+    pixels: Arc<ephemeris_pal::display::PixelBuf>,
     strokes: Vec<ephemeris_core::Stroke>,
 }
 
@@ -259,7 +260,7 @@ impl LocalPageWriteQueue {
                 job.doc_page,
                 job.width,
                 job.height,
-                &job.pixels,
+                &job.pixels.data,
             );
             save_note_page_strokes(&data_dir, job.note_id, job.doc_page, &job.strokes);
             active.store(false, Ordering::Release);
@@ -281,7 +282,7 @@ impl LocalPageWriteQueue {
                 job.doc_page,
                 job.width,
                 job.height,
-                &job.pixels,
+                &job.pixels.data,
             );
             save_note_page_strokes(&self.data_dir, job.note_id, job.doc_page, &job.strokes);
         }
@@ -5102,6 +5103,7 @@ impl App {
             page_swipe_handled,
             pointer_source: PointerSource::Mouse,
             is_drawing: false,
+            redraw_pending: false,
             data_dir,
             notes: notes.clone(),
             notebooks: notebooks.clone(),
@@ -5151,8 +5153,12 @@ impl App {
     }
 }
 
-/// Design UI size: `EPHEMERIS_SIZE=WxH`, else ~½ PineNote portrait so chrome
-/// upscales to ~1.75× on a 1404×1872 panel (icons/text readable on e-ink).
+/// Design UI size: `EPHEMERIS_SIZE=WxH`, else panel-native on Linux kiosk.
+///
+/// PineNote softbuffer presents physical pixels. A half-res logical buffer
+/// (800×1067 → 1404×1872) forces bilinear sampling on every ink present and
+/// freezes RK3566 hard enough for GNOME's force-quit dialog. Prefer 1:1 on
+/// the device; desktop/windowed builds keep the lighter half-res default.
 fn probe_window_size() -> (u32, u32) {
     if let Ok(raw) = std::env::var("EPHEMERIS_SIZE") {
         if let Some((w, h)) = raw.split_once('x').or_else(|| raw.split_once('X')) {
@@ -5162,9 +5168,14 @@ fn probe_window_size() -> (u32, u32) {
                 }
             }
         }
-        tracing::warn!("Ignoring invalid EPHEMERIS_SIZE={raw:?} (expected e.g. 800x1067)");
+        tracing::warn!("Ignoring invalid EPHEMERIS_SIZE={raw:?} (expected e.g. 1404x1872)");
     }
-    // Keep PineNote portrait aspect (1404∶1872 ≈ 3∶4).
+    #[cfg(target_os = "linux")]
+    if kiosk_enabled() {
+        // PineNote portrait panel (physical). Matches softbuffer surface → 1:1 blit.
+        return (1404, 1872);
+    }
+    // Desktop / windowed: half-res portrait aspect for lighter Retina upscale.
     (800, 1067)
 }
 
@@ -5201,6 +5212,10 @@ struct WinitHandler {
     pointer_source: PointerSource,
     /// True while a draw stroke is in progress (mouse button down, no Ctrl).
     is_drawing: bool,
+    /// Coalesce pen samples → one softbuffer present per event-loop turn.
+    /// Wayland `buffer_mut` blocks until the back buffer is released; per-sample
+    /// `request_redraw` wedges the UI thread on PineNote (force-quit dialog).
+    redraw_pending: bool,
     /// Directory where per-note pixel data is saved.
     data_dir: PathBuf,
     /// Shared note list — used to map page_idx → note_id for persistence.
@@ -5379,9 +5394,14 @@ impl WinitHandler {
                 return;
             }
         }
-        self.ui.dispatch_pointer_moved(lx, ly);
-        if self.is_drawing && !self.ui.is_canvas_active() {
-            self.is_drawing = false;
+        // While inking, skip Slint pointer dispatch — it dirties UI regions and
+        // upgrades Fast ink presents to Partial (and costs CPU every sample).
+        if self.is_drawing {
+            if !self.ui.is_canvas_active() {
+                self.is_drawing = false;
+            }
+        } else {
+            self.ui.dispatch_pointer_moved(lx, ly);
         }
         if self.is_drawing {
             let cy = ly - STATUS_BAR_H as f32;
@@ -5399,10 +5419,12 @@ impl WinitHandler {
                 // Do not persist mid-stroke / mid-erase — sync disk I/O on every
                 // sample freezes PineNote. Persist on pointer release only.
             }
-            if let Some(d) = &self.display {
-                d.request_redraw();
-            }
+            self.request_redraw_coalesced();
         } else if let Some(d) = &self.display {
+            // Keep OS cursor hidden over the note canvas (macOS re-shows it).
+            if self.ui.is_canvas_active() {
+                d.hide_cursor();
+            }
             // Idle moves over a static note canvas: skip redraw wake (eink).
             // Overlays / chrome swipe / peek still need Slint frames.
             let need = self.chrome_peeking
@@ -5410,8 +5432,19 @@ impl WinitHandler {
                 || !self.ui.is_canvas_active()
                 || self.ui.has_ink_damage();
             if need {
-                d.request_redraw();
+                self.request_redraw_coalesced();
             }
+        }
+    }
+
+    /// Ask for at most one redraw until `RedrawRequested` clears the flag.
+    fn request_redraw_coalesced(&mut self) {
+        if self.redraw_pending {
+            return;
+        }
+        self.redraw_pending = true;
+        if let Some(d) = &self.display {
+            d.request_redraw();
         }
     }
 
@@ -5461,6 +5494,9 @@ impl WinitHandler {
             && self.canvas_touch_down.get()
         {
             self.is_drawing = true;
+            if let Some(d) = &self.display {
+                d.hide_cursor();
+            }
             let cy = ly - STATUS_BAR_H as f32;
             self.ui.feed_input(
                 &InputEvent::PenDown(PenSample {
@@ -5473,9 +5509,7 @@ impl WinitHandler {
                 now_ms(),
             );
         }
-        if let Some(d) = &self.display {
-            d.request_redraw();
-        }
+        self.request_redraw_coalesced();
     }
 
     /// Persist raster + strokes when the live stroke list changed (erase / clear).
@@ -5498,7 +5532,9 @@ impl WinitHandler {
         let Some((note_id, doc_page)) = note_info else {
             return;
         };
-        let pixels = self.ui.get_committed_pixels();
+        // Arc snapshot for the writer; then re-unique the live layer so the next
+        // stroke does not COW the full panel mid-draw.
+        let pixels = self.ui.get_committed_pixels_arc();
         let (w, h) = self.ui.canvas_size();
         let strokes = self.ui.get_page_strokes();
         self.local_page_writes.queue(PendingPageWrite {
@@ -5509,12 +5545,14 @@ impl WinitHandler {
             pixels,
             strokes,
         });
+        self.ui.ensure_committed_unique();
         if let Some(note) = self.notes.borrow_mut().iter_mut().find(|n| n.id == note_id) {
             note.updated_at = now_secs();
             note.text_content = None;
         }
         // Drop stale See-text so the next toggle re-OCRs instead of showing
-        // text from before this ink change.
+        // text from before this ink change. No-op when already empty (avoids
+        // Slint UI damage mid-ink present).
         self.ui.set_note_text_content("");
         // Vault export waits for leave-note or the 10‑minute batch — never per stroke.
         self.vault_export.mark(note_id);
@@ -5634,7 +5672,12 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
         #[cfg(target_os = "linux")]
         self.drain_pen_events();
         // Kiosk watchdog: re-cover the output unless we're peeking the panel.
-        if kiosk_enabled() && self.last_kiosk_check.elapsed() >= Duration::from_millis(250) {
+        // Skip while drawing — enter_kiosk/resize resets softbuffer age→0 and
+        // forces a full-panel rewrite mid-stroke (PineNote force-quit).
+        if kiosk_enabled()
+            && !self.is_drawing
+            && self.last_kiosk_check.elapsed() >= Duration::from_millis(250)
+        {
             self.last_kiosk_check = Instant::now();
             self.on_kiosk_geometry();
         }
@@ -5942,7 +5985,12 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
                 self.on_kiosk_geometry();
             }
 
-            WindowEvent::Focused(_) => {
+            WindowEvent::Focused(focused) => {
+                if focused {
+                    if let Some(d) = &self.display {
+                        d.hide_cursor();
+                    }
+                }
                 self.on_kiosk_geometry();
             }
 
@@ -6042,6 +6090,7 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
             }
 
             WindowEvent::RedrawRequested => {
+                self.redraw_pending = false;
                 if let Some(display) = &mut self.display {
                     if let Err(e) = self.ui.render_frame(display) {
                         tracing::error!("render_frame failed: {e}");

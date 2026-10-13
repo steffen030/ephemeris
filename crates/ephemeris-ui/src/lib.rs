@@ -831,6 +831,11 @@ impl EphemerisUi {
 
     /// Set the machine-readable text shown in the see-text overlay.
     pub fn set_note_text_content(&self, text: &str) {
+        // Skip no-op updates — Slint property sets dirty UI damage and can
+        // upgrade the next ink present from Fast → Partial.
+        if self.component.get_note_text_content().as_str() == text {
+            return;
+        }
         self.component
             .set_note_text_content(slint::SharedString::from(text));
     }
@@ -2127,6 +2132,20 @@ impl EphemerisUi {
         self.committed_layer.borrow().data.clone()
     }
 
+    /// Shared handle to the committed ink layer (cheap `Arc` clone — no memcpy).
+    pub fn get_committed_pixels_arc(&self) -> Arc<PixelBuf> {
+        Arc::clone(&self.committed_layer.borrow())
+    }
+
+    /// Ensure the live committed layer is uniquely owned.
+    ///
+    /// Call after handing an [`Arc`] snapshot to a background writer so the next
+    /// stroke's `Arc::make_mut` does not COW mid-draw.
+    pub fn ensure_committed_unique(&self) {
+        let mut arc = self.committed_layer.borrow_mut();
+        let _ = Arc::make_mut(&mut arc);
+    }
+
     /// True when ink damage or a screen-change is queued for the next present.
     pub fn has_ink_damage(&self) -> bool {
         self.screen_change.get() || !self.ink_damage.borrow().is_empty()
@@ -2519,14 +2538,9 @@ impl EphemerisUi {
                 self.in_progress.borrow_mut().clear();
                 self.clear_in_progress_layer(tool);
 
-                if let InputEvent::PenDown(s) = event {
-                    let pt = Point {
-                        x: s.x,
-                        y: s.y,
-                        pressure: s.pressure.clamp(0.0, 1.0),
-                        tilt: s.tilt,
-                        t_ms: 0,
-                    };
+                // Stamp the engine's accepted point (raw-anchored on PenDown),
+                // not a separately reconstructed sample — keeps tip/damage aligned.
+                if let Some(pt) = self.engine.borrow().last_point() {
                     self.in_progress.borrow_mut().push(pt);
                     raster::rasterize_points(
                         &mut self.in_progress_layer.borrow_mut(),
@@ -2540,19 +2554,15 @@ impl EphemerisUi {
                     );
                     let pad = bw + 1.0;
                     self.push_ink_damage(
-                        ephemeris_core::geom::Rect::new(s.x, s.y, s.x, s.y).inflate(pad),
+                        ephemeris_core::geom::Rect::new(pt.x, pt.y, pt.x, pt.y).inflate(pad),
                     );
                 }
             }
             InkUpdate::Extended { damage } => {
-                if let InputEvent::PenMove(s) = event {
-                    let pt = Point {
-                        x: s.x,
-                        y: s.y,
-                        pressure: s.pressure.clamp(0.0, 1.0),
-                        tilt: s.tilt,
-                        t_ms,
-                    };
+                // Use One-Euro-smoothed engine points for live ink. Stamping raw
+                // PenSample coords drew ahead of the damage rect (tip lag) and
+                // left a jagged polyline that never matched the committed spline.
+                if let Some(pt) = self.engine.borrow().last_point() {
                     let seg = {
                         let mut pts = self.in_progress.borrow_mut();
                         pts.push(pt);
@@ -2599,13 +2609,17 @@ impl EphemerisUi {
                         let mut book = self.pages.borrow_mut();
                         let page = book.current_page_mut();
                         page.strokes = self.strokes.borrow().clone();
-                        // Arc clone — no full-canvas memcpy on stroke end.
-                        page.committed = Arc::clone(&self.committed_layer.borrow());
+                        // Do NOT Arc::clone committed into PageBook here — that
+                        // shares ownership so the next stroke's Arc::make_mut
+                        // COWs the full canvas (~2.6MB at PineNote 1:1). Live
+                        // `committed_layer` stays unique; save_current_page /
+                        // navigate sync PageBook.
                     }
                     self.strokes_dirty.set(true);
                 }
                 self.in_progress.borrow_mut().clear();
                 self.clear_in_progress_layer(tool);
+                // `damage` is the full stroke bbox from the engine (not tip-only).
                 self.push_ink_damage(*damage);
             }
             InkUpdate::Idle => {}
@@ -4197,7 +4211,8 @@ mod tests {
 
     /// The scheduler's periodic-full policy is configurable via
     /// [`EphemerisUi::set_refresh_config`]: after N fast/partial frames it emits
-    /// a `Full` to flush accumulated ghosting.
+    /// a `Full` to flush accumulated ghosting — but live ink stays `Fast` so
+    /// mid-stroke presents never freeze on a full softbuffer rewrite.
     #[test]
     fn set_refresh_config_controls_periodic_full() {
         let ui = EphemerisUi::new(800, 600).expect("UI construction failed");
@@ -4214,7 +4229,7 @@ mod tests {
             .expect("idle render failed")
             .is_empty());
 
-        // Three ink frames: Fast, Fast, then Full (3rd hits the interval).
+        // Ink frames stay Fast even past the interval.
         let mut modes = Vec::new();
         for i in 0..3 {
             let t = i * 16;
@@ -4225,8 +4240,13 @@ mod tests {
         }
         assert_eq!(
             modes,
-            vec![RefreshMode::Fast, RefreshMode::Fast, RefreshMode::Full]
+            vec![RefreshMode::Fast, RefreshMode::Fast, RefreshMode::Fast]
         );
+
+        // Next UI damage should Full immediately (counter already past interval).
+        ui.set_show_start_page(true);
+        ui.render_frame(&mut disp).expect("ui render failed");
+        assert_eq!(disp.last_mode, Some(RefreshMode::Full));
     }
 
     /// Verify that text elements (status bar, toolbar) render without panicking

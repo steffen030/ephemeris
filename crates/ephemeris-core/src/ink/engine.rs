@@ -176,6 +176,12 @@ impl StrokeBuilder {
     }
 }
 
+/// Damage covering a finished stroke: raw-sample union plus the smoothed
+/// centre-line bbox (Catmull-Rom can overshoot the sample polyline).
+fn finished_stroke_damage(sample_union: Rect, stroke: &Stroke) -> Rect {
+    sample_union.union(&stroke.approx_bbox())
+}
+
 /// The ink engine. Feed it [`InputEvent`]s; it emits [`InkUpdate`]s.
 pub struct InkEngine {
     cfg: InkConfig,
@@ -196,6 +202,14 @@ impl InkEngine {
     /// Whether a stroke is currently in progress.
     pub fn is_drawing(&self) -> bool {
         self.active.is_some()
+    }
+
+    /// Last accepted (One-Euro-smoothed) point of the in-progress stroke.
+    ///
+    /// Callers should stamp this — not the raw `PenSample` — into the live
+    /// ink layer so preview damage and tip position match the engine.
+    pub fn last_point(&self) -> Option<Point> {
+        self.active.as_ref().and_then(|b| b.points.last().copied())
     }
 
     /// Read-only access to the engine's current configuration.
@@ -235,8 +249,13 @@ impl InkEngine {
             },
             InputEvent::PenUp(s) => match self.active.take() {
                 Some(mut b) => {
-                    let damage = b.push_sample(s, t_ms, true).unwrap_or(b.total_damage);
+                    // Tip sample updates total_damage; Finished must damage the
+                    // whole stroke so the smoothed committed raster presents
+                    // (tip-only left raw in-progress pixels on screen).
+                    let _ = b.push_sample(s, t_ms, true);
+                    let sample_union = b.total_damage;
                     let stroke = b.finish(self.cfg.spline_segments);
+                    let damage = finished_stroke_damage(sample_union, &stroke);
                     InkUpdate::Finished {
                         stroke: Box::new(stroke),
                         damage,
@@ -444,6 +463,39 @@ mod tests {
             union.width() < 200.0 && union.height() < 200.0,
             "damage union too large: {union:?}"
         );
+    }
+
+    #[test]
+    fn finished_damage_covers_full_smoothed_stroke() {
+        // PenUp must damage the whole stroke, not just the tip segment — otherwise
+        // the committed Catmull-Rom raster never presents outside the tip.
+        let coords = diagonal(12);
+        let (updates, stroke) = drive(&coords, 0.5);
+        let InkUpdate::Finished { damage, .. } = updates.last().unwrap() else {
+            panic!("expected Finished");
+        };
+        let need = stroke.approx_bbox();
+        assert!(
+            damage.min_x <= need.min_x + 1e-3
+                && damage.min_y <= need.min_y + 1e-3
+                && damage.max_x >= need.max_x - 1e-3
+                && damage.max_y >= need.max_y - 1e-3,
+            "Finished damage {damage:?} must cover stroke bbox {need:?}"
+        );
+    }
+
+    #[test]
+    fn last_point_tracks_accepted_samples() {
+        let mut engine = InkEngine::new(InkConfig::default());
+        assert!(engine.last_point().is_none());
+        engine.update_now(&InputEvent::PenDown(sample(10.0, 20.0, 0.5)));
+        let p0 = engine.last_point().expect("after PenDown");
+        assert!((p0.x - 10.0).abs() < 1e-4 && (p0.y - 20.0).abs() < 1e-4);
+        engine.update_now(&InputEvent::PenMove(sample(30.0, 40.0, 0.5)));
+        let p1 = engine.last_point().expect("after PenMove");
+        assert!(p1.x.is_finite() && p1.y.is_finite());
+        let _ = engine.update_now(&InputEvent::PenUp(sample(50.0, 60.0, 0.5)));
+        assert!(engine.last_point().is_none());
     }
 
     #[test]

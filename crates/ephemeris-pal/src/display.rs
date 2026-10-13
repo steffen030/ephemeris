@@ -213,7 +213,9 @@ impl DesktopWindow {
         // Pen-first / e-ink: hide the OS pointer. Hover and CursorMoved still
         // drive Slint hit-testing; a visible cursor tracks the stylus and looks
         // wrong on the note canvas (and wasted ink on partial refresh).
-        window.set_cursor_visible(false);
+        // macOS can re-show the cursor after focus changes — re-assert via
+        // [`DesktopWindow::hide_cursor`].
+        hide_os_cursor(&window);
 
         let ctx = softbuffer::Context::new(window.clone())
             .map_err(|e| DisplayError::init(e.to_string()))?;
@@ -315,6 +317,13 @@ impl DesktopWindow {
     /// Request keyboard/pointer focus so the shell dismisses the top panel.
     pub fn focus(&self) {
         self.window.focus_window();
+        // Focus regain often restores the OS cursor on macOS; keep pen-first UX.
+        self.hide_cursor();
+    }
+
+    /// Hide the OS pointer (pen-first note canvas). Safe to call repeatedly.
+    pub fn hide_cursor(&self) {
+        hide_os_cursor(&self.window);
     }
 
     /// Returns the window's current scale factor (physical / logical pixels).
@@ -332,6 +341,10 @@ impl DesktopWindow {
     pub fn logical_size(&self) -> (u32, u32) {
         (self.width, self.height)
     }
+}
+
+fn hide_os_cursor(window: &winit::window::Window) {
+    window.set_cursor_visible(false);
 }
 
 fn apply_borderless_fullscreen(window: &winit::window::Window) {
@@ -374,9 +387,17 @@ impl Display for DesktopWindow {
         // on PineNote (1404×1872) where a full softbuffer present freezes.
         // softbuffer age == 0 means the buffer contents are undefined, so we
         // must rewrite the whole surface even for a Partial/Fast present.
+        let age = sb.age();
         let full = matches!(mode, RefreshMode::Full | RefreshMode::Clear)
             || damage.is_empty()
-            || sb.age() == 0;
+            || age == 0;
+        let one_to_one = lw == phys_w && lh == phys_h;
+        let ink_trace = std::env::var_os("EPHEMERIS_INK_TRACE").is_some();
+        let t0 = if ink_trace {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
 
         if full {
             blit_gray_to_softbuffer(
@@ -448,6 +469,21 @@ impl Display for DesktopWindow {
                 sb.present_with_damage(&sb_damage)
                     .map_err(|e| DisplayError::present(e.to_string()))?;
             }
+        }
+
+        if let Some(t0) = t0 {
+            let area: u64 = if full {
+                (phys_w as u64) * (phys_h as u64)
+            } else {
+                damage
+                    .iter()
+                    .map(|r| u64::from(r.width) * u64::from(r.height))
+                    .sum()
+            };
+            log::info!(
+                "ink_trace present mode={mode:?} full={full} 1:1={one_to_one} age={age} logical={lw}x{lh} phys={phys_w}x{phys_h} damage_px={area} took={:?}",
+                t0.elapsed()
+            );
         }
 
         Ok(())
