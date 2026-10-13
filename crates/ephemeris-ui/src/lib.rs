@@ -3174,8 +3174,7 @@ fn render_background_in_rect(
             let line_spacing = 28u32;
             let line_color = 200u8;
             let first = canvas_start
-                + ((y0.saturating_sub(canvas_start) + line_spacing - 1) / line_spacing)
-                    * line_spacing;
+                + y0.saturating_sub(canvas_start).div_ceil(line_spacing) * line_spacing;
             let mut row = first;
             while row < y1 {
                 if row >= y0 {
@@ -3211,8 +3210,8 @@ fn render_background_in_rect(
         PageTemplate::Dot => {
             let spacing = 28u32;
             let dot_color = 210u8;
-            let first_row = canvas_start
-                + ((y0.saturating_sub(canvas_start) + spacing - 1) / spacing) * spacing;
+            let first_row =
+                canvas_start + y0.saturating_sub(canvas_start).div_ceil(spacing) * spacing;
             let mut row = first_row;
             while row < y1 {
                 if row >= y0 {

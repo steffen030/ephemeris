@@ -751,10 +751,7 @@ mod tests {
             format_note_title("yyyy-mm-dd Note {n}", 7, d),
             "2026-10-13 Note 7"
         );
-        assert_eq!(
-            format_note_title("", 3, d),
-            "2026-10-13 Note 3"
-        );
+        assert_eq!(format_note_title("", 3, d), "2026-10-13 Note 3");
         assert_eq!(format_note_title("Scratch {n}", 1, d), "Scratch 1");
     }
 

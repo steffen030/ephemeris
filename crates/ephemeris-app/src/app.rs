@@ -4,11 +4,11 @@ use ephemeris_core::ink::InkUpdate;
 use ephemeris_core::model::Tool;
 use ephemeris_core::profile_manager::ProfileManager;
 use ephemeris_core::{
-    count_lane, export_raster_pages_to_pdf, filter_agenda, is_stale, list_engage, mark_reviewed,
-    markdown_to_blocks, markdown_to_plain, resolve_lane, review_queue, search_events,
-    search_local_notes, search_tasks, set_lane_tag, strip_inline_markdown, sync_notes_to_vault,
-    sync_tags_from_structured, to_agenda_entries, AgendaRange, CalendarEvent, CascadingTranscriber,
-    format_note_title, Config, EngageFilter, EventId, LineImageHtrTranscriber,
+    count_lane, export_raster_pages_to_pdf, filter_agenda, format_note_title, is_stale,
+    list_engage, mark_reviewed, markdown_to_blocks, markdown_to_plain, resolve_lane, review_queue,
+    search_events, search_local_notes, search_tasks, set_lane_tag, strip_inline_markdown,
+    sync_notes_to_vault, sync_tags_from_structured, to_agenda_entries, AgendaRange, CalendarEvent,
+    CascadingTranscriber, Config, EngageFilter, EventId, LineImageHtrTranscriber,
     MarkdownTaskExtractor, PdfExportOptions, ProfileId, RasterOcrTranscriber, RasterPage,
     SearchHit, StrokeHtrTranscriber, Task, TaskContext, TaskContextKind, TaskId, TaskPriority,
     TaskProvider, VaultFtsIndex, VaultNoteExport,
@@ -7791,17 +7791,12 @@ fn sync_notes_export_to_vault(
                     export_root.display()
                 );
             }
-            Err(e) => tracing::warn!(
-                "Vault note export sync failed for {}: {e}",
-                vault.display()
-            ),
+            Err(e) => tracing::warn!("Vault note export sync failed for {}: {e}", vault.display()),
         }
         schedule_vault_git_push_for(config, vault);
     }
     if skipped > 0 {
-        tracing::debug!(
-            "Skipped {skipped} note(s) with no per-profile vault connection"
-        );
+        tracing::debug!("Skipped {skipped} note(s) with no per-profile vault connection");
     }
     if total == 0 && by_vault.is_empty() {
         tracing::debug!("No notes exported (no matching profile vaults)");
@@ -9309,11 +9304,7 @@ fn priority_to_int(p: TaskPriority) -> i32 {
 
 /// Next auto-title for a new note (`Config.note_title_pattern`, `{n}` = counter).
 fn next_note_title(config: &Config, n: u32) -> String {
-    format_note_title(
-        &config.note_title_pattern,
-        n,
-        Local::now().date_naive(),
-    )
+    format_note_title(&config.note_title_pattern, n, Local::now().date_naive())
 }
 
 fn now_secs() -> u64 {
