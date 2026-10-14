@@ -157,6 +157,8 @@ export struct TaskViewEntry {
     overdue: bool,
     done: bool,
     lane-label: string,
+    /// True when the task has an Obsidian `source_ref` (openable vault note).
+    has-source-note: bool,
     /// Show owning-profile badge (All aggregator view).
     show-profile: bool,
     profile-icon-char: string,
@@ -409,6 +411,8 @@ export component EphemerisPage inherits Window {
     in-out property <string> task-dialog-lane: "next";
     in-out property <string> task-dialog-contexts: ""; // space-separated context names
     in-out property <string> task-dialog-waiting: "";
+    /// True when edit dialog can open the Obsidian source note.
+    in-out property <bool> task-dialog-has-source-note: false;
     in-out property <string> task-filter: "active";    // all | active | done
     in-out property <string> task-sort: "priority"; // priority | due | title | added
     // Horizon lane filter; empty = all lanes (default so vault tasks without #lane/* show).
@@ -427,6 +431,8 @@ export component EphemerisPage inherits Window {
     callback task-back-tapped();
     callback task-complete-toggled(string);
     callback task-edit-requested(string);
+    /// Open the Obsidian vault note linked via `source_ref` (modal md-viewer).
+    callback task-view-source-note(string);
     // title, priority, due, tags, lane, contexts, waiting
     callback task-confirm-add(string, int, string, string, string, string, string);
     // id, title, priority, due, tags, lane, contexts, waiting
@@ -439,6 +445,9 @@ export component EphemerisPage inherits Window {
     callback task-priority-cycle(string);
     callback task-profile-filter-changed(string);
     callback task-search-changed(string);
+    /// Explicit page flip from the burger page indicator (same rules as edge swipe).
+    callback page-prev-tapped();
+    callback page-next-tapped();
 
     // ── Event create dialog (action ring / quick add) ─────────────────────
     in-out property <bool> event-dialog-visible: false;
@@ -1348,6 +1357,7 @@ export component EphemerisPage inherits Window {
                                 root.task-dialog-lane = "next";
                                 root.task-dialog-contexts = "";
                                 root.task-dialog-waiting = "";
+                                root.task-dialog-has-source-note = false;
                                 root.task-dialog-visible = true;
                             }
                         }
@@ -1568,7 +1578,7 @@ export component EphemerisPage inherits Window {
                     spacing: 0px;
                     width: root.width - root.nav-w;
 
-                    // check | profile | prio chip | wrapping title | due | edit
+                    // check | profile | prio chip | wrapping title | due | note? | edit
                     for item[i] in root.full-task-list: Rectangle {
                         height: 64px;
                         width: root.width - root.nav-w;
@@ -1579,6 +1589,7 @@ export component EphemerisPage inherits Window {
                         property <length> profile-w: item.show-profile ? 22px : 0px;
                         property <length> prio-w: 28px;
                         property <length> due-w: 56px;
+                        property <length> note-w: item.has-source-note ? 32px : 0px;
                         property <length> edit-w: 32px;
                         property <length> gap: 8px;
                         property <length> x-check: self.pad;
@@ -1586,7 +1597,8 @@ export component EphemerisPage inherits Window {
                         property <length> x-prio: self.x-profile + self.profile-w + (item.show-profile ? self.gap : 0px);
                         property <length> x-title: self.x-prio + self.prio-w + self.gap;
                         property <length> x-edit: self.width - self.pad - self.edit-w;
-                        property <length> x-due: self.x-edit - self.gap - self.due-w;
+                        property <length> x-note: self.x-edit - (item.has-source-note ? self.gap + self.note-w : 0px);
+                        property <length> x-due: self.x-note - self.gap - self.due-w;
                         property <length> title-w: self.x-due - self.x-title - self.gap;
 
                         Rectangle {
@@ -1635,16 +1647,25 @@ export component EphemerisPage inherits Window {
                             TouchArea { clicked => { root.task-priority-cycle(item.id); } }
                         }
 
-                        Text {
+                        // Title tap opens the task (same as home Engage rows).
+                        Rectangle {
                             x: x-title; y: 8px;
                             width: title-w > 40px ? title-w : 40px;
                             height: 48px;
-                            text: item.title;
-                            font-size: 13px;
-                            color: item.done ? EinkTheme.text-secondary : EinkTheme.btn-fg;
-                            wrap: word-wrap;
-                            overflow: elide;
-                            vertical-alignment: top;
+                            background: transparent;
+                            Text {
+                                width: parent.width; height: parent.height;
+                                text: item.title;
+                                font-size: 13px;
+                                color: item.done ? EinkTheme.text-secondary : EinkTheme.btn-fg;
+                                wrap: word-wrap;
+                                overflow: elide;
+                                vertical-alignment: top;
+                            }
+                            TouchArea {
+                                width: parent.width; height: parent.height;
+                                clicked => { root.task-edit-requested(item.id); }
+                            }
                         }
 
                         // Scratch-out for completed items (closure cue; stays visible for the day).
@@ -1665,6 +1686,16 @@ export component EphemerisPage inherits Window {
                             color: item.done ? EinkTheme.text-secondary
                                 : (item.overdue ? EinkTheme.danger-fg : EinkTheme.text-secondary);
                             horizontal-alignment: right;
+                        }
+
+                        if item.has-source-note: Text {
+                            x: x-note; y: 0;
+                            width: note-w; height: parent.height;
+                            text: Icons.notes;
+                            font-family: "Material Icons";
+                            font-size: 18px; color: EinkTheme.text-secondary;
+                            horizontal-alignment: center; vertical-alignment: center;
+                            TouchArea { clicked => { root.task-view-source-note(item.id); } }
                         }
 
                         Text {
@@ -3146,25 +3177,70 @@ export component EphemerisPage inherits Window {
 
     }
 
-    // Page X/Y — visible only while the note burger menu is open.
+    // Page X/Y + prev/next — visible only while the note burger menu is open.
+    // Buttons use the same next/create and prev rules as finger edge swipes.
     note-page-indicator := Rectangle {
         visible: root.drawing-menu-open && root.is-canvas-context;
-        x: parent.width - 100px;
+        x: parent.width - 168px;
         y: parent.height - 40px;
-        width: 90px;
+        width: 158px;
         height: 28px;
         background: EinkTheme.chrome-bg;
         border-width: 1px;
         border-color: EinkTheme.chrome-border;
         border-radius: 4px;
-        Text {
-            text: "\{root.page-index}/\{root.page-count}";
-            font-size: 13px;
-            color: EinkTheme.btn-fg;
-            horizontal-alignment: center;
-            vertical-alignment: center;
-            width: parent.width;
-            height: parent.height;
+
+        HorizontalLayout {
+            spacing: 0px;
+            padding-left: 2px;
+            padding-right: 2px;
+            alignment: center;
+
+            Rectangle {
+                width: 32px; height: parent.height;
+                background: transparent;
+                opacity: root.page-index > 1 ? 1.0 : 0.35;
+                Text {
+                    text: Icons.nav-prev;
+                    font-family: "Material Icons";
+                    font-size: 18px;
+                    color: EinkTheme.btn-fg;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    width: parent.width; height: parent.height;
+                }
+                TouchArea {
+                    clicked => {
+                        if (root.page-index > 1) {
+                            root.page-prev-tapped();
+                        }
+                    }
+                }
+            }
+
+            Text {
+                horizontal-stretch: 1;
+                text: "\{root.page-index}/\{root.page-count}";
+                font-size: 13px;
+                color: EinkTheme.btn-fg;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+
+            Rectangle {
+                width: 32px; height: parent.height;
+                background: transparent;
+                Text {
+                    text: Icons.nav-next;
+                    font-family: "Material Icons";
+                    font-size: 18px;
+                    color: EinkTheme.btn-fg;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    width: parent.width; height: parent.height;
+                }
+                TouchArea { clicked => { root.page-next-tapped(); } }
+            }
         }
     }
 
@@ -6365,8 +6441,9 @@ export component EphemerisPage inherits Window {
 
         Rectangle {
             x: (parent.width - 460px) / 2;
-            y: (parent.height - 560px) / 2;
-            width: 460px; height: 560px;
+            y: (parent.height - (root.task-dialog-has-source-note ? 610px : 560px)) / 2;
+            width: 460px;
+            height: root.task-dialog-has-source-note ? 610px : 560px;
             background: EinkTheme.canvas-bg;
             border-radius: 8px;
             border-width: 3px;
@@ -6544,6 +6621,30 @@ export component EphemerisPage inherits Window {
                                color: root.task-dialog-priority == 3 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
                                horizontal-alignment: center; vertical-alignment: center; }
                         TouchArea { clicked => { root.task-dialog-priority = 3; } }
+                    }
+                }
+
+                if root.task-dialog-is-edit && root.task-dialog-has-source-note: Rectangle {
+                    height: 40px;
+                    border-radius: 4px; border-width: 2px;
+                    border-color: EinkTheme.btn-border;
+                    background: EinkTheme.btn-bg;
+                    HorizontalLayout {
+                        spacing: 6px; alignment: center;
+                        Text {
+                            text: Icons.notes;
+                            font-family: "Material Icons"; font-size: 18px;
+                            color: EinkTheme.btn-fg;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: "View associated note";
+                            font-size: 14px; color: EinkTheme.btn-fg;
+                            vertical-alignment: center;
+                        }
+                    }
+                    TouchArea {
+                        clicked => { root.task-view-source-note(root.task-dialog-id); }
                     }
                 }
 
@@ -7731,16 +7832,22 @@ export component EphemerisPage inherits Window {
         y: 8px;
         height: 44px;
         width: parent.width - root.nav-w - 60px;
-        background: transparent;
+        // Opaque chrome chip so ink behind the title stays readable on e-ink.
+        background: EinkTheme.chrome-bg;
+        border-width: 1px;
+        border-color: EinkTheme.chrome-border;
+        border-radius: 8px;
 
         HorizontalLayout {
             spacing: 4px;
             alignment: start;
             padding: 4px;
+            padding-left: 10px;
 
             Text {
                 text: root.page-title;
-                font-size: 13px;
+                font-size: 16px;
+                font-weight: 700;
                 color: EinkTheme.btn-fg;
                 vertical-alignment: center;
                 overflow: elide;
