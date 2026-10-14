@@ -19,6 +19,7 @@ pub mod refresh;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 pub mod store;
+pub mod text_format;
 
 pub use action::{Action, ActionMap, ActionRouter, CanvasPoint, DefaultActionMap, RouterOutput};
 pub use config::{
@@ -39,6 +40,7 @@ pub use task_context::{
     review_queue, set_lane_tag, sync_tags_from_structured, todoist_priority,
     todoist_section_to_lane, EngageFilter, TodoistTaskFields, LANE_TAG_PREFIX,
 };
+pub use text_format::{lines_to_markdown, BlockKind, InlineKind, InlineMark, LineFormat};
 
 /// Initialize tracing with environment filter.
 pub fn init_tracing() {

@@ -5790,7 +5790,7 @@ impl WinitHandler {
         if let Err(e) = cache.save(&self.data_dir, note_id, doc_page) {
             tracing::warn!("Failed to save recognition cache for note {note_id}: {e}");
         }
-        let completed = cache.completed_text();
+        let completed = cache.completed_markdown();
         let display = cache.display_text();
         let see_text_open = self.ui.clone_component().get_note_see_text();
         self.bg_recog.store(note_id, doc_page, cache);
@@ -6064,7 +6064,7 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
         if let Ok(mut guard) = self.bg_recog.result.lock() {
             if let Some(job) = guard.take() {
                 drop(guard);
-                let completed = job.cache.completed_text();
+                let completed = job.cache.completed_markdown();
                 let display = job.cache.display_text();
                 self.bg_recog
                     .store(job.note_id, job.doc_page, job.cache.clone());

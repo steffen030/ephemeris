@@ -10,6 +10,7 @@
 
 use crate::model::{Stroke, StrokeId};
 use crate::stroke_htr::{default_line_gap, group_strokes_into_lines_with_ruling, StrokeLine};
+use crate::text_format::{lines_to_markdown, LineFormat};
 use crate::transcriber::TextSpan;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
@@ -75,6 +76,9 @@ pub struct CachedLine {
     /// True until a recogniser result has been applied for this hash.
     #[serde(default)]
     pub pending: bool,
+    /// Block / inline formatting; absent in old caches (plain paragraph).
+    #[serde(default)]
+    pub format: LineFormat,
 }
 
 fn default_pending_confidence() -> f32 {
@@ -95,6 +99,7 @@ impl CachedLine {
             width: line.width,
             height: line.height,
             pending: true,
+            format: LineFormat::default(),
         }
     }
 
@@ -242,6 +247,18 @@ impl PageRecognitionCache {
             .map(|l| l.text.as_str())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Completed lines rendered as Obsidian markdown via
+    /// [`lines_to_markdown`]; this is what `note.text_content` stores.
+    pub fn completed_markdown(&self) -> String {
+        let lines: Vec<(String, LineFormat)> = self
+            .lines
+            .iter()
+            .filter(|l| !l.pending && !l.text.is_empty())
+            .map(|l| (l.text.clone(), l.format.clone()))
+            .collect();
+        lines_to_markdown(&lines)
     }
 
     /// See-text body: recognised lines plus [`PENDING_LINE_MARKER`] for pending.
@@ -629,6 +646,32 @@ mod tests {
     }
 
     #[test]
+    fn old_cache_json_without_format_loads() {
+        let json = r#"{"model_version":"v1","lines":[{"stroke_ids_hash":1,"stroke_ids":[],"text":"alt","confidence":0.5,"x":0.0,"y":0.0,"width":1.0,"height":1.0,"pending":false}]}"#;
+        let cache: PageRecognitionCache = serde_json::from_str(json).unwrap();
+        assert_eq!(cache.lines[0].format, LineFormat::default());
+        assert_eq!(cache.completed_markdown(), "alt");
+    }
+
+    #[test]
+    fn completed_markdown_matches_plain_for_paragraphs() {
+        let mut cache = PageRecognitionCache::new("v1");
+        for (i, t) in ["L0", "L1"].iter().enumerate() {
+            let mut l = CachedLine::pending_from_line(&StrokeLine {
+                strokes: vec![],
+                x: 0.0,
+                y: i as f32,
+                width: 1.0,
+                height: 1.0,
+            });
+            l.text = (*t).into();
+            l.pending = false;
+            cache.lines.push(l);
+        }
+        assert_eq!(cache.completed_markdown(), cache.completed_text());
+    }
+
+    #[test]
     fn page_cache_round_trips_json() {
         let dir = tempfile::tempdir().unwrap();
         let mut cache = PageRecognitionCache::new("v1");
@@ -642,6 +685,7 @@ mod tests {
             width: 3.0,
             height: 4.0,
             pending: false,
+            format: LineFormat::default(),
         });
         cache.save(dir.path(), 7, 1).unwrap();
         let loaded = PageRecognitionCache::load(dir.path(), 7, 1).unwrap();
