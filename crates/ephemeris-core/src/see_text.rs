@@ -238,6 +238,7 @@ mod tests {
             stroke_ids_hash: 0,
             stroke_ids: vec![],
             text: text.into(),
+            raw_text: None,
             confidence: 0.9,
             x: 0.0,
             y: 0.0,
