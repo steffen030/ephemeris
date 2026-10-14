@@ -63,6 +63,7 @@ pub mod calendar_cache;
 pub mod htr_eval;
 pub mod layout_detect;
 pub mod line_htr;
+pub mod local_task_store;
 pub mod markdown_tasks;
 pub mod note_search;
 pub mod note_tasks;
@@ -93,6 +94,9 @@ pub use layout_detect::{detect_line_formats, DetectedLine, LayoutLine};
 pub use line_htr::{
     prepare_line_htr_input, split_ink_line_bands, ImageLineBand, LineHtrInput, DE_HTR_V2_ALPHABET,
     LINE_HTR_HEIGHT, LINE_HTR_MAX_WIDTH,
+};
+pub use local_task_store::{
+    LocalTaskStore, NoteTaskState, LOCAL_TASK_SOURCE, LOCAL_TASK_STORE_VERSION,
 };
 pub use markdown_tasks::{MarkdownTaskExtractor, DEFAULT_TASKS_INBOX};
 pub use note_search::{

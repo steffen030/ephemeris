@@ -16,8 +16,13 @@
 //!   unchanged ink state is kept. The app never alters ink.
 //! * **Erase**: a task whose checkbox line is gone from the page is deleted, but
 //!   only while no line of the page is pending (a pending line looks "missing").
-//!   Tasks have no separate user-edit state, so app edits do not save them.
+//!   Exception: a task in [`NoteTaskState::user_edited`] (ticked or edited in the
+//!   app) is kept as an orphan, so erasing the ink never destroys user work.
+//!   Uncommitted, unedited note tasks are still deleted on erase.
+//! * **Persistence**: tasks plus [`NoteTaskState`] are saved by
+//!   [`crate::local_task_store`], so app ticks and `ink_seen` survive restarts.
 
+use crate::local_task_store::NoteTaskState;
 use crate::model::{ProfileId, StrokeId, Task, TaskId};
 use crate::recognition_cache::{CachedLine, PageRecognitionCache};
 use crate::text_format::BlockKind;
@@ -109,14 +114,14 @@ impl NoteTaskChanges {
 
 /// Diff `desired` (from [`checkbox_tasks_for_page`]) against `existing` tasks.
 ///
-/// `ink_seen` maps task id → last-seen ink tick state and is updated in place.
-/// Only tasks of this note page are considered for update / delete.
+/// `state.ink_seen` maps task id → last-seen ink tick state and is updated in
+/// place; `state.user_edited` tasks are never deleted. Only tasks of this note page are considered for update / delete.
 pub fn reconcile_note_tasks(
     note_id: u32,
     doc_page: usize,
     desired: &[Task],
     existing: &[Task],
-    ink_seen: &mut HashMap<TaskId, bool>,
+    state: &mut NoteTaskState,
     allow_delete: bool,
 ) -> NoteTaskChanges {
     let mut changes = NoteTaskChanges::default();
@@ -133,7 +138,7 @@ pub fn reconcile_note_tasks(
     for want in desired {
         let ink = want.done;
         let Some(have) = mine.get(&want.id) else {
-            ink_seen.insert(want.id, ink);
+            state.ink_seen.insert(want.id, ink);
             changes.creates.push(want.clone());
             continue;
         };
@@ -142,10 +147,10 @@ pub fn reconcile_note_tasks(
             next.title = want.title.clone();
         }
         next.profile_id = want.profile_id;
-        if ink_seen.get(&want.id) != Some(&ink) {
+        if state.ink_seen.get(&want.id) != Some(&ink) {
             next.set_done(ink);
         }
-        ink_seen.insert(want.id, ink);
+        state.ink_seen.insert(want.id, ink);
         if next != **have {
             changes.updates.push(next);
         }
@@ -153,8 +158,8 @@ pub fn reconcile_note_tasks(
     if allow_delete {
         let wanted: HashSet<TaskId> = desired.iter().map(|t| t.id).collect();
         for id in mine.keys() {
-            if !wanted.contains(id) {
-                ink_seen.remove(id);
+            if !wanted.contains(id) && !state.user_edited.contains(id) {
+                state.ink_seen.remove(id);
                 changes.deletes.push(*id);
             }
         }
@@ -166,7 +171,7 @@ pub fn reconcile_note_tasks(
 /// Reconcile one page cache into `tasks`; returns true when `tasks` changed.
 pub fn sync_page_tasks(
     tasks: &mut Vec<Task>,
-    ink_seen: &mut HashMap<TaskId, bool>,
+    state: &mut NoteTaskState,
     note_id: u32,
     doc_page: usize,
     profile: ProfileId,
@@ -178,7 +183,7 @@ pub fn sync_page_tasks(
         doc_page,
         &desired,
         tasks,
-        ink_seen,
+        state,
         !cache.has_pending(),
     );
     if changes.is_empty() {
@@ -241,7 +246,7 @@ mod tests {
         ])
     }
 
-    fn sync(tasks: &mut Vec<Task>, seen: &mut HashMap<TaskId, bool>, c: &PageRecognitionCache) {
+    fn sync(tasks: &mut Vec<Task>, seen: &mut NoteTaskState, c: &PageRecognitionCache) {
         sync_page_tasks(tasks, seen, 7, 0, ProfileId(Uuid::nil()), c);
     }
 
@@ -261,7 +266,7 @@ mod tests {
 
     #[test]
     fn rerun_does_not_duplicate() {
-        let (mut tasks, mut seen) = (Vec::new(), HashMap::new());
+        let (mut tasks, mut seen) = (Vec::new(), NoteTaskState::default());
         sync(&mut tasks, &mut seen, &two_boxes());
         assert!(!sync_page_tasks(
             &mut tasks,
@@ -282,7 +287,7 @@ mod tests {
         assert_ne!(a, note_task_id(8, 0, sid(1)));
         let mut c = two_boxes();
         c.lines[0] = line(&[1, 2, 9], "buy milk now", BlockKind::Checkbox(false));
-        let (mut tasks, mut seen) = (Vec::new(), HashMap::new());
+        let (mut tasks, mut seen) = (Vec::new(), NoteTaskState::default());
         sync(&mut tasks, &mut seen, &two_boxes());
         sync(&mut tasks, &mut seen, &c);
         assert_eq!(tasks.len(), 2);
@@ -291,7 +296,7 @@ mod tests {
 
     #[test]
     fn erased_checkbox_is_deleted_unless_pending() {
-        let (mut tasks, mut seen) = (Vec::new(), HashMap::new());
+        let (mut tasks, mut seen) = (Vec::new(), NoteTaskState::default());
         sync(&mut tasks, &mut seen, &two_boxes());
         let mut c = two_boxes();
         c.lines.remove(0);
@@ -309,8 +314,21 @@ mod tests {
     }
 
     #[test]
+    fn user_edited_task_is_kept_on_erase() {
+        let (mut tasks, mut seen) = (Vec::new(), NoteTaskState::default());
+        sync(&mut tasks, &mut seen, &two_boxes());
+        let kept = tasks[0].id;
+        seen.user_edited.insert(kept);
+        let mut c = two_boxes();
+        c.lines.drain(0..3);
+        sync(&mut tasks, &mut seen, &c);
+        assert_eq!(tasks.len(), 1, "unedited call bob deleted, edited kept");
+        assert_eq!(tasks[0].id, kept);
+    }
+
+    #[test]
     fn text_correction_updates_title() {
-        let (mut tasks, mut seen) = (Vec::new(), HashMap::new());
+        let (mut tasks, mut seen) = (Vec::new(), NoteTaskState::default());
         sync(&mut tasks, &mut seen, &two_boxes());
         let mut c = two_boxes();
         c.lines[0].user_text = Some("buy oat milk".into());
@@ -321,7 +339,7 @@ mod tests {
 
     #[test]
     fn app_tick_survives_unchanged_ink_but_ink_change_wins() {
-        let (mut tasks, mut seen) = (Vec::new(), HashMap::new());
+        let (mut tasks, mut seen) = (Vec::new(), NoteTaskState::default());
         sync(&mut tasks, &mut seen, &two_boxes());
         tasks[0].set_done(true); // ticked in the app
         sync(&mut tasks, &mut seen, &two_boxes());
@@ -337,7 +355,7 @@ mod tests {
 
     #[test]
     fn other_pages_and_sources_untouched() {
-        let (mut tasks, mut seen) = (Vec::new(), HashMap::new());
+        let (mut tasks, mut seen) = (Vec::new(), NoteTaskState::default());
         sync(&mut tasks, &mut seen, &two_boxes());
         let other = Task::new("keep", ProfileId(Uuid::nil()));
         tasks.push(other.clone());
