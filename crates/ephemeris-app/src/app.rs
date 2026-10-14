@@ -761,6 +761,14 @@ impl App {
             }
         };
 
+        // Local + handwritten-checkbox task state (ephemeris-rjz): restored before
+        // the note-task startup sync so it sees persisted ticks and ink_seen.
+        let task_dir = note_data_dir();
+        let persist = Rc::new(TaskPersist::new(&task_dir));
+        let mut initial_tasks = initial_tasks;
+        if let Some(store) = load_local_task_store(&task_dir) {
+            *persist.state.borrow_mut() = store.apply(&mut initial_tasks);
+        }
         let tasks: Rc<RefCell<Vec<Task>>> = Rc::new(RefCell::new(initial_tasks));
 
         // ── Calendar events ───────────────────────────────────────────────────
@@ -1291,8 +1299,7 @@ impl App {
             let filter_rc = active_profile_filter.clone();
             let mgr2 = profile_mgr.clone();
             let cfg2 = config.clone();
-            let ink_seen: Rc<RefCell<HashMap<ephemeris_core::TaskId, bool>>> =
-                Rc::new(RefCell::new(HashMap::new()));
+            let persist2 = persist.clone();
             Rc::new(move |note_id, doc_page, cache| {
                 let profile = notes2
                     .borrow()
@@ -1303,13 +1310,14 @@ impl App {
                     .unwrap_or(work_pid);
                 let changed = ephemeris_core::sync_page_tasks(
                     &mut tasks2.borrow_mut(),
-                    &mut ink_seen.borrow_mut(),
+                    &mut persist2.state.borrow_mut(),
                     note_id,
                     doc_page,
                     profile,
                     cache,
                 );
                 if changed {
+                    persist2.save(&tasks2.borrow());
                     let filter_str = filter_rc.borrow().clone();
                     let filtered = filter_tasks_by_profile(&tasks2.borrow(), &filter_str);
                     refresh_comp(&ui2, &filtered, work_pid, &mgr2, &cfg2.borrow());
@@ -1317,6 +1325,16 @@ impl App {
             })
         };
         {
+            // Drop restored note tasks whose note no longer exists.
+            let live: std::collections::HashSet<u32> =
+                notes.borrow().iter().map(|n| n.id).collect();
+            tasks.borrow_mut().retain(|t| {
+                t.source != ephemeris_core::NOTE_TASK_SOURCE
+                    || t.source_ref
+                        .as_deref()
+                        .and_then(ephemeris_core::parse_note_source_ref)
+                        .is_none_or(|(id, _)| live.contains(&id))
+            });
             let snapshot: Vec<(u32, usize)> = notes
                 .borrow()
                 .iter()
@@ -1327,6 +1345,7 @@ impl App {
                     sync_note_tasks(note_id, doc_page, &cache);
                 }
             }
+            persist.save(&tasks.borrow());
         }
 
         // ── Connection management ─────────────────────────────────────────────
@@ -3148,12 +3167,14 @@ impl App {
             let ui2 = ui.clone_component();
             let cfg2 = config.clone();
             let filter_rc = active_profile_filter.clone();
+            let persist2 = persist.clone();
             ui.on_task_complete_toggled(move |id| {
                 let mut dirty: Option<Task> = None;
                 {
                     let mut ts = tasks2.borrow_mut();
                     if let Some(t) = ts.iter_mut().find(|t| t.id.0.to_string() == id) {
                         t.set_done(!t.done);
+                        persist2.mark_edited(t);
                         if t.source == "obsidian" {
                             dirty = Some(t.clone());
                         }
@@ -3162,6 +3183,7 @@ impl App {
                 if let Some(ref t) = dirty {
                     write_back_obsidian_task(&cfg2.borrow(), t);
                 }
+                persist2.save(&tasks2.borrow());
                 let filter_str = filter_rc.borrow().clone();
                 let filtered = filter_tasks_by_profile(&tasks2.borrow(), &filter_str);
                 refresh_comp(&ui2, &filtered, work_pid, &mgr_refresh_1, &cfg2.borrow());
@@ -3212,6 +3234,7 @@ impl App {
             let cfg2 = config.clone();
             let filter_rc = active_profile_filter.clone();
             let counter = new_task_n.clone();
+            let persist2 = persist.clone();
             ui.on_task_confirm_add(move |title, priority, due, tags, lane, contexts, waiting| {
                 let title = title.trim().to_string();
                 let title = if title.is_empty() {
@@ -3273,6 +3296,7 @@ impl App {
                         Some(id)
                     }
                 };
+                persist2.save(&tasks2.borrow());
                 ui2.set_task_dialog_visible(false);
                 let filtered = filter_tasks_by_profile(&tasks2.borrow(), &filter_str);
                 refresh_comp(&ui2, &filtered, work_pid, &mgr_refresh_2, &cfg2.borrow());
@@ -3301,6 +3325,7 @@ impl App {
             let ui2 = ui.clone_component();
             let cfg2 = config.clone();
             let filter_rc = active_profile_filter.clone();
+            let persist2 = persist.clone();
             ui.on_task_confirm_edit(
                 move |id, title, priority, due, tags, lane, contexts, waiting| {
                     let title = title.trim().to_string();
@@ -3315,6 +3340,7 @@ impl App {
                             t.due = parse_due_ymd(&due);
                             t.tags = parse_tag_list(&tags);
                             apply_task_dialog_fields(t, lane.trim(), &contexts, &waiting);
+                            persist2.mark_edited(t);
                             if t.source == "obsidian" {
                                 dirty = Some(t.clone());
                             }
@@ -3323,6 +3349,7 @@ impl App {
                     if let Some(ref t) = dirty {
                         write_back_obsidian_task(&cfg2.borrow(), t);
                     }
+                    persist2.save(&tasks2.borrow());
                     ui2.set_task_dialog_visible(false);
                     let filter_str = filter_rc.borrow().clone();
                     let filtered = filter_tasks_by_profile(&tasks2.borrow(), &filter_str);
@@ -3589,6 +3616,7 @@ impl App {
             let tasks2 = tasks.clone();
             let cfg2 = config.clone();
             let filter_rc = active_profile_filter.clone();
+            let persist2 = persist.clone();
             ui.on_task_priority_cycle(move |id| {
                 let mut dirty: Option<Task> = None;
                 {
@@ -3600,6 +3628,7 @@ impl App {
                             TaskPriority::Medium => TaskPriority::Low,
                             TaskPriority::Low => TaskPriority::Urgent,
                         };
+                        persist2.mark_edited(t);
                         if t.source == "obsidian" {
                             dirty = Some(t.clone());
                         }
@@ -3608,6 +3637,7 @@ impl App {
                 if let Some(ref t) = dirty {
                     write_back_obsidian_task(&cfg2.borrow(), t);
                 }
+                persist2.save(&tasks2.borrow());
                 let filter_str = filter_rc.borrow().clone();
                 let profile_filtered = filter_tasks_by_profile(&tasks2.borrow(), &filter_str);
                 refresh_comp(&ui2, &profile_filtered, work_pid, &mgr_prio, &cfg2.borrow());
@@ -3656,6 +3686,7 @@ impl App {
             let ui2 = ui.clone_component();
             let cfg2 = config.clone();
             let filter_rc = active_profile_filter.clone();
+            let persist2 = persist.clone();
             page.on_clarify_save(move |id, lane, contexts, waiting| {
                 let id = id.to_string();
                 let lane = lane.to_string();
@@ -3666,6 +3697,7 @@ impl App {
                     let mut ts = tasks2.borrow_mut();
                     if let Some(t) = ts.iter_mut().find(|t| t.id.0.to_string() == id) {
                         apply_task_dialog_fields(t, lane.trim(), &contexts, &waiting);
+                        persist2.mark_edited(t);
                         if t.source == "obsidian" {
                             dirty = Some(t.clone());
                         }
@@ -3674,6 +3706,7 @@ impl App {
                 if let Some(ref t) = dirty {
                     write_back_obsidian_task(&cfg2.borrow(), t);
                 }
+                persist2.save(&tasks2.borrow());
                 ui2.set_clarify_visible(false);
                 let filter_str = filter_rc.borrow().clone();
                 let filtered = filter_tasks_by_profile(&tasks2.borrow(), &filter_str);
@@ -3738,6 +3771,7 @@ impl App {
             let filter_rc = active_profile_filter.clone();
             let q_ids = review_queue_ids.clone();
             let q_idx = review_index.clone();
+            let persist2 = persist.clone();
             page.on_review_confirm(move || {
                 let id_str = ui2.get_review_task_id().to_string();
                 if !id_str.is_empty() {
@@ -3746,6 +3780,7 @@ impl App {
                         let mut ts = tasks2.borrow_mut();
                         if let Some(t) = ts.iter_mut().find(|t| t.id.0.to_string() == id_str) {
                             mark_reviewed(t, now_secs());
+                            persist2.mark_edited(t);
                             if t.source == "obsidian" {
                                 dirty = Some(t.clone());
                             }
@@ -3754,6 +3789,7 @@ impl App {
                     if let Some(ref t) = dirty {
                         write_back_obsidian_task(&cfg2.borrow(), t);
                     }
+                    persist2.save(&tasks2.borrow());
                 }
                 let next = q_idx.get() + 1;
                 q_idx.set(next);
@@ -3800,6 +3836,7 @@ impl App {
             let filter_rc = active_profile_filter.clone();
             let q_ids = review_queue_ids.clone();
             let q_idx = review_index.clone();
+            let persist2 = persist.clone();
             page.on_review_done(move || {
                 let id_str = ui2.get_review_task_id().to_string();
                 if !id_str.is_empty() {
@@ -3808,6 +3845,7 @@ impl App {
                         let mut ts = tasks2.borrow_mut();
                         if let Some(t) = ts.iter_mut().find(|t| t.id.0.to_string() == id_str) {
                             t.set_done(true);
+                            persist2.mark_edited(t);
                             if t.source == "obsidian" {
                                 dirty = Some(t.clone());
                             }
@@ -3816,6 +3854,7 @@ impl App {
                     if let Some(ref t) = dirty {
                         write_back_obsidian_task(&cfg2.borrow(), t);
                     }
+                    persist2.save(&tasks2.borrow());
                 }
                 let next = q_idx.get() + 1;
                 q_idx.set(next);
@@ -4773,6 +4812,16 @@ impl App {
                 } else {
                     sample_tasks_split(work_pid, personal_pid)
                 };
+                // Keep app-local and note tasks across the provider reload.
+                let kept: Vec<Task> = tasks2
+                    .borrow()
+                    .iter()
+                    .filter(|t| t.source == "local" || t.source == ephemeris_core::NOTE_TASK_SOURCE)
+                    .cloned()
+                    .collect();
+                let mut new_tasks = new_tasks;
+                new_tasks.retain(|t| t.source != "local");
+                new_tasks.extend(kept);
                 *tasks2.borrow_mut() = new_tasks;
 
                 // Reload calendar events (ICS + CalDAV), keep local quick-add events.
@@ -8059,6 +8108,56 @@ fn switch_note_doc_page(
     }
     ui.discard_in_progress_stroke();
     set_note_doc_page_chrome(ui, note);
+}
+
+/// Persists local + handwritten-checkbox tasks (`tasks_local.json`, ephemeris-rjz).
+struct TaskPersist {
+    path: PathBuf,
+    /// Note-task ink_seen / user_edited bookkeeping (see `NoteTaskState`).
+    state: RefCell<ephemeris_core::NoteTaskState>,
+    /// Last JSON written, so unchanged state costs no disk write.
+    last: RefCell<String>,
+}
+
+impl TaskPersist {
+    fn new(data_dir: &Path) -> Self {
+        Self {
+            path: local_tasks_path(data_dir),
+            state: RefCell::default(),
+            last: RefCell::default(),
+        }
+    }
+
+    /// Note tasks the user ticked/edited must survive erasing their ink.
+    fn mark_edited(&self, task: &Task) {
+        if task.source == ephemeris_core::NOTE_TASK_SOURCE {
+            self.state.borrow_mut().user_edited.insert(task.id);
+        }
+    }
+
+    /// Write the store if it differs from the last write (atomic rename).
+    fn save(&self, tasks: &[Task]) {
+        let json =
+            ephemeris_core::LocalTaskStore::from_tasks(tasks, &self.state.borrow()).to_json();
+        if json.is_empty() || json == *self.last.borrow() {
+            return;
+        }
+        let tmp = self.path.with_extension("json.tmp");
+        let res = std::fs::write(&tmp, &json).and_then(|_| std::fs::rename(&tmp, &self.path));
+        match res {
+            Ok(()) => *self.last.borrow_mut() = json,
+            Err(e) => tracing::warn!("Failed to save local tasks: {e}"),
+        }
+    }
+}
+
+fn local_tasks_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("tasks_local.json")
+}
+
+fn load_local_task_store(data_dir: &Path) -> Option<ephemeris_core::LocalTaskStore> {
+    let json = std::fs::read_to_string(local_tasks_path(data_dir)).ok()?;
+    ephemeris_core::LocalTaskStore::from_json(&json)
 }
 
 fn notes_index_path(data_dir: &Path) -> PathBuf {
