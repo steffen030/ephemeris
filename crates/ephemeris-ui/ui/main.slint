@@ -140,6 +140,19 @@ export struct MdBlockEntry {
     text: string,
 }
 
+/// One formatted line of the See-text view.
+export struct SeeTextLine {
+    kind: int,   // 0=h1 1=h2 2=h3 3=para 4=bullet 5=numbered 6=checkbox
+    number: int,
+    checked: bool,
+    indent: int,
+    gap-before: bool,
+    pending: bool,
+    stale: bool,
+    line-index: int,
+    body: styled-text,
+}
+
 /// A calendar event row for the agenda view.
 export struct AgendaEntry {
     title: string,
@@ -508,7 +521,7 @@ export component EphemerisPage inherits Window {
     in-out property <string> active-paper: "blank";
     // See-text: overlay machine-readable / OCR text for the current note.
     in-out property <bool> note-see-text: false;
-    in-out property <string> note-text-content: "";
+    in property <[SeeTextLine]> see-text-lines: [];
 
     callback notebook-quick-new-note(string);
     callback paper-type-tapped(string);
@@ -3184,7 +3197,7 @@ export component EphemerisPage inherits Window {
         background: EinkTheme.canvas-bg;
         clip: true;
 
-        property <bool> has-body: root.note-text-content != "";
+        property <bool> has-body: root.see-text-lines.length > 0;
 
         VerticalLayout {
             padding: 0px;
@@ -3292,12 +3305,58 @@ export component EphemerisPage inherits Window {
                     padding-bottom: 28px;
                     spacing: 0px;
 
-                    Text {
-                        text: root.note-text-content;
-                        font-size: 17px;
-                        color: EinkTheme.btn-fg;
-                        wrap: word-wrap;
-                        width: parent.width - 40px;
+                    for line[i] in root.see-text-lines: HorizontalLayout {
+                        spacing: 8px;
+                        padding-top: line.gap-before ? 14px : 4px;
+                        padding-left: line.indent * 24px;
+
+                        if line.kind == 4: Text {
+                            text: "•";
+                            font-size: 17px;
+                            color: EinkTheme.btn-fg;
+                            width: 16px;
+                            vertical-alignment: top;
+                        }
+                        if line.kind == 5: Text {
+                            text: line.number + ".";
+                            font-size: 17px;
+                            color: EinkTheme.btn-fg;
+                            width: 28px;
+                            horizontal-alignment: right;
+                            vertical-alignment: top;
+                        }
+                        if line.kind == 6: Rectangle {
+                            width: 16px;
+                            height: 16px;
+                            y: 3px;
+                            border-width: 2px;
+                            border-color: EinkTheme.btn-fg;
+                            background: line.checked ? EinkTheme.btn-fg : transparent;
+                            Text {
+                                text: line.checked ? "✓" : "";
+                                font-size: 12px;
+                                font-weight: 700;
+                                color: EinkTheme.canvas-bg;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+                        StyledText {
+                            text: line.body;
+                            horizontal-stretch: 1;
+                            default-font-size: line.kind == 0 ? 20px
+                                : line.kind == 1 ? 17px
+                                : line.kind == 2 ? 15px
+                                : 17px;
+                            default-color: line.pending ? EinkTheme.text-secondary : EinkTheme.btn-fg;
+                        }
+                        if line.stale: Text {
+                            text: "✎";
+                            font-size: 12px;
+                            color: EinkTheme.text-secondary;
+                            width: 16px;
+                            vertical-alignment: top;
+                        }
                     }
                 }
             }

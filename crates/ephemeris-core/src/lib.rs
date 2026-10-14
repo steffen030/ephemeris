@@ -41,7 +41,9 @@ pub use task_context::{
     review_queue, set_lane_tag, sync_tags_from_structured, todoist_priority,
     todoist_section_to_lane, EngageFilter, TodoistTaskFields, LANE_TAG_PREFIX,
 };
-pub use text_format::{lines_to_markdown, BlockKind, InlineKind, InlineMark, LineFormat};
+pub use text_format::{
+    lines_to_markdown, styled_inline_markdown, BlockKind, InlineKind, InlineMark, LineFormat,
+};
 
 /// Initialize tracing with environment filter.
 pub fn init_tracing() {
@@ -67,6 +69,7 @@ pub mod pdf_export;
 pub mod prioritizer;
 pub mod profile_manager;
 pub mod recognition_cache;
+pub mod see_text;
 pub mod stroke_htr;
 pub mod stroke_persistence;
 pub mod stroke_render;
