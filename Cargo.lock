@@ -1363,7 +1363,7 @@ dependencies = [
 
 [[package]]
 name = "ephemeris-app"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "chrono",
  "cpal",
@@ -1387,7 +1387,7 @@ dependencies = [
 
 [[package]]
 name = "ephemeris-core"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "bytes",
  "chrono",
@@ -1414,7 +1414,7 @@ dependencies = [
 
 [[package]]
 name = "ephemeris-pal"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "crossbeam-channel",
  "evdev",
@@ -1429,7 +1429,7 @@ dependencies = [
 
 [[package]]
 name = "ephemeris-ui"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "ephemeris-core",
  "ephemeris-pal",
@@ -2472,9 +2472,9 @@ dependencies = [
 
 [[package]]
 name = "icalendar"
-version = "0.17.14"
+version = "0.17.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "785af055d3fda0cd975e77b358d8e5d20dd7dbcca6a61eefd197410b8a1cbfe7"
+checksum = "ef7e7ae829dee4463f049b1f2855a7b0ba7a255bef3c06a09ca22a7befa4e9e4"
 dependencies = [
  "chrono",
  "iso8601",
@@ -4840,9 +4840,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "once_cell",
