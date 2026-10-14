@@ -15,11 +15,11 @@ use crate::model::{Stroke, Tool};
 /// OnlineHTR / Carbune2020 default points per unit length after normalisation.
 pub const CARBUNE_POINTS_PER_UNIT: f32 = 20.0;
 
-/// Helper: true only for pen strokes with at least one point (suitable for HTR input).
+/// True only for pen strokes with at least one point — the sole recognition input.
 ///
-/// Highlighter strokes are kept on the page for format detection but excluded
-/// from handwriting recognition.
-fn is_text_ink(s: &Stroke) -> bool {
+/// Highlighter strokes stay on the page for format detection but never reach
+/// HTR / OCR; eraser strokes are never ink.
+pub fn is_text_ink(s: &Stroke) -> bool {
     s.tool == Tool::Pen && !s.points.is_empty()
 }
 

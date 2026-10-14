@@ -8,7 +8,7 @@ use crate::config::{HandwritingLanguage, ResolvedHandwritingLanguage};
 #[cfg(feature = "htr")]
 use crate::line_htr::{decode_line_alphabet, line_logits_confidence, DE_HTR_V2_ALPHABET};
 use crate::line_htr::{prepare_line_htr_input, split_ink_line_bands};
-use crate::model::{Point, Stroke, Tool};
+use crate::model::{Point, Stroke};
 #[cfg(feature = "htr")]
 use crate::stroke_htr::{
     armrest::{self, featurize_line_armrest_pieces},
@@ -17,7 +17,8 @@ use crate::stroke_htr::{
 };
 use crate::stroke_htr::{
     bundled_htr_lexicon_text, default_line_gap, featurize_line_pieces,
-    group_strokes_into_lines_with_ruling, HtrLexicon, StrokeLine, MAX_STROKE_HTR_TIMESTEPS,
+    group_strokes_into_lines_with_ruling, is_text_ink, HtrLexicon, StrokeLine,
+    MAX_STROKE_HTR_TIMESTEPS,
 };
 use crate::stroke_render::{prepare_line_htr_from_strokes, render_stroke_line, StrokeRenderParams};
 #[cfg(feature = "ocr")]
@@ -2000,14 +2001,6 @@ fn write_pgm(path: &Path, width: u32, height: u32, gray8: &[u8]) -> crate::Resul
     Ok(())
 }
 
-/// Helper: true only for pen strokes with at least one point (suitable for HTR input).
-///
-/// Highlighter strokes are kept on the page for format detection but excluded
-/// from handwriting recognition.
-fn is_text_ink(s: &Stroke) -> bool {
-    s.tool == Tool::Pen && !s.points.is_empty()
-}
-
 /// Simple stroke → gray8 raster for the stroke-based [`Transcriber`] path
 /// (also used by `htr-eval`, which has no screen raster).
 pub fn rasterize_strokes(strokes: &[Stroke]) -> (u32, u32, Vec<u8>) {
@@ -2099,7 +2092,7 @@ fn draw_line_thick(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Color;
+    use crate::model::{Color, Tool};
 
     #[cfg(feature = "htr")]
     #[test]
