@@ -244,7 +244,7 @@ fn build_raster_page_ops(
 
     let highlights: Vec<&Stroke> = highlight_strokes
         .iter()
-        .filter(|s| s.tool == Tool::Highlighter && s.points.len() >= 1)
+        .filter(|s| s.tool == Tool::Highlighter && !s.points.is_empty())
         .collect();
 
     let image = if highlights.is_empty() {
