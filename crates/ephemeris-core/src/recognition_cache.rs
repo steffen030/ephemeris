@@ -8,7 +8,8 @@
 //! [`BG_RECOG_IDLE_DELAY`] after the last PenUp, cancelled on PenDown, and
 //! never while drawing.
 
-use crate::ink_layout::split_page_ink;
+use crate::ink_layout::{estimate_text_height, split_page_ink, PageInk};
+use crate::layout_detect::{detect_line_formats, LayoutLine};
 use crate::model::{Stroke, StrokeId};
 use crate::stroke_htr::StrokeLine;
 use crate::text_format::{lines_to_markdown, LineFormat};
@@ -64,9 +65,14 @@ pub struct CachedLine {
     pub stroke_ids_hash: u64,
     /// Stroke ids that formed this line when recognised (or when marked pending).
     pub stroke_ids: Vec<StrokeId>,
-    /// Recognised text when ready; empty while pending.
+    /// Recognised text when ready; empty while pending. Layout detection
+    /// strips list prefixes (`- `, `1. `) from it; the block lives in `format`.
     #[serde(default)]
     pub text: String,
+    /// Raw recogniser output when layout detection stripped a prefix from
+    /// `text` (so re-detection stays idempotent); `None` when identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_text: Option<String>,
     /// Model confidence in `[0, 1]`; negative when unknown / pending.
     #[serde(default = "default_pending_confidence")]
     pub confidence: f32,
@@ -104,6 +110,7 @@ impl CachedLine {
             stroke_ids_hash: line_stroke_ids_hash(&stroke_ids),
             stroke_ids,
             text: String::new(),
+            raw_text: None,
             confidence: -1.0,
             x: line.x,
             y: line.y,
@@ -141,6 +148,7 @@ impl CachedLine {
     /// Drop recognised output (keeps the user's correction).
     fn reset_recognised(&mut self) {
         self.text.clear();
+        self.raw_text = None;
         self.confidence = -1.0;
         self.format = LineFormat::default();
         self.pending = true;
@@ -149,6 +157,7 @@ impl CachedLine {
     /// Store a recognised span for this line (clears pending).
     pub fn apply_span(&mut self, span: &TextSpan) {
         self.text = span.text.clone();
+        self.raw_text = None;
         self.confidence = span.confidence;
         self.x = span.x;
         self.y = span.y;
@@ -217,6 +226,8 @@ impl PageRecognitionCache {
     /// Reconcile cache with current strokes: reuse matching line hashes, mark
     /// the rest pending. Does **not** run recognition.
     ///
+    /// Line formats are re-detected (see [`Self::apply_layout`]).
+    ///
     /// Returns how many lines were invalidated vs reused.
     pub fn sync_strokes(
         &mut self,
@@ -225,7 +236,8 @@ impl PageRecognitionCache {
         model_version: &str,
     ) -> RecogCacheStats {
         // Same mark-free lines as `CascadingTranscriber::transcribe_page`.
-        let live = split_page_ink(strokes, ruling_pitch).lines;
+        let ink = split_page_ink(strokes, ruling_pitch);
+        let live = &ink.lines;
         let version_ok = self.model_version == model_version;
         // A model-version bump drops recognised output but never user corrections.
         let mut old: Vec<Option<CachedLine>> = Vec::new();
@@ -292,7 +304,68 @@ impl PageRecognitionCache {
             }
         }
         self.lines = next;
+        self.apply_layout_with(&ink);
         stats
+    }
+
+    /// Re-detect every completed line's [`LineFormat`] from the page's ink
+    /// (headings, lists, checkboxes, paragraph breaks, whole-line marks; see
+    /// [`crate::layout_detect`]). Cheap and idempotent: runs inside
+    /// [`Self::sync_strokes`] and [`Self::recognise_pending`], so a new
+    /// highlight or underline (which leaves text-line hashes alone) updates
+    /// formats without re-running HTR.
+    pub fn apply_layout(&mut self, strokes: &[Stroke], ruling_pitch: Option<f32>) {
+        self.apply_layout_with(&split_page_ink(strokes, ruling_pitch));
+    }
+
+    /// Recognised text gets its list prefix stripped (raw kept in
+    /// `raw_text`); user text is never rewritten nor prefix-interpreted.
+    fn apply_layout_with(&mut self, ink: &PageInk) {
+        let glyph: std::collections::HashMap<u64, f32> = ink
+            .lines
+            .iter()
+            .map(|l| (stroke_line_ids_hash(l), estimate_text_height(&l.strokes)))
+            .collect();
+        let completed: Vec<bool> = self.lines.iter().map(|l| l.is_completed()).collect();
+        let raw: Vec<String> = self
+            .lines
+            .iter()
+            .map(|l| match &l.user_text {
+                Some(u) => u.clone(),
+                None => l.raw_text.clone().unwrap_or_else(|| l.text.clone()),
+            })
+            .collect();
+        let layout: Vec<LayoutLine> = self
+            .lines
+            .iter()
+            .zip(&raw)
+            .zip(&completed)
+            .map(|((l, t), done)| LayoutLine {
+                x: l.x,
+                y: l.y,
+                width: l.width,
+                height: l.height,
+                glyph_height: glyph.get(&l.stroke_ids_hash).copied().unwrap_or(0.0),
+                text: if *done { t } else { "" },
+                strip_prefix: l.user_text.is_none(),
+            })
+            .collect();
+        let detected = detect_line_formats(&layout, &ink.marks, &ink.highlights);
+        for ((line, d), (done, raw)) in self
+            .lines
+            .iter_mut()
+            .zip(detected)
+            .zip(completed.into_iter().zip(raw))
+        {
+            if !done {
+                continue;
+            }
+            if line.user_text.is_none() {
+                line.raw_text = (d.text != raw).then_some(raw);
+                line.text = d.text;
+            }
+            line.format = d.format;
+        }
     }
 
     /// Pick the old corrected line a changed live line descends from.
@@ -436,7 +509,8 @@ impl PageRecognitionCache {
         F: FnMut(&StrokeLine, i32) -> crate::Result<Option<TextSpan>>,
     {
         // Same mark-free lines as `CascadingTranscriber::transcribe_page`.
-        let live = split_page_ink(strokes, ruling_pitch).lines;
+        let ink = split_page_ink(strokes, ruling_pitch);
+        let live = &ink.lines;
         let mut stats = RecogCacheStats::default();
         if live.len() != self.lines.len() {
             // Caller should sync first; still attempt by hash.
@@ -461,12 +535,14 @@ impl PageRecognitionCache {
                 None => {
                     // Empty result: clear pending so we do not spin forever.
                     slot.text.clear();
+                    slot.raw_text = None;
                     slot.confidence = -1.0;
                     slot.pending = false;
                     stats.recognised += 1;
                 }
             }
         }
+        self.apply_layout_with(&ink);
         Ok(stats)
     }
 }
@@ -806,6 +882,7 @@ mod tests {
             stroke_ids_hash: 42,
             stroke_ids: vec![StrokeId::new()],
             text: "hi".into(),
+            raw_text: None,
             confidence: 0.8,
             x: 1.0,
             y: 2.0,
