@@ -943,6 +943,33 @@ impl EphemerisUi {
             .set_see_text_lines(Rc::new(slint::VecModel::from(lines)).into());
     }
 
+    /// Save from the See-text editor: `(line_index, text, kind, number,
+    /// indent, highlight, underline)`.
+    pub fn on_see_text_line_save<F: FnMut(i32, String, i32, i32, i32, bool, bool) + 'static>(
+        &self,
+        mut handler: F,
+    ) {
+        self.component
+            .on_see_text_line_save(move |i, t, k, n, d, h, u| {
+                handler(i, t.to_string(), k, n, d, h, u)
+            });
+    }
+
+    /// Reset a line's user correction (`line_index`).
+    pub fn on_see_text_line_reset<F: FnMut(i32) + 'static>(&self, handler: F) {
+        self.component.on_see_text_line_reset(handler);
+    }
+
+    /// Stale line: keep the user's edit.
+    pub fn on_see_text_line_keep<F: FnMut(i32) + 'static>(&self, handler: F) {
+        self.component.on_see_text_line_keep(handler);
+    }
+
+    /// Stale line: use the new recognition.
+    pub fn on_see_text_line_accept<F: FnMut(i32) + 'static>(&self, handler: F) {
+        self.component.on_see_text_line_accept(handler);
+    }
+
     /// Register a closure called when the see-text toggle changes.
     pub fn on_note_see_text_toggled<F: FnMut(bool) + 'static>(&self, handler: F) {
         self.component.on_note_see_text_toggled(handler);
@@ -4988,6 +5015,10 @@ fn see_text_line(r: &ephemeris_core::see_text::SeeTextRow) -> SeeTextLine {
         pending: r.pending,
         stale: r.stale,
         line_index: r.line_index,
+        editable: r.editable,
+        whole_highlight: r.whole_highlight,
+        whole_underline: r.whole_underline,
+        plain: r.plain.as_str().into(),
         body,
     }
 }
@@ -5007,6 +5038,9 @@ mod see_text_tests {
             pending: false,
             stale: false,
             line_index: 0,
+            editable: false,
+            whole_highlight: false,
+            whole_underline: false,
             styled_md: md.into(),
             plain: md.into(),
         }
@@ -5085,6 +5119,16 @@ mod see_text_tests {
         );
         ui.set_see_text_rows(&rows);
         ui.set_note_see_text(true);
+        // `SEE_TEXT_EDITOR=1` renders with the line editor sheet open.
+        if std::env::var("SEE_TEXT_EDITOR").is_ok() {
+            let c = ui.clone_component();
+            c.set_see_text_edit_text("bullet b".into());
+            c.set_see_text_edit_kind(4);
+            c.set_see_text_edit_indent(1);
+            c.set_see_text_edit_underline(true);
+            c.set_see_text_edit_stale(true);
+            c.set_see_text_edit_open(true);
+        }
         ui.request_screen_change();
         let mut cap = Cap(None);
         ui.render_frame(&mut cap).expect("render");

@@ -8,7 +8,7 @@
 
 use crate::note_search::strip_inline_markdown;
 use crate::recognition_cache::{PageRecognitionCache, PENDING_LINE_MARKER};
-use crate::text_format::{styled_inline_markdown, BlockKind, InlineKind};
+use crate::text_format::{styled_inline_markdown, BlockKind, InlineKind, InlineMark, LineFormat};
 
 pub const KIND_H1: i32 = 0;
 pub const KIND_H2: i32 = 1;
@@ -30,6 +30,12 @@ pub struct SeeTextRow {
     pub stale: bool,
     /// Index into the cache's `lines` (0 for markdown-derived rows: position).
     pub line_index: i32,
+    /// True when `line_index` is a real cache line the editor may correct
+    /// (false for markdown-derived and still-empty pending rows).
+    pub editable: bool,
+    /// A highlight / underline mark covers the whole trimmed line.
+    pub whole_highlight: bool,
+    pub whole_underline: bool,
     /// StyledText-safe inline markdown.
     pub styled_md: String,
     /// Plain text fallback.
@@ -38,6 +44,23 @@ pub struct SeeTextRow {
 
 fn is_list_kind(k: i32) -> bool {
     matches!(k, KIND_BULLET | KIND_NUMBERED | KIND_CHECKBOX)
+}
+
+/// Char range of `text` without leading / trailing whitespace.
+fn trimmed_range(text: &str) -> (usize, usize) {
+    let n = text.chars().count();
+    let lead = text.chars().take_while(|c| c.is_whitespace()).count();
+    let trail = text.chars().rev().take_while(|c| c.is_whitespace()).count();
+    (lead.min(n), n.saturating_sub(trail).max(lead.min(n)))
+}
+
+/// True when a `kind` mark spans the whole trimmed (non-empty) line.
+fn has_whole_mark(text: &str, marks: &[InlineMark], kind: InlineKind) -> bool {
+    let (s, e) = trimmed_range(text);
+    s < e
+        && marks
+            .iter()
+            .any(|m| m.kind == kind && m.start <= s && m.end >= e)
 }
 
 fn bold_heading(inner: &str) -> String {
@@ -53,6 +76,7 @@ pub fn rows_from_cache(cache: &PageRecognitionCache) -> Vec<SeeTextRow> {
     let mut rows: Vec<SeeTextRow> = Vec::new();
     for (i, l) in cache.lines.iter().enumerate() {
         let (kind, number, checked, indent, para_break, styled_md, plain, pending);
+        let (mut whole_highlight, mut whole_underline) = (false, false);
         if l.is_completed() {
             let f = l.effective_format();
             let text = l.effective_text();
@@ -82,6 +106,8 @@ pub fn rows_from_cache(cache: &PageRecognitionCache) -> Vec<SeeTextRow> {
             };
             plain = text.to_string();
             pending = l.pending;
+            whole_highlight = has_whole_mark(text, &f.marks, InlineKind::Highlight);
+            whole_underline = has_whole_mark(text, &f.marks, InlineKind::Underline);
         } else {
             kind = KIND_PARA;
             number = 0;
@@ -107,6 +133,9 @@ pub fn rows_from_cache(cache: &PageRecognitionCache) -> Vec<SeeTextRow> {
             pending,
             stale: l.user_stale,
             line_index: i as i32,
+            editable: l.is_completed(),
+            whole_highlight,
+            whole_underline,
             styled_md,
             plain,
         });
@@ -215,6 +244,9 @@ pub fn rows_from_markdown(md: &str) -> Vec<SeeTextRow> {
             pending: false,
             stale: false,
             line_index: idx as i32,
+            editable: false,
+            whole_highlight: false,
+            whole_underline: false,
             styled_md: if kind <= KIND_H3 {
                 bold_heading(&inline_to_styled(body, true))
             } else {
@@ -225,6 +257,128 @@ pub fn rows_from_markdown(md: &str) -> Vec<SeeTextRow> {
         blank = false;
     }
     rows
+}
+
+/// Editor state for one line: plain text (no markup) plus format chips.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LineEdit {
+    pub text: String,
+    pub block: BlockKind,
+    /// List nesting; clamped to `0..=MAX_INDENT` and ignored for non-lists.
+    pub indent: u8,
+    /// Whole-line highlight / underline chips.
+    pub highlight: bool,
+    pub underline: bool,
+}
+
+pub const MAX_INDENT: u8 = 3;
+
+/// Block chip index (same numbering as `KIND_*`) to a [`BlockKind`].
+/// `number` is kept for Numbered when positive, else 1; `checked` is the
+/// previous checkbox state.
+pub fn block_from_kind(kind: i32, number: i32, checked: bool) -> BlockKind {
+    match kind {
+        KIND_H1 => BlockKind::Heading(1),
+        KIND_H2 => BlockKind::Heading(2),
+        KIND_H3 => BlockKind::Heading(3),
+        KIND_BULLET => BlockKind::Bullet,
+        KIND_NUMBERED => BlockKind::Numbered(number.max(1) as u32),
+        KIND_CHECKBOX => BlockKind::Checkbox(checked),
+        _ => BlockKind::Paragraph,
+    }
+}
+
+/// Initial editor state for cache line `idx` (effective text and format).
+pub fn line_edit_state(cache: &PageRecognitionCache, idx: usize) -> Option<LineEdit> {
+    let l = cache.lines.get(idx)?;
+    let f = l.effective_format();
+    let text = l.effective_text();
+    Some(LineEdit {
+        text: text.to_string(),
+        block: f.block,
+        indent: f.indent.min(MAX_INDENT),
+        highlight: has_whole_mark(text, &f.marks, InlineKind::Highlight),
+        underline: has_whole_mark(text, &f.marks, InlineKind::Underline),
+    })
+}
+
+/// Save an editor result as the user's correction for line `idx`.
+///
+/// Newlines in the text become spaces. `user_text` is set when the text
+/// differs from the effective text or a text correction already exists;
+/// `user_format` is always set. Mark handling:
+/// - Highlight / Underline chips are whole-line marks over the trimmed text.
+///   A kind whose chip state is unchanged keeps its existing (possibly
+///   partial) marks, unless the text changed.
+/// - When the text changed, char offsets of old marks are meaningless, so
+///   every mark that was not whole-line is dropped and whole-line marks
+///   (any kind) are recomputed over the new trimmed text.
+///
+/// Returns false when `idx` is out of range.
+pub fn apply_line_edit(cache: &mut PageRecognitionCache, idx: usize, edit: &LineEdit) -> bool {
+    let Some(l) = cache.lines.get(idx) else {
+        return false;
+    };
+    let old_text = l.effective_text().to_string();
+    let mut fmt: LineFormat = l.effective_format().clone();
+    let had_user_text = l.user_text.is_some();
+    let new_text = edit.text.replace(['\r', '\n'], " ");
+    let changed = new_text != old_text;
+
+    let (ns, ne) = trimmed_range(&new_text);
+    let whole = |kind| InlineMark {
+        kind,
+        start: ns,
+        end: ne,
+    };
+    if changed {
+        let was_whole = |m: &InlineMark| has_whole_mark(&old_text, std::slice::from_ref(m), m.kind);
+        let keep: Vec<InlineKind> = fmt
+            .marks
+            .iter()
+            .filter(|m| was_whole(m))
+            .map(|m| m.kind)
+            .collect();
+        fmt.marks = Vec::new();
+        if ns < ne {
+            for k in [
+                InlineKind::Bold,
+                InlineKind::Highlight,
+                InlineKind::Underline,
+            ] {
+                if keep.contains(&k) {
+                    fmt.marks.push(whole(k));
+                }
+            }
+        }
+    }
+    for (kind, want) in [
+        (InlineKind::Highlight, edit.highlight),
+        (InlineKind::Underline, edit.underline),
+    ] {
+        let has = has_whole_mark(&new_text, &fmt.marks, kind);
+        if has == want {
+            continue;
+        }
+        fmt.marks.retain(|m| m.kind != kind);
+        if want && ns < ne {
+            fmt.marks.push(whole(kind));
+        }
+    }
+
+    fmt.block = edit.block;
+    let is_list = matches!(
+        edit.block,
+        BlockKind::Bullet | BlockKind::Numbered(_) | BlockKind::Checkbox(_)
+    );
+    fmt.indent = if is_list {
+        edit.indent.min(MAX_INDENT)
+    } else {
+        0
+    };
+    let text = (changed || had_user_text).then_some(new_text);
+    cache.set_line_correction(idx, text, Some(fmt));
+    true
 }
 
 #[cfg(test)]
@@ -355,5 +509,114 @@ mod tests {
         assert_eq!((rows[2].kind, rows[2].number), (KIND_NUMBERED, 7));
         assert_eq!(rows[3].styled_md, "\\# hash");
         assert_eq!(rows[4].styled_md, "snake\\_case \\<b\\>");
+    }
+
+    fn edit_of(c: &PageRecognitionCache, i: usize) -> LineEdit {
+        line_edit_state(c, i).unwrap()
+    }
+
+    fn mk(kind: InlineKind, start: usize, end: usize) -> InlineMark {
+        InlineMark { kind, start, end }
+    }
+
+    #[test]
+    fn edit_text_sets_user_text_and_recomputes_whole_marks() {
+        let mut f = fmt(BlockKind::Paragraph);
+        f.marks = vec![
+            mk(InlineKind::Highlight, 0, 5), // whole line
+            mk(InlineKind::Underline, 0, 2), // partial
+        ];
+        let mut c = cache(vec![line("hello", f)]);
+        let mut e = edit_of(&c, 0);
+        assert!(e.highlight && !e.underline);
+        e.text = "hello brave world".into();
+        assert!(apply_line_edit(&mut c, 0, &e));
+        let l = &c.lines[0];
+        assert_eq!(l.user_text.as_deref(), Some("hello brave world"));
+        // Whole-line highlight follows the new length; partial underline dropped.
+        assert_eq!(
+            l.user_format.as_ref().unwrap().marks,
+            vec![mk(InlineKind::Highlight, 0, 17)]
+        );
+        assert_eq!(l.text, "hello");
+    }
+
+    #[test]
+    fn unchanged_text_keeps_partial_marks_and_no_user_text() {
+        let mut f = fmt(BlockKind::Paragraph);
+        f.marks = vec![mk(InlineKind::Underline, 0, 2)];
+        let mut c = cache(vec![line("hello", f)]);
+        let mut e = edit_of(&c, 0);
+        e.block = BlockKind::Heading(2);
+        apply_line_edit(&mut c, 0, &e);
+        let l = &c.lines[0];
+        assert!(l.user_text.is_none());
+        let uf = l.user_format.as_ref().unwrap();
+        assert_eq!(uf.block, BlockKind::Heading(2));
+        assert_eq!(uf.marks, vec![mk(InlineKind::Underline, 0, 2)]);
+    }
+
+    #[test]
+    fn chips_toggle_whole_line_marks_over_trimmed_text() {
+        let mut c = cache(vec![line("  hi there ", fmt(BlockKind::Paragraph))]);
+        let mut e = edit_of(&c, 0);
+        e.underline = true;
+        apply_line_edit(&mut c, 0, &e);
+        assert_eq!(
+            c.lines[0].user_format.as_ref().unwrap().marks,
+            vec![mk(InlineKind::Underline, 2, 10)]
+        );
+        assert!(edit_of(&c, 0).underline);
+        let mut e = edit_of(&c, 0);
+        e.underline = false;
+        apply_line_edit(&mut c, 0, &e);
+        assert!(c.lines[0].user_format.as_ref().unwrap().marks.is_empty());
+    }
+
+    #[test]
+    fn indent_clamps_and_only_applies_to_lists() {
+        let mut c = cache(vec![line("a", fmt(BlockKind::Paragraph))]);
+        let mut e = edit_of(&c, 0);
+        e.block = BlockKind::Bullet;
+        e.indent = 9;
+        apply_line_edit(&mut c, 0, &e);
+        assert_eq!(c.lines[0].user_format.as_ref().unwrap().indent, MAX_INDENT);
+        e.block = BlockKind::Heading(1);
+        apply_line_edit(&mut c, 0, &e);
+        assert_eq!(c.lines[0].user_format.as_ref().unwrap().indent, 0);
+    }
+
+    #[test]
+    fn numbered_defaults_to_one() {
+        assert_eq!(
+            block_from_kind(KIND_NUMBERED, 0, false),
+            BlockKind::Numbered(1)
+        );
+        assert_eq!(
+            block_from_kind(KIND_NUMBERED, 4, false),
+            BlockKind::Numbered(4)
+        );
+        assert_eq!(
+            block_from_kind(KIND_CHECKBOX, 0, true),
+            BlockKind::Checkbox(true)
+        );
+        assert_eq!(block_from_kind(KIND_H3, 0, false), BlockKind::Heading(3));
+        assert_eq!(block_from_kind(KIND_PARA, 0, false), BlockKind::Paragraph);
+    }
+
+    #[test]
+    fn reset_clears_correction_and_rows_flag_editable() {
+        let mut c = cache(vec![line("a", fmt(BlockKind::Paragraph))]);
+        let mut e = edit_of(&c, 0);
+        e.text = "b".into();
+        e.block = BlockKind::Bullet;
+        apply_line_edit(&mut c, 0, &e);
+        assert_eq!(c.completed_markdown(), "- b");
+        let rows = rows_from_cache(&c);
+        assert!(rows[0].editable);
+        c.clear_line_correction(0);
+        assert_eq!(c.completed_markdown(), "a");
+        assert!(!apply_line_edit(&mut c, 5, &e));
+        assert!(!rows_from_markdown("x")[0].editable);
     }
 }
