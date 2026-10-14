@@ -15,9 +15,10 @@ mod live {
     use wayland_client::backend::Backend;
     use wayland_client::globals::{registry_queue_init, GlobalListContents};
     use wayland_client::protocol::{wl_registry, wl_seat};
-    use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle};
+    use wayland_client::{event_created_child, Connection, Dispatch, EventQueue, QueueHandle};
     use wayland_protocols::wp::tablet::zv2::client::{
-        zwp_tablet_manager_v2, zwp_tablet_seat_v2, zwp_tablet_tool_v2, zwp_tablet_v2,
+        zwp_tablet_manager_v2, zwp_tablet_pad_v2, zwp_tablet_seat_v2, zwp_tablet_tool_v2,
+        zwp_tablet_v2,
     };
     use winit::raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
 
@@ -140,6 +141,14 @@ mod live {
     }
 
     impl Dispatch<zwp_tablet_seat_v2::ZwpTabletSeatV2, ()> for State {
+        // tablet_added / tool_added / pad_added create child objects — without
+        // this specialization wayland-client panics on stylus devices (PineNote).
+        event_created_child!(State, zwp_tablet_seat_v2::ZwpTabletSeatV2, [
+            zwp_tablet_seat_v2::EVT_TABLET_ADDED_OPCODE => (zwp_tablet_v2::ZwpTabletV2, ()),
+            zwp_tablet_seat_v2::EVT_TOOL_ADDED_OPCODE => (zwp_tablet_tool_v2::ZwpTabletToolV2, ()),
+            zwp_tablet_seat_v2::EVT_PAD_ADDED_OPCODE => (zwp_tablet_pad_v2::ZwpTabletPadV2, ()),
+        ]);
+
         fn event(
             _: &mut Self,
             _: &zwp_tablet_seat_v2::ZwpTabletSeatV2,
@@ -148,7 +157,8 @@ mod live {
             _: &Connection,
             _: &QueueHandle<Self>,
         ) {
-            // tool_added / tablet_added proxies are routed to their own Dispatch.
+            // Child proxies are constructed via event_created_child above and
+            // delivered to their own Dispatch impls.
         }
     }
 
@@ -161,6 +171,19 @@ mod live {
             _: &Connection,
             _: &QueueHandle<Self>,
         ) {
+        }
+    }
+
+    impl Dispatch<zwp_tablet_pad_v2::ZwpTabletPadV2, ()> for State {
+        fn event(
+            _: &mut Self,
+            _: &zwp_tablet_pad_v2::ZwpTabletPadV2,
+            _: zwp_tablet_pad_v2::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            // PineNote has no pad; ignore if a compositor still advertises one.
         }
     }
 

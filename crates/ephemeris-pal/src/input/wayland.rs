@@ -302,9 +302,10 @@ impl Input for WaylandInput {
 #[cfg(all(feature = "wayland", target_os = "linux"))]
 mod live {
     use wayland_client::protocol::{wl_registry, wl_seat, wl_touch};
-    use wayland_client::{Connection, Dispatch, QueueHandle};
+    use wayland_client::{event_created_child, Connection, Dispatch, QueueHandle};
     use wayland_protocols::wp::tablet::zv2::client::{
-        zwp_tablet_manager_v2, zwp_tablet_seat_v2, zwp_tablet_tool_v2, zwp_tablet_v2,
+        zwp_tablet_manager_v2, zwp_tablet_pad_v2, zwp_tablet_seat_v2, zwp_tablet_tool_v2,
+        zwp_tablet_v2,
     };
 
     use super::super::InputError;
@@ -470,6 +471,14 @@ mod live {
     // ── Tablet seat: a new tool appears ───────────────────────────────────────
 
     impl Dispatch<zwp_tablet_seat_v2::ZwpTabletSeatV2, ()> for AppData {
+        // Child-creating events must specialize event_created_child or
+        // wayland-client panics (seen on PineNote: opcode 0 = tablet_added).
+        event_created_child!(AppData, zwp_tablet_seat_v2::ZwpTabletSeatV2, [
+            zwp_tablet_seat_v2::EVT_TABLET_ADDED_OPCODE => (zwp_tablet_v2::ZwpTabletV2, ()),
+            zwp_tablet_seat_v2::EVT_TOOL_ADDED_OPCODE => (zwp_tablet_tool_v2::ZwpTabletToolV2, ()),
+            zwp_tablet_seat_v2::EVT_PAD_ADDED_OPCODE => (zwp_tablet_pad_v2::ZwpTabletPadV2, ()),
+        ]);
+
         fn event(
             _: &mut Self,
             _: &zwp_tablet_seat_v2::ZwpTabletSeatV2,
@@ -478,10 +487,7 @@ mod live {
             _: &Connection,
             _: &QueueHandle<Self>,
         ) {
-            // `tool_added` (and `tablet_added`/`pad_added`) arrive as this
-            // event's variants carrying already-constructed proxies, which the
-            // generated code routes to their own Dispatch impls below. Nothing
-            // extra to do here.
+            // Child proxies are constructed via event_created_child above.
             let _ = event;
         }
     }
@@ -493,6 +499,18 @@ mod live {
             _: &mut Self,
             _: &zwp_tablet_v2::ZwpTabletV2,
             _: zwp_tablet_v2::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
+    }
+
+    impl Dispatch<zwp_tablet_pad_v2::ZwpTabletPadV2, ()> for AppData {
+        fn event(
+            _: &mut Self,
+            _: &zwp_tablet_pad_v2::ZwpTabletPadV2,
+            _: zwp_tablet_pad_v2::Event,
             _: &(),
             _: &Connection,
             _: &QueueHandle<Self>,
