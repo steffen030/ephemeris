@@ -696,6 +696,24 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn exported_note_checkboxes_are_not_scanned() {
+        let tmp = TempDir::new().unwrap();
+        let export = tmp.path().join("Ephemeris/Notes");
+        fs::create_dir_all(&export).unwrap();
+        fs::write(export.join("Note.md"), "- [ ] handwritten\n").unwrap();
+        fs::write(tmp.path().join("Real.md"), "- [ ] typed\n").unwrap();
+        let ext = MarkdownTaskExtractor::new(tmp.path(), ProfileId::new())
+            .with_exclude_export_subdir("Ephemeris");
+        let titles: Vec<String> = ext
+            .list(ProfileId::new())
+            .unwrap()
+            .into_iter()
+            .map(|t| t.title)
+            .collect();
+        assert_eq!(titles, vec!["typed".to_string()]);
+    }
+
+    #[test]
     fn parse_simple_task() {
         let ext = MarkdownTaskExtractor::new("/tmp", ProfileId::new());
         let tasks = ext.parse_tasks("- [ ] Buy milk #errands", Some("a.md"));

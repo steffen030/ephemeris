@@ -1280,6 +1280,55 @@ impl App {
             });
         }
 
+        // ── Hand-drawn checkboxes → tasks (ephemeris-fmt.11) ──────────────────
+        // Reconciles a page's checkbox lines into `tasks` (source "note") and
+        // refreshes the task view when anything changed. In-memory like all
+        // non-vault tasks; rebuilt below from the on-disk caches at startup.
+        let sync_note_tasks: SyncNoteTasksFn = {
+            let tasks2 = tasks.clone();
+            let notes2 = notes.clone();
+            let ui2 = ui.clone_component();
+            let filter_rc = active_profile_filter.clone();
+            let mgr2 = profile_mgr.clone();
+            let cfg2 = config.clone();
+            let ink_seen: Rc<RefCell<HashMap<ephemeris_core::TaskId, bool>>> =
+                Rc::new(RefCell::new(HashMap::new()));
+            Rc::new(move |note_id, doc_page, cache| {
+                let profile = notes2
+                    .borrow()
+                    .iter()
+                    .find(|n| n.id == note_id)
+                    .and_then(|n| uuid::Uuid::parse_str(&n.profile_id).ok())
+                    .map(ProfileId)
+                    .unwrap_or(work_pid);
+                let changed = ephemeris_core::sync_page_tasks(
+                    &mut tasks2.borrow_mut(),
+                    &mut ink_seen.borrow_mut(),
+                    note_id,
+                    doc_page,
+                    profile,
+                    cache,
+                );
+                if changed {
+                    let filter_str = filter_rc.borrow().clone();
+                    let filtered = filter_tasks_by_profile(&tasks2.borrow(), &filter_str);
+                    refresh_comp(&ui2, &filtered, work_pid, &mgr2, &cfg2.borrow());
+                }
+            })
+        };
+        {
+            let snapshot: Vec<(u32, usize)> = notes
+                .borrow()
+                .iter()
+                .flat_map(|n| (0..n.doc_page_count.max(1)).map(move |p| (n.id, p)))
+                .collect();
+            for (note_id, doc_page) in snapshot {
+                if let Some(cache) = PageRecognitionCache::load(&data_dir, note_id, doc_page) {
+                    sync_note_tasks(note_id, doc_page, &cache);
+                }
+            }
+        }
+
         // ── Connection management ─────────────────────────────────────────────
 
         // Connect-tab profile selection (does not change the app-wide filter)
@@ -5321,6 +5370,7 @@ impl App {
             calendar_events: calendar_events.clone(),
             active_profile_filter: active_profile_filter.clone(),
             push_recordings,
+            sync_note_tasks,
             #[cfg(target_os = "linux")]
             pen_source,
             #[cfg(target_os = "linux")]
@@ -5374,6 +5424,9 @@ enum PointerSource {
     Finger,
     Mouse,
 }
+
+/// `(note_id, doc_page, cache)` → reconcile handwritten checkboxes into tasks.
+type SyncNoteTasksFn = Rc<dyn Fn(u32, usize, &PageRecognitionCache)>;
 
 struct WinitHandler {
     _rt: Runtime,
@@ -5457,6 +5510,8 @@ struct WinitHandler {
     active_profile_filter: Rc<RefCell<String>>,
     /// Profile-filtered recording list refresh — called after transcription completes.
     push_recordings: Rc<dyn Fn()>,
+    /// Reconcile a page's handwritten checkboxes into tasks (ephemeris-fmt.11).
+    sync_note_tasks: SyncNoteTasksFn,
     /// Linux: separate digitiser (PineNote pen) via `/dev/input` — not wl_touch.
     #[cfg(target_os = "linux")]
     pen_source: Option<EvdevPenSource>,
@@ -5790,6 +5845,7 @@ impl WinitHandler {
         let completed = cache.completed_markdown();
         let rows = see_text_rows(&cache, Some(&completed));
         let see_text_open = self.ui.clone_component().get_note_see_text();
+        (self.sync_note_tasks)(note_id, doc_page, &cache);
         self.bg_recog.store(note_id, doc_page, cache);
         if let Some(note) = self.notes.borrow_mut().iter_mut().find(|n| n.id == note_id) {
             note.updated_at = now_secs();
@@ -6082,6 +6138,7 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
                     }
                 }
                 if did_persist {
+                    (self.sync_note_tasks)(job.note_id, job.doc_page, &job.cache);
                     save_notes_index_and_sync_vault(
                         &self.data_dir,
                         &self.notes.borrow(),

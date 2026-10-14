@@ -377,6 +377,24 @@ mod tests {
     }
 
     #[test]
+    fn markdown_checkboxes_survive() {
+        let tmp = TempDir::new().unwrap();
+        let note = VaultNoteExport {
+            notebook_title: "Test".into(),
+            notebook_segments: vec![],
+            note_title: "Note".into(),
+            note_id: 1,
+            created_at: 0,
+            text_content: Some("- [ ] buy milk\n- [x] call bob".into()),
+            pdf_vault_rel: None,
+        };
+        let path = export_note_markdown(tmp.path(), Path::new("Ephemeris"), &note).unwrap();
+        let body = fs::read_to_string(path).unwrap();
+        assert!(body.contains("- [ ] buy milk"));
+        assert!(body.contains("- [x] call bob"));
+    }
+
+    #[test]
     fn markdown_escaped_paragraph_survives() {
         let tmp = TempDir::new().unwrap();
         let note = VaultNoteExport {
