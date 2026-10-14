@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.16](https://github.com/steffen030/ephemeris/compare/v0.1.15...v0.1.16) (2026-10-14)
+
+
+### Bug Fixes
+
+* keep stroke HTR timing precise and persist stroke t0_ms (ephemeris-ktg.16, ktg.17) ([#41](https://github.com/steffen030/ephemeris/issues/41)) ([a38e815](https://github.com/steffen030/ephemeris/commit/a38e815dccac2719be938aaf048b0d5c8d436da9))
+
 ## [0.1.15](https://github.com/steffen030/ephemeris/compare/v0.1.14...v0.1.15) (2026-10-14)
 
 
