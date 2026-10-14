@@ -11,7 +11,7 @@
 use crate::ink_layout::{estimate_text_height, split_page_ink, PageInk};
 use crate::layout_detect::{detect_line_formats, LayoutLine};
 use crate::model::{Stroke, StrokeId};
-use crate::stroke_htr::StrokeLine;
+use crate::stroke_htr::{stroke_bounds, StrokeLine};
 use crate::text_format::{lines_to_markdown, LineFormat};
 use crate::transcriber::TextSpan;
 use serde::{Deserialize, Serialize};
@@ -326,6 +326,20 @@ impl PageRecognitionCache {
             .iter()
             .map(|l| (stroke_line_ids_hash(l), estimate_text_height(&l.strokes)))
             .collect();
+        // Text stroke x-extents per line, for word-level marks.
+        let spans: std::collections::HashMap<u64, Vec<(f32, f32)>> = ink
+            .lines
+            .iter()
+            .map(|l| {
+                let xs = l
+                    .strokes
+                    .iter()
+                    .filter_map(stroke_bounds)
+                    .map(|(x0, _, x1, _)| (x0, x1))
+                    .collect();
+                (stroke_line_ids_hash(l), xs)
+            })
+            .collect();
         let completed: Vec<bool> = self.lines.iter().map(|l| l.is_completed()).collect();
         let raw: Vec<String> = self
             .lines
@@ -348,6 +362,7 @@ impl PageRecognitionCache {
                 glyph_height: glyph.get(&l.stroke_ids_hash).copied().unwrap_or(0.0),
                 text: if *done { t } else { "" },
                 strip_prefix: l.user_text.is_none(),
+                stroke_spans: spans.get(&l.stroke_ids_hash).map_or(&[], Vec::as_slice),
             })
             .collect();
         let detected = detect_line_formats(&layout, &ink.marks, &ink.highlights);
