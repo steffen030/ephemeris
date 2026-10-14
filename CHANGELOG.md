@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.14](https://github.com/steffen030/ephemeris/compare/v0.1.13...v0.1.14) (2026-10-14)
+
+
+### Features
+
+* PineNote ink + HTR overhaul (ephemeris-ktg) ([#37](https://github.com/steffen030/ephemeris/issues/37)) ([216cbd3](https://github.com/steffen030/ephemeris/commit/216cbd3ca6dde036e7a5be92aed1cb6552056067))
+
 ## [0.1.13](https://github.com/steffen030/ephemeris/compare/v0.1.12...v0.1.13) (2026-10-13)
 
 
