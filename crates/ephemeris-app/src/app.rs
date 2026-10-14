@@ -1846,11 +1846,16 @@ impl App {
                     let version = recognition_model_version_for(&cfg2.borrow());
                     let strokes = ui_rc.get_page_strokes();
                     let ruling = note_ruling_pitch(&ui_rc);
-                    let display = if let (Some(nid), Some(page)) = (note_id, doc_page) {
+                    let rows = if let (Some(nid), Some(page)) = (note_id, doc_page) {
                         let mut cache = bg.get_or_load(&data_dir_st, nid, page, &version);
                         cache.sync_strokes(&strokes, ruling, &version);
-                        let text = cache.display_text();
                         let pending = cache.has_pending();
+                        let stored = notes_prior
+                            .borrow()
+                            .iter()
+                            .find(|n| n.id == nid)
+                            .and_then(|n| n.text_content.clone());
+                        let rows = see_text_rows(&cache, stored.as_deref());
                         bg.store(nid, page, cache);
                         if pending {
                             // Kick low-priority worker immediately (still blocked while drawing).
@@ -1864,25 +1869,11 @@ impl App {
                                 ruling,
                             );
                         }
-                        if text.is_empty() {
-                            if pending {
-                                "Recognising…".to_string()
-                            } else {
-                                notes_prior
-                                    .borrow()
-                                    .iter()
-                                    .find(|n| n.id == nid)
-                                    .and_then(|n| n.text_content.clone())
-                                    .filter(|t| !t.is_empty())
-                                    .unwrap_or_else(|| "No text recognised yet.".into())
-                            }
-                        } else {
-                            text
-                        }
+                        rows
                     } else {
-                        "No active note.".into()
+                        Vec::new()
                     };
-                    ui_rc.set_note_text_content(&display);
+                    ui_rc.set_see_text_rows(&rows);
                 } else {
                     // Discard late See-text overlay updates from a closed view.
                     gen_counter.fetch_add(1, Ordering::AcqRel);
@@ -1981,7 +1972,7 @@ impl App {
                 ui2.set_show_notebook_list(false);
                 ui2.set_drawing_menu_open(false);
                 ui2.set_active_note_id(new_id.to_string().as_str().into());
-                ui_rc.set_note_text_content("");
+                ui_rc.set_see_text_rows(&[]);
                 ui_rc.set_note_see_text(false);
                 save_notes_index_and_sync_vault(
                     &data_dir2,
@@ -4359,7 +4350,9 @@ impl App {
                             ui2.set_active_note_id(id.as_str().into());
                             ui_rc.set_page_title(&title);
                             ui_rc.set_current_page_template(template);
-                            ui_rc.set_note_text_content(&text);
+                            ui_rc.set_see_text_rows(&ephemeris_core::see_text::rows_from_markdown(
+                                &text,
+                            ));
                             ui_rc.set_note_see_text(false);
                             ui_rc.navigate_to_page(page_idx);
                         }
@@ -5240,7 +5233,7 @@ impl App {
                         ui2.set_show_note_list(false);
                         ui2.set_show_notebook_list(false);
                         ui2.set_active_note_id(new_id.to_string().as_str().into());
-                        ui_rc.set_note_text_content("");
+                        ui_rc.set_see_text_rows(&[]);
                         ui_rc.set_note_see_text(false);
                         save_notes_index_and_sync_vault(
                             &data_dir2,
@@ -5795,7 +5788,7 @@ impl WinitHandler {
             tracing::warn!("Failed to save recognition cache for note {note_id}: {e}");
         }
         let completed = cache.completed_markdown();
-        let display = cache.display_text();
+        let rows = see_text_rows(&cache, Some(&completed));
         let see_text_open = self.ui.clone_component().get_note_see_text();
         self.bg_recog.store(note_id, doc_page, cache);
         if let Some(note) = self.notes.borrow_mut().iter_mut().find(|n| n.id == note_id) {
@@ -5809,7 +5802,7 @@ impl WinitHandler {
         // Update See-text overlay in place when open (pending markers); otherwise
         // leave Slint alone mid-ink to avoid UI damage.
         if see_text_open {
-            self.ui.set_note_text_content(&display);
+            self.ui.set_see_text_rows(&rows);
         }
         // Vault export waits for leave-note or the 10‑minute batch — never per stroke.
         self.vault_export.mark(note_id);
@@ -6069,7 +6062,7 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
             if let Some(job) = guard.take() {
                 drop(guard);
                 let completed = job.cache.completed_markdown();
-                let display = job.cache.display_text();
+                let rows = see_text_rows(&job.cache, Some(&completed));
                 self.bg_recog
                     .store(job.note_id, job.doc_page, job.cache.clone());
                 let mut did_persist = false;
@@ -6108,7 +6101,7 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
                     .parse::<u32>()
                     .ok();
                 if see_text_open && active_id == Some(job.note_id) {
-                    self.ui.set_note_text_content(&display);
+                    self.ui.set_see_text_rows(&rows);
                     self.ui.request_screen_change();
                     if let Some(d) = &self.display {
                         d.request_redraw();
@@ -8293,6 +8286,18 @@ fn sync_notes_export_to_vault(
     }
 }
 
+/// See-text rows: from the live cache lines, else from stored markdown.
+fn see_text_rows(
+    cache: &ephemeris_core::recognition_cache::PageRecognitionCache,
+    stored_markdown: Option<&str>,
+) -> Vec<ephemeris_core::see_text::SeeTextRow> {
+    if cache.lines.is_empty() {
+        ephemeris_core::see_text::rows_from_markdown(stored_markdown.unwrap_or_default())
+    } else {
+        ephemeris_core::see_text::rows_from_cache(cache)
+    }
+}
+
 /// Push see-text content for the active note into the UI.
 fn push_note_text_for_active(ui: &ephemeris_ui::EphemerisUi, notes: &[AppNote], active_id: &str) {
     let text = notes
@@ -8300,7 +8305,7 @@ fn push_note_text_for_active(ui: &ephemeris_ui::EphemerisUi, notes: &[AppNote], 
         .find(|n| n.id.to_string() == active_id)
         .and_then(|n| n.text_content.clone())
         .unwrap_or_default();
-    ui.set_note_text_content(&text);
+    ui.set_see_text_rows(&ephemeris_core::see_text::rows_from_markdown(&text));
     ui.set_note_see_text(false);
 }
 

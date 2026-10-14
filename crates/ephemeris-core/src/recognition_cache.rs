@@ -141,7 +141,7 @@ impl CachedLine {
 
     /// Whether this line contributes to completed text: a corrected line counts
     /// even while its re-recognition is pending.
-    fn is_completed(&self) -> bool {
+    pub(crate) fn is_completed(&self) -> bool {
         (!self.pending || self.has_correction()) && !self.effective_text().is_empty()
     }
 

@@ -116,9 +116,70 @@ fn normalise_marks(marks: &[InlineMark], len: usize) -> Vec<InlineMark> {
 /// Render `text` with inline marks. Offsets are chars, so umlauts and other
 /// multi-byte characters never split.
 fn render_inline(text: &str, marks: &[InlineMark]) -> String {
+    render_inline_opts(text, marks, false)
+}
+
+/// Escape one char so it is literal inside a StyledText-safe markdown string.
+fn push_escaped(out: &mut String, c: char) {
+    if matches!(
+        c,
+        '\\' | '*' | '_' | '`' | '<' | '>' | '[' | ']' | '~' | '&'
+    ) {
+        out.push('\\');
+    }
+    out.push(c);
+}
+
+/// Render a line body for Slint `StyledText::from_markdown`.
+///
+/// Only the inline subset Slint parses is emitted: `**bold**` (highlight is
+/// folded into bold, which renders as the e-ink highlight), `<u>underline</u>`.
+/// Literal markdown-significant characters in `text` are backslash-escaped and
+/// block syntax at the start of the line (`#`, `-`, `1.` ...) is neutralised,
+/// so recognised text can never produce headings or unsupported tags.
+pub fn styled_inline_markdown(text: &str, marks: &[InlineMark]) -> String {
+    let folded: Vec<InlineMark> = marks
+        .iter()
+        .map(|m| InlineMark {
+            kind: if m.kind == InlineKind::Highlight {
+                InlineKind::Bold
+            } else {
+                m.kind
+            },
+            ..*m
+        })
+        .collect();
+    let body = render_inline_opts(text, &folded, true);
+    // Neutralise block syntax at the very start (after optional whitespace).
+    let t = body.trim_start();
+    let lead = body.len() - t.len();
+    let mut chars = t.chars();
+    let first = chars.next();
+    let digits = t.chars().take_while(|c| c.is_ascii_digit()).count();
+    let mut out = String::with_capacity(body.len() + 2);
+    out.push_str(&body[..lead]);
+    if matches!(first, Some('#' | '-' | '+')) {
+        out.push('\\');
+        out.push_str(t);
+    } else if digits > 0 && matches!(t[digits..].chars().next(), Some('.' | ')')) {
+        out.push_str(&t[..digits]);
+        out.push('\\');
+        out.push_str(&t[digits..]);
+    } else {
+        out.push_str(t);
+    }
+    out
+}
+
+fn render_inline_opts(text: &str, marks: &[InlineMark], escape: bool) -> String {
     let chars: Vec<char> = text.chars().collect();
     let marks = normalise_marks(marks, chars.len());
     if marks.is_empty() {
+        if escape {
+            let mut out = String::with_capacity(text.len());
+            text.chars().for_each(|c| push_escaped(&mut out, c));
+            return out;
+        }
         return text.to_string();
     }
     let active_at = |i: usize| -> [bool; 3] {
@@ -152,7 +213,11 @@ fn render_inline(text: &str, marks: &[InlineMark]) -> String {
                 }
             }
         }
-        out.push(*c);
+        if escape {
+            push_escaped(&mut out, *c);
+        } else {
+            out.push(*c);
+        }
     }
     for (k, on) in KINDS.iter().zip(cur).rev() {
         if on {
