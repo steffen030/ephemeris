@@ -28,7 +28,28 @@
 //!   which swing with descenders).
 //! * Whole-line highlight / underline: highlighter or underline strokes cover
 //!   `>= 80%` of the line width → mark over the trimmed text (so `==text==`
-//!   never has inner spaces). Partial coverage is left to ephemeris-fmt.10.
+//!   never has inner spaces).
+//! * Word-level highlight / underline (ephemeris-fmt.10): see below.
+//!
+//! # Word-level marks
+//!
+//! HTR yields no character positions, so marks are mapped through words.
+//! The line's text strokes ([`LayoutLine::stroke_spans`]) are clustered into
+//! `k` word boxes by cutting at the `k − 1` largest x-gaps, `k` being the
+//! whitespace word count of the detected text (after prefix stripping; if a
+//! textual prefix was stripped, `k + 1` boxes with the first dropped is tried
+//! first, as the prefix glyph is ink). The clustering is accepted only when the
+//! smallest cut gap is `>= 1.5×` the largest uncut gap and `>= 0.25×` the
+//! line's glyph height; otherwise the ink and the text disagree (HTR merged
+//! or split words, or a user correction changed the word count).
+//!
+//! With word boxes, a mark selects every word whose box it covers `>= 50%`
+//! in x; contiguous selected words merge into one [`InlineMark`] (inner
+//! spaces included, surrounding spaces never). Selecting every word is the
+//! whole-line case when coverage is `>= 80%` (heading-by-underline applies);
+//! a strict subset is always inline, so an underlined word on a short line is
+//! never a heading. Without word boxes, coverage `>= 80%` → whole line, else
+//! the mark is dropped (logged at debug).
 //!
 //! # Mark ↔ line association
 //!
@@ -52,12 +73,18 @@ pub const PARA_GAP_RATIO: f32 = 1.6;
 pub const WHOLE_LINE_COVERAGE: f32 = 0.8;
 /// Longest line (in words) an underline can turn into an H2.
 pub const UNDERLINE_HEADING_MAX_WORDS: usize = 6;
+/// Fraction of a word box a mark must cover to select that word.
+pub const WORD_COVERAGE: f32 = 0.5;
+/// A word-cut gap must be this × the largest gap left uncut.
+pub const WORD_GAP_RATIO: f32 = 1.5;
+/// A word-cut gap must be at least this × the line's glyph height.
+pub const WORD_GAP_MIN: f32 = 0.25;
 /// List indent step in units of `H`.
 const INDENT_STEP: f32 = 1.5;
 const MAX_INDENT: u8 = 3;
 
 /// One line's geometry and text, in reading order.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct LayoutLine<'a> {
     pub x: f32,
     pub y: f32,
@@ -73,6 +100,10 @@ pub struct LayoutLine<'a> {
     /// Interpret and strip textual list prefixes (`- `, `1. `). False for
     /// user-corrected text, which is never rewritten.
     pub strip_prefix: bool,
+    /// `(min_x, max_x)` of each text stroke on the line, any order; used to
+    /// cluster words for partial marks. Empty when unknown, in which case
+    /// only whole-line marks are detected.
+    pub stroke_spans: &'a [(f32, f32)],
 }
 
 /// Detection result: the text with any list prefix stripped, plus its format.
@@ -232,20 +263,35 @@ pub fn detect_line_formats(
         }
 
         let mut marks = Vec::new();
-        let under = coverage(&underlines[i], line) >= WHOLE_LINE_COVERAGE;
+        let words = if underlines[i].is_empty() && highlit[i].is_empty() {
+            None
+        } else {
+            word_boxes(line, body)
+        };
         let top_of_block = i == 0 || para_break(i) || prev_block != BlockKind::Paragraph;
-        if under {
-            if block == BlockKind::Paragraph
-                && top_of_block
-                && body.split_whitespace().count() <= UNDERLINE_HEADING_MAX_WORDS
-            {
-                block = BlockKind::Heading(2);
-            } else if !matches!(block, BlockKind::Heading(_)) {
-                marks.extend(whole_line_mark(body, InlineKind::Underline));
+        match mark_scope(
+            &underlines[i],
+            line,
+            words.as_deref(),
+            InlineKind::Underline,
+        ) {
+            MarkScope::WholeLine => {
+                if block == BlockKind::Paragraph
+                    && top_of_block
+                    && body.split_whitespace().count() <= UNDERLINE_HEADING_MAX_WORDS
+                {
+                    block = BlockKind::Heading(2);
+                } else if !matches!(block, BlockKind::Heading(_)) {
+                    marks.extend(whole_line_mark(body, InlineKind::Underline));
+                }
             }
+            MarkScope::Words(m) if !matches!(block, BlockKind::Heading(_)) => marks.extend(m),
+            _ => {}
         }
-        if coverage(&highlit[i], line) >= WHOLE_LINE_COVERAGE {
-            marks.extend(whole_line_mark(body, InlineKind::Highlight));
+        match mark_scope(&highlit[i], line, words.as_deref(), InlineKind::Highlight) {
+            MarkScope::WholeLine => marks.extend(whole_line_mark(body, InlineKind::Highlight)),
+            MarkScope::Words(m) => marks.extend(m),
+            MarkScope::Drop => {}
         }
         prev_block = if body.trim().is_empty() {
             BlockKind::Paragraph
@@ -337,10 +383,184 @@ fn line_containing(lines: &[LayoutLine], b: &Bb, h: f32) -> Option<usize> {
 
 /// Fraction of the line's x-extent covered by the union of `spans`.
 fn coverage(spans: &[(f32, f32)], line: &LayoutLine) -> f32 {
-    if spans.is_empty() || line.width <= 0.0 {
+    if line.width <= 0.0 {
         return 0.0;
     }
-    let (lo, hi) = (line.x, line.x + line.width);
+    coverage_of(spans, line.x, line.x + line.width)
+}
+
+/// One word: its ink x-range and its char range in the detected text.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct WordBox {
+    min_x: f32,
+    max_x: f32,
+    start: usize,
+    end: usize,
+}
+
+/// How a line's highlight / underline strokes apply to its text.
+#[derive(Debug, PartialEq)]
+enum MarkScope {
+    Drop,
+    WholeLine,
+    Words(Vec<InlineMark>),
+}
+
+/// Whole line, selected words, or nothing (see the module docs).
+fn mark_scope(
+    spans: &[(f32, f32)],
+    line: &LayoutLine,
+    words: Option<&[WordBox]>,
+    kind: InlineKind,
+) -> MarkScope {
+    if spans.is_empty() {
+        return MarkScope::Drop;
+    }
+    let whole = coverage(spans, line) >= WHOLE_LINE_COVERAGE;
+    let Some(words) = words else {
+        if whole {
+            return MarkScope::WholeLine;
+        }
+        tracing::debug!(
+            "layout: dropping partial {kind:?} on {:?}: words do not match ink",
+            line.text
+        );
+        return MarkScope::Drop;
+    };
+    let selected: Vec<bool> = words
+        .iter()
+        .map(|w| coverage_of(spans, w.min_x, w.max_x) >= WORD_COVERAGE)
+        .collect();
+    if whole && selected.iter().all(|s| *s) {
+        return MarkScope::WholeLine;
+    }
+    // Contiguous selected words merge (inner spaces included).
+    let mut marks: Vec<InlineMark> = Vec::new();
+    for (j, w) in words.iter().enumerate().filter(|(j, _)| selected[*j]) {
+        match marks.last_mut() {
+            Some(m) if j > 0 && selected[j - 1] => m.end = w.end,
+            _ => marks.push(InlineMark {
+                kind,
+                start: w.start,
+                end: w.end,
+            }),
+        }
+    }
+    if marks.is_empty() {
+        MarkScope::Drop
+    } else {
+        MarkScope::Words(marks)
+    }
+}
+
+/// Cluster the line's text strokes into one box per word of `body`, or
+/// `None` when the ink's gaps don't clearly split into that many words.
+fn word_boxes(line: &LayoutLine, body: &str) -> Option<Vec<WordBox>> {
+    let tokens = word_char_ranges(body);
+    if tokens.is_empty() || line.stroke_spans.is_empty() {
+        return None;
+    }
+    let min_gap = WORD_GAP_MIN * line.size();
+    let k = tokens.len();
+    // A stripped textual prefix (`-`, `1.`) is still ink on the left: try one
+    // extra leading cluster first, then the plain word count.
+    let with_prefix = (body.len() != line.text.len())
+        .then(|| cluster_spans(line.stroke_spans, k + 1, min_gap))
+        .flatten()
+        .map(|mut b| {
+            b.remove(0);
+            b
+        });
+    let boxes = with_prefix.or_else(|| cluster_spans(line.stroke_spans, k, min_gap))?;
+    Some(
+        boxes
+            .into_iter()
+            .zip(tokens)
+            .map(|((min_x, max_x), (start, end))| WordBox {
+                min_x,
+                max_x,
+                start,
+                end,
+            })
+            .collect(),
+    )
+}
+
+/// Char ranges of the whitespace-separated words of `text`.
+fn word_char_ranges(text: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut start = None;
+    let mut n = 0;
+    for (i, c) in text.chars().enumerate() {
+        match (c.is_whitespace(), start) {
+            (true, Some(s)) => {
+                out.push((s, i));
+                start = None;
+            }
+            (false, None) => start = Some(i),
+            _ => {}
+        }
+        n = i + 1;
+    }
+    if let Some(s) = start {
+        out.push((s, n));
+    }
+    out
+}
+
+/// Split stroke x-spans into `k` clusters at the `k − 1` largest gaps.
+/// Accepted only if every cut gap is `>= min_gap` and `>= WORD_GAP_RATIO` ×
+/// the largest uncut gap; returns the clusters' x-ranges left to right.
+fn cluster_spans(spans: &[(f32, f32)], k: usize, min_gap: f32) -> Option<Vec<(f32, f32)>> {
+    if k == 0 || spans.len() < k {
+        return None;
+    }
+    let mut sorted = spans.to_vec();
+    sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
+    // Gap before stroke i+1: its left edge minus the furthest right edge so
+    // far (overlapping strokes give negative gaps, never cut).
+    let mut reach = sorted[0].1;
+    let mut gaps: Vec<(f32, usize)> = Vec::with_capacity(sorted.len() - 1);
+    for (i, s) in sorted.iter().enumerate().skip(1) {
+        gaps.push((s.0 - reach, i));
+        reach = reach.max(s.1);
+    }
+    gaps.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let (cut, kept) = gaps.split_at(k - 1);
+    if let Some(&(smallest_cut, _)) = cut.last() {
+        let largest_kept = kept.first().map_or(f32::NEG_INFINITY, |g| g.0);
+        if smallest_cut < min_gap || smallest_cut < WORD_GAP_RATIO * largest_kept {
+            return None;
+        }
+    }
+    let mut cuts: Vec<usize> = cut.iter().map(|g| g.1).collect();
+    cuts.sort_unstable();
+    cuts.push(sorted.len());
+    let mut out = Vec::with_capacity(k);
+    let mut from = 0;
+    for to in cuts {
+        let part = &sorted[from..to];
+        let lo = part[0].0;
+        let hi = part.iter().map(|s| s.1).fold(f32::NEG_INFINITY, f32::max);
+        out.push((lo, hi));
+        from = to;
+    }
+    Some(out)
+}
+
+/// Fraction of `lo..hi` covered by the union of `spans`. A degenerate
+/// range (a dot-sized word) counts as covered when a span contains it.
+fn coverage_of(spans: &[(f32, f32)], lo: f32, hi: f32) -> f32 {
+    if spans.is_empty() {
+        return 0.0;
+    }
+    if hi - lo <= f32::EPSILON {
+        return if spans.iter().any(|(a, b)| *a <= lo && hi <= *b) {
+            1.0
+        } else {
+            0.0
+        };
+    }
     let mut clipped: Vec<(f32, f32)> = spans
         .iter()
         .map(|(a, b)| (a.max(lo), b.min(hi)))
@@ -355,7 +575,7 @@ fn coverage(spans: &[(f32, f32)], line: &LayoutLine) -> f32 {
             end = b;
         }
     }
-    covered / line.width
+    covered / (hi - lo)
 }
 
 /// Mark spanning the trimmed text (char offsets), if any.
@@ -494,11 +714,23 @@ mod tests {
     fn detect(strokes: &[Stroke], texts: &[&str]) -> Vec<DetectedLine> {
         let ink = split_page_ink(strokes, None);
         assert_eq!(ink.lines.len(), texts.len(), "line grouping");
+        let spans: Vec<Vec<(f32, f32)>> = ink
+            .lines
+            .iter()
+            .map(|l| {
+                l.strokes
+                    .iter()
+                    .filter_map(stroke_bounds)
+                    .map(|(x0, _, x1, _)| (x0, x1))
+                    .collect()
+            })
+            .collect();
         let lines: Vec<LayoutLine> = ink
             .lines
             .iter()
             .zip(texts)
-            .map(|(l, t)| LayoutLine {
+            .zip(&spans)
+            .map(|((l, t), sp)| LayoutLine {
                 x: l.x,
                 y: l.y,
                 width: l.width,
@@ -506,6 +738,7 @@ mod tests {
                 glyph_height: crate::ink_layout::estimate_text_height(&l.strokes),
                 text: t,
                 strip_prefix: true,
+                stroke_spans: sp,
             })
             .collect();
         detect_line_formats(&lines, &ink.marks, &ink.highlights)
@@ -598,12 +831,141 @@ mod tests {
         assert_eq!(markdown(&d), "==remember  this== \nplain");
     }
 
+    // Word-level marks (ephemeris-fmt.10). `text_line(0, row, 4)` puts word
+    // boxes at x 0..25, 45..70, 90..115, 135..160 (gaps 20, in-word gaps 7).
+
     #[test]
-    fn partial_highlight_is_ignored() {
-        let mut s = text_line(0.0, 0.0, 4); // x 0..~147
-        s.push(highlight(0.0, 60.0, 0.0));
-        let d = detect(&s, &["one two three four"]);
+    fn highlight_over_second_of_four_words() {
+        let mut s = text_line(0.0, 0.0, 4);
+        s.push(highlight(43.0, 72.0, 0.0));
+        let d = detect(&s, &["a b c d"]);
+        assert_eq!(markdown(&d), "a ==b== c d");
+    }
+
+    #[test]
+    fn underline_over_last_two_words_is_inline_not_heading() {
+        let mut s = text_line(0.0, 0.0, 4);
+        s.push(underline(88.0, 162.0, 0.0));
+        s.extend(text_line(0.0, 1.0, 4));
+        let d = detect(&s, &["a b c d", "next"]);
+        assert_eq!(d[0].format.block, BlockKind::Paragraph);
+        assert_eq!(
+            markdown(&d),
+            "a b <u>c d</u>
+next"
+        );
+    }
+
+    #[test]
+    fn near_full_underline_over_a_word_subset_is_not_a_heading() {
+        // Covers 95 of 115 (> 80%) but only 20% of the last word.
+        let mut s = text_line(0.0, 0.0, 3);
+        s.push(underline(0.0, 95.0, 0.0));
+        s.extend(text_line(0.0, 1.0, 4));
+        let d = detect(&s, &["my short topic", "body"]);
+        assert_eq!(d[0].format.block, BlockKind::Paragraph);
+        assert_eq!(
+            markdown(&d),
+            "<u>my short</u> topic
+body"
+        );
+    }
+
+    #[test]
+    fn word_count_mismatch_drops_partial_mark() {
+        // Four ink words, three recognised: gaps don't separate cleanly.
+        let mut s = text_line(0.0, 0.0, 4);
+        s.push(highlight(43.0, 72.0, 0.0));
+        let d = detect(&s, &["one two three"]);
         assert!(d[0].format.marks.is_empty());
+    }
+
+    #[test]
+    fn word_count_mismatch_keeps_near_full_mark_as_whole_line() {
+        let mut s = text_line(0.0, 0.0, 4);
+        s.push(highlight(-2.0, 158.0, 0.0));
+        let d = detect(&s, &["one two three"]);
+        assert_eq!(markdown(&d), "==one two three==");
+    }
+
+    #[test]
+    fn umlaut_words_use_char_offsets() {
+        let mut s = text_line(0.0, 0.0, 4);
+        s.push(highlight(88.0, 117.0, 0.0));
+        let d = detect(&s, &["Bär über Öl Fuß"]);
+        assert_eq!(
+            d[0].format.marks,
+            vec![InlineMark {
+                kind: InlineKind::Highlight,
+                start: 9,
+                end: 11
+            }]
+        );
+        assert_eq!(markdown(&d), "Bär über ==Öl== Fuß");
+    }
+
+    #[test]
+    fn two_separate_highlighted_words_give_two_marks() {
+        let mut s = text_line(0.0, 0.0, 4);
+        s.push(highlight(-2.0, 27.0, 0.0));
+        s.push(highlight(88.0, 117.0, 0.0));
+        let d = detect(&s, &["a b c d"]);
+        assert_eq!(d[0].format.marks.len(), 2);
+        assert_eq!(markdown(&d), "==a== b ==c== d");
+    }
+
+    #[test]
+    fn stripped_prefix_ink_is_skipped_when_mapping_words() {
+        // Ink cluster 1 is the textual "1." prefix.
+        let mut s = text_line(0.0, 0.0, 3);
+        s.push(highlight(88.0, 117.0, 0.0));
+        let d = detect(&s, &["1. alpha beta"]);
+        assert_eq!(d[0].format.block, BlockKind::Numbered(1));
+        assert_eq!(markdown(&d), "1. alpha ==beta==");
+    }
+
+    #[test]
+    fn user_text_word_mismatch_falls_back() {
+        let spans = [(0.0, 25.0), (45.0, 70.0), (90.0, 115.0)];
+        let line = |text| LayoutLine {
+            x: 0.0,
+            y: 0.0,
+            width: 115.0,
+            height: H,
+            glyph_height: H,
+            text,
+            strip_prefix: false,
+            stroke_spans: &spans,
+        };
+        let mark = |x0, x1| {
+            let mut s = poly(&[(x0, 10.0), (x1, 10.0)]);
+            s.tool = Tool::Highlighter;
+            s
+        };
+        let partial = [mark(43.0, 72.0)];
+        let d = detect_line_formats(&[line("x y z")], &[], &partial);
+        assert_eq!(d[0].format.marks.len(), 1);
+        let d = detect_line_formats(&[line("xyz")], &[], &partial);
+        assert!(d[0].format.marks.is_empty());
+        let d = detect_line_formats(&[line("xyz")], &[], &[mark(0.0, 110.0)]);
+        assert_eq!(d[0].format.marks.len(), 1);
+    }
+
+    #[test]
+    fn cluster_spans_rules() {
+        let spans = [(0.0, 5.0), (7.0, 12.0), (30.0, 35.0), (4.0, 6.0)];
+        assert_eq!(
+            cluster_spans(&spans, 2, 5.0),
+            Some(vec![(0.0, 12.0), (30.0, 35.0)])
+        );
+        assert_eq!(cluster_spans(&spans, 1, 5.0), Some(vec![(0.0, 35.0)]));
+        // Cut gap 18 is not >= 1.5× the next gap when that is 15.
+        let close = [(0.0, 5.0), (20.0, 25.0), (43.0, 48.0)];
+        assert_eq!(cluster_spans(&close, 2, 5.0), None);
+        // Too few strokes or below the absolute minimum gap.
+        assert_eq!(cluster_spans(&spans, 5, 5.0), None);
+        assert_eq!(cluster_spans(&spans, 2, 20.0), None);
+        assert_eq!(word_char_ranges(" ab  ü c "), vec![(1, 3), (5, 6), (7, 8)]);
     }
 
     #[test]
@@ -693,6 +1055,7 @@ mod tests {
             glyph_height: H,
             text: "1. kept",
             strip_prefix: false,
+            stroke_spans: &[],
         }];
         let d = detect_line_formats(&lines, &[], &[]);
         assert_eq!(d[0].text, "1. kept");
@@ -750,6 +1113,28 @@ mod tests {
         assert_eq!(stats.invalidated, 0);
         assert_eq!(recognise(&mut cache, &s, &texts), 0);
         assert!(cache.completed_markdown().contains("\n\n==call mum==\n\n"));
+    }
+
+    #[test]
+    fn end_to_end_cache_word_marks() {
+        use crate::recognition_cache::PageRecognitionCache;
+        let mut s = text_line(0.0, 0.0, 4);
+        s.push(highlight(43.0, 72.0, 0.0));
+        s.extend(text_line(0.0, 1.0, 4));
+        s.push(underline(88.0, 162.0, 1.0));
+        s.extend(text_line(0.0, 2.0, 4));
+        let texts = ["one two three four", "a b c d", "zu viele wörter hier drin"];
+        let mut cache = PageRecognitionCache::new("v");
+        cache.sync_strokes(&s, None, "v");
+        assert_eq!(recognise(&mut cache, &s, &texts), 3);
+        assert_eq!(
+            cache.completed_markdown(),
+            "one ==two== three four\na b <u>c d</u>\nzu viele wörter hier drin"
+        );
+        // A partial highlight on the mismatched line is dropped.
+        s.push(highlight(43.0, 72.0, 2.0));
+        cache.sync_strokes(&s, None, "v");
+        assert!(cache.lines[2].format.marks.is_empty());
     }
 
     #[test]
