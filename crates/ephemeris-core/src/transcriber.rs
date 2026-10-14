@@ -761,7 +761,13 @@ impl StrokeHtrTranscriber {
             [1, t_out, c_out] if *c_out == c => *t_out,
             [t_out, c_out] if *c_out == c => *t_out,
             _ if c > 0 && logits.len() % c == 0 => logits.len() / c,
-            _ => return Ok((String::new(), 0.0)),
+            _ => {
+                tracing::warn!(
+                    "stroke HTR output {shape:?} does not match charset ({} chars + blank)",
+                    c - 1
+                );
+                return Ok((String::new(), 0.0));
+            }
         };
         let blank = sess.blank_index.min(c.saturating_sub(1));
         // Prefer live shared lexicon (user vocab refresh) over session snapshot.
@@ -796,22 +802,30 @@ fn default_charset() -> &'static str {
     " !\"#&'()*+,-./0123456789:;?ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 }
 
-/// Load alphabet-only charset (no blank). Prefers line-based `charset.txt`.
+/// Parse a `charset.txt` body: one class per line (first char of each
+/// non-empty line), or a single line holding the whole alphabet.
+///
+/// No comment syntax — `#` is a real class in the OnlineHTR and DE·HTR v2
+/// alphabets, and dropping it shifts every class after it.
 #[cfg(feature = "htr")]
-fn load_charset_file(dir: &std::path::Path) -> Option<String> {
-    let path = StrokeHtrTranscriber::charset_path(dir);
-    let Ok(raw) = std::fs::read_to_string(&path) else {
-        return None;
-    };
-    Some(if raw.contains('\n') {
+fn parse_charset_text(raw: &str) -> String {
+    if raw.contains('\n') {
         raw.lines()
             .map(|l| l.trim_end_matches('\r'))
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .filter(|l| !l.is_empty())
             .map(|l| l.chars().next().unwrap_or(' '))
             .collect()
     } else {
         raw.chars().filter(|c| *c != '\n' && *c != '\r').collect()
-    })
+    }
+}
+
+/// Load alphabet-only charset (no blank). Prefers line-based `charset.txt`.
+#[cfg(feature = "htr")]
+fn load_charset_file(dir: &std::path::Path) -> Option<String> {
+    let path = StrokeHtrTranscriber::charset_path(dir);
+    let raw = std::fs::read_to_string(&path).ok()?;
+    Some(parse_charset_text(&raw))
 }
 
 #[cfg(feature = "htr")]
@@ -830,8 +844,10 @@ struct StrokeHtrMeta {
 fn load_stroke_htr_meta(dir: &std::path::Path) -> StrokeHtrMeta {
     #[derive(serde::Deserialize, Default)]
     struct Meta {
+        /// A feature-set name; other shapes (e.g. the OnlineHTR exporter's
+        /// `["dx","dy","dt","n"]` channel list) mean the Carbune default.
         #[serde(default)]
-        features: Option<String>,
+        features: Option<serde_json::Value>,
         #[serde(default)]
         blank_index: Option<usize>,
         #[serde(default)]
@@ -843,7 +859,8 @@ fn load_stroke_htr_meta(dir: &std::path::Path) -> StrokeHtrMeta {
         .unwrap_or_default();
     let features = meta
         .features
-        .as_deref()
+        .as_ref()
+        .and_then(|v| v.as_str())
         .map(StrokeHtrFeatures::from_meta)
         .unwrap_or_default();
     let charset = meta
@@ -1151,7 +1168,13 @@ impl LineImageHtrTranscriber {
             [t_out, c_out] if *c_out == c => *t_out,
             [1, c_out, t_out] if *c_out == c => *t_out, // NCT
             _ if c > 0 && logits.len() % c == 0 => logits.len() / c,
-            _ => return Ok((String::new(), 0.0)),
+            _ => {
+                tracing::warn!(
+                    "line HTR output {shape:?} does not match alphabet ({} chars + blank)",
+                    c - 1
+                );
+                return Ok((String::new(), 0.0));
+            }
         };
         // If layout was NCT, transpose would be needed — DE·HTR v2 is T×C in
         // docs as logits; RTen typically keeps export order. Prefer T×C.
@@ -1227,17 +1250,9 @@ fn logits_rows_to_log_softmax(logits: &[f32], time_steps: usize, num_classes: us
 fn load_line_htr_meta(dir: &std::path::Path) -> (String, usize, String, String) {
     let meta_path = dir.join("meta.json");
     let charset_path = dir.join("charset.txt");
-    let alphabet_from_file = std::fs::read_to_string(&charset_path).ok().map(|raw| {
-        if raw.contains('\n') {
-            raw.lines()
-                .map(|l| l.trim_end_matches('\r'))
-                .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                .map(|l| l.chars().next().unwrap_or(' '))
-                .collect::<String>()
-        } else {
-            raw.chars().filter(|c| *c != '\n' && *c != '\r').collect()
-        }
-    });
+    let alphabet_from_file = std::fs::read_to_string(&charset_path)
+        .ok()
+        .map(|raw| parse_charset_text(&raw));
 
     #[derive(serde::Deserialize)]
     struct Meta {
@@ -2077,6 +2092,43 @@ fn draw_line_thick(
 mod tests {
     use super::*;
     use crate::model::Color;
+
+    #[cfg(feature = "htr")]
+    #[test]
+    fn charset_keeps_hash_class() {
+        // OnlineHTR charset.txt: one class per line, `#` is a real class.
+        let raw = " \n!\n\"\n#\n&\na\nb\n";
+        assert_eq!(parse_charset_text(raw), " !\"#&ab");
+        assert_eq!(parse_charset_text("ab#c"), "ab#c");
+        assert_eq!(parse_charset_text("a\r\n#\r\nb\r\n"), "a#b");
+    }
+
+    #[cfg(feature = "htr")]
+    #[test]
+    fn stroke_meta_tolerates_feature_channel_list() {
+        // The OnlineHTR exporter writes `features` as a channel list; that must
+        // not discard blank_index / charset from the same file.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("meta.json"),
+            r#"{"blank_index": 3, "features": ["dx","dy","dt","n"]}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("charset.txt"), "a\n#\nb\n").unwrap();
+        let meta = load_stroke_htr_meta(dir.path());
+        assert_eq!(meta.blank_index, 3);
+        assert_eq!(meta.features, StrokeHtrFeatures::Carbune2020);
+        assert_eq!(meta.charset, "a#b");
+    }
+
+    #[cfg(feature = "htr")]
+    #[test]
+    fn line_meta_charset_keeps_hash_class() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("charset.txt"), "a\n#\nb\n").unwrap();
+        let (alphabet, ..) = load_line_htr_meta(dir.path());
+        assert_eq!(alphabet, "a#b");
+    }
 
     #[test]
     fn noop_returns_empty() {

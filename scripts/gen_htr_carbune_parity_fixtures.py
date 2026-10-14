@@ -32,7 +32,7 @@ SAMPLES = [
                 "t0_ms": 1000,
                 "points": [
                     {"x": 0, "y": 0, "t_ms": 0},
-                    {"x": 8, "y": 6, "t_ms": 100},
+                    {"x": 9, "y": 6, "t_ms": 100},
                 ],
             },
             {
@@ -51,7 +51,7 @@ SAMPLES = [
                 "t0_ms": 0,
                 "points": [
                     {"x": 0, "y": 0, "t_ms": 0},
-                    {"x": 8, "y": 6, "t_ms": 100},
+                    {"x": 9, "y": 6, "t_ms": 100},
                 ],
             },
             {
@@ -67,8 +67,12 @@ SAMPLES = [
 
 
 def strokes_to_points(strokes):
+    """Flat (x, y, t_s, stroke_nr) table in pen order when every stroke has a
+    real t0 (screen y-down; the featurisers flip to y-up)."""
     pts = []
     next_synth = 0.0
+    if strokes and all(st.get("t0_ms", 0) for st in strokes):
+        strokes = sorted(strokes, key=lambda st: st["t0_ms"])
     for si, st in enumerate(strokes):
         t0 = float(st.get("t0_ms", 0))
         t0_use = next_synth if t0 == 0 else t0
@@ -113,7 +117,7 @@ def _interp1d(xs, ys, xq):
 
 def featurize_pure(points):
     xs = [p["x"] for p in points]
-    ys = [p["y"] for p in points]
+    ys = [-p["y"] for p in points]  # OnlineHTR is y-up
     ts = [p["t"] for p in points]
     sn = [p["stroke_nr"] for p in points]
     x0, ymin = xs[0], min(ys)
@@ -184,6 +188,7 @@ def featurize_scipy(points):
     from scipy.interpolate import interp1d
 
     df = pd.DataFrame(points)
+    df["y"] = -df["y"]  # OnlineHTR is y-up
     df["x"] = df["x"] - df["x"].iloc[0]
     df["y"] = df["y"] - df["y"].min()
     scale = float(df["y"].max()) or 1.0
