@@ -15,6 +15,14 @@ use crate::model::{Stroke, Tool};
 /// OnlineHTR / Carbune2020 default points per unit length after normalisation.
 pub const CARBUNE_POINTS_PER_UNIT: f32 = 20.0;
 
+/// Helper: true only for pen strokes with at least one point (suitable for HTR input).
+///
+/// Highlighter strokes are kept on the page for format detection but excluded
+/// from handwriting recognition.
+fn is_text_ink(s: &Stroke) -> bool {
+    s.tool == Tool::Pen && !s.points.is_empty()
+}
+
 /// Safety cap: split a line when featurized length exceeds this (BiLSTM cost).
 pub const MAX_STROKE_HTR_TIMESTEPS: usize = 4000;
 
@@ -85,7 +93,7 @@ pub fn group_strokes_into_lines_with_ruling(
 ) -> Vec<StrokeLine> {
     let mut raw: Vec<StrokeItem> = Vec::new();
     for s in strokes {
-        if s.tool == Tool::Eraser || s.points.is_empty() {
+        if !is_text_ink(s) {
             continue;
         }
         let Some((min_x, min_y, max_x, max_y)) = stroke_bounds(s) else {
@@ -1952,5 +1960,95 @@ mod tests {
         assert!((lex.weight_of("beta") - USER_LEXICON_WEIGHT).abs() < f32::EPSILON);
         let merged = merged_htr_lexicon(Some("customname\n"));
         assert!(merged.weight_of("customname") > merged.weight_of("the"));
+    }
+
+    /// Pen strokes forming "Hallo" with a wide highlighter stroke over them
+    /// groups into exactly 1 line containing no Highlighter strokes.
+    #[test]
+    fn highlighter_excluded_from_grouped_lines() {
+        let mut strokes = vec![
+            // Five pen strokes roughly forming "Hallo"
+            body_stroke(10.0, 100.0, 15.0, 118.0), // H
+            body_stroke(30.0, 102.0, 35.0, 118.0), // a
+            body_stroke(50.0, 100.0, 55.0, 118.0), // l
+            body_stroke(70.0, 100.0, 75.0, 118.0), // l
+            body_stroke(90.0, 102.0, 95.0, 118.0), // o
+        ];
+        // Add a wide highlighter stroke spanning the entire line
+        let highlighter = Stroke {
+            id: StrokeId::new(),
+            tool: Tool::Highlighter,
+            color: Color::BLACK,
+            base_width: 15.0, // much wider than pen strokes
+            points: vec![
+                Point::new(5.0, 110.0, 0.5, 0.0, 0),
+                Point::new(100.0, 110.0, 0.5, 0.0, 100),
+            ],
+            t0_ms: 0,
+        };
+        strokes.push(highlighter);
+
+        let gap = default_line_gap(&strokes);
+        let lines = group_strokes_into_lines(&strokes, gap);
+
+        // Should group into exactly 1 line
+        assert_eq!(lines.len(), 1, "pen + highlighter should group as 1 line");
+
+        // The line must contain no Highlighter strokes (only pen strokes)
+        let line = &lines[0];
+        assert!(
+            line.strokes.iter().all(|s| s.tool == Tool::Pen),
+            "line should contain only Pen strokes, no Highlighter"
+        );
+        assert_eq!(
+            line.strokes.len(),
+            5,
+            "line should contain the 5 pen strokes only"
+        );
+    }
+
+    /// rasterize_strokes output is identical with and without a highlighter stroke.
+    #[test]
+    fn rasterize_ignores_highlighter_strokes() {
+        let pen_strokes = vec![
+            body_stroke(10.0, 10.0, 50.0, 30.0),
+            body_stroke(60.0, 10.0, 100.0, 30.0),
+        ];
+
+        // Rasterize without highlighter
+        let (w1, h1, gray1) = crate::transcriber::rasterize_strokes(&pen_strokes);
+
+        // Add a wide highlighter stroke that would affect the bounds if included
+        let mut strokes_with_hl = pen_strokes.clone();
+        strokes_with_hl.push(Stroke {
+            id: StrokeId::new(),
+            tool: Tool::Highlighter,
+            color: Color::BLACK,
+            base_width: 20.0,
+            points: vec![
+                Point::new(5.0, 15.0, 0.5, 0.0, 0),
+                Point::new(110.0, 25.0, 0.5, 0.0, 100),
+            ],
+            t0_ms: 0,
+        });
+
+        // Rasterize with highlighter
+        let (w2, h2, gray2) = crate::transcriber::rasterize_strokes(&strokes_with_hl);
+
+        // Dimensions must be identical (highlighter doesn't expand bounds)
+        assert_eq!(
+            w1, w2,
+            "rasterize width should be identical with/without highlighter"
+        );
+        assert_eq!(
+            h1, h2,
+            "rasterize height should be identical with/without highlighter"
+        );
+
+        // Pixel data must be identical
+        assert_eq!(
+            gray1, gray2,
+            "rasterized pixels should be identical with/without highlighter"
+        );
     }
 }

@@ -2000,6 +2000,14 @@ fn write_pgm(path: &Path, width: u32, height: u32, gray8: &[u8]) -> crate::Resul
     Ok(())
 }
 
+/// Helper: true only for pen strokes with at least one point (suitable for HTR input).
+///
+/// Highlighter strokes are kept on the page for format detection but excluded
+/// from handwriting recognition.
+fn is_text_ink(s: &Stroke) -> bool {
+    s.tool == Tool::Pen && !s.points.is_empty()
+}
+
 /// Simple stroke → gray8 raster for the stroke-based [`Transcriber`] path
 /// (also used by `htr-eval`, which has no screen raster).
 pub fn rasterize_strokes(strokes: &[Stroke]) -> (u32, u32, Vec<u8>) {
@@ -2009,7 +2017,7 @@ pub fn rasterize_strokes(strokes: &[Stroke]) -> (u32, u32, Vec<u8>) {
     let mut max_y = f32::MIN;
     let mut any = false;
     for s in strokes {
-        if s.tool == Tool::Eraser {
+        if !is_text_ink(s) {
             continue;
         }
         for p in &s.points {
@@ -2033,7 +2041,7 @@ pub fn rasterize_strokes(strokes: &[Stroke]) -> (u32, u32, Vec<u8>) {
     let oy = if any { min_y - 24.0 } else { 0.0 };
 
     for s in strokes {
-        if s.tool == Tool::Eraser || s.points.len() < 2 {
+        if !is_text_ink(s) || s.points.len() < 2 {
             continue;
         }
         let thickness = s.base_width.max(1.5).ceil() as i32;
