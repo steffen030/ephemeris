@@ -54,10 +54,14 @@ pub struct OneEuroConfig {
 
 impl Default for OneEuroConfig {
     fn default() -> Self {
-        // Tuned for pen input sampled at ~100–200 Hz in logical pixels.
+        // Tuned on `tests/fixtures/ink/synthetic_scribble.jsonl` plus synthetic
+        // slow-jitter / constant-velocity ramps (ephemeris-ktg.6).  Sweep of
+        // min_cutoff ∈ {0.5,1,2,4} × beta ∈ {0.001..0.05}: (2.0, 0.02) cuts
+        // steady-state ramp lag ~2.7× vs the prior (1.0, 0.007) while still
+        // removing ~99% of digitizer jitter energy at near-stationary speed.
         Self {
-            min_cutoff: 1.0,
-            beta: 0.007,
+            min_cutoff: 2.0,
+            beta: 0.02,
             d_cutoff: 1.0,
         }
     }
@@ -151,6 +155,14 @@ impl OneEuroFilter2D {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn defaults_match_ktg6_sweep() {
+        let c = OneEuroConfig::default();
+        assert!((c.min_cutoff - 2.0).abs() < 1e-6);
+        assert!((c.beta - 0.02).abs() < 1e-6);
+        assert!((c.d_cutoff - 1.0).abs() < 1e-6);
+    }
 
     #[test]
     fn first_sample_is_passthrough() {

@@ -96,14 +96,21 @@ pub struct Config {
     #[serde(default)]
     pub ics_urls: Vec<String>,
 
-    /// When true, PDF export runs [`crate::RasterOcrTranscriber`] on note
-    /// rasters (requires the `ocr` Cargo feature + system Tesseract).
+    /// When true, Tesseract may run as a last-resort recogniser (printed text /
+    /// weak handwriting lines). Off by default for handwriting (ephemeris-ktg.11);
+    /// enable in Settings › Handwriting for printed pages.
     #[serde(default = "default_ocr_enabled")]
     pub ocr_enabled: bool,
 
     /// Tesseract language packs, e.g. `"eng"` or `"eng+deu"`.
+    /// Also used when [`Self::handwriting_language`] is `auto`.
     #[serde(default = "default_ocr_languages")]
     pub ocr_languages: String,
+
+    /// Preferred handwriting language for cascade primary selection
+    /// (`auto` / `en` / `de`). See [`HandwritingLanguage`].
+    #[serde(default)]
+    pub handwriting_language: HandwritingLanguage,
 
     /// Optional tessdata directory (`TESSDATA_PREFIX`). When unset, Tesseract's
     /// default search path is used.
@@ -293,11 +300,84 @@ fn default_vault_export_subdir() -> PathBuf {
 }
 
 fn default_ocr_enabled() -> bool {
-    true
+    // Tesseract last-resort for handwriting is opt-in (printed-text toggle).
+    false
 }
 
 fn default_ocr_languages() -> String {
     "eng".to_string()
+}
+
+/// Preferred language for handwriting cascade primary (ephemeris-ktg.11).
+///
+/// * `de` → line-image HTR primary (DE·HTR)
+/// * `en` → stroke HTR primary (Carbune / OnlineHTR; armrest when model exists)
+/// * `auto` → infer from [`Config::ocr_languages`] (`deu` → de, else en)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum HandwritingLanguage {
+    #[default]
+    Auto,
+    En,
+    De,
+}
+
+impl HandwritingLanguage {
+    /// Parse UI / TOML / env tokens (`auto`, `en`, `de`, `eng`, `deu`, …).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "en" | "eng" | "english" => Some(Self::En),
+            "de" | "deu" | "ger" | "german" => Some(Self::De),
+            _ => None,
+        }
+    }
+
+    /// Stable config / UI token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::En => "en",
+            Self::De => "de",
+        }
+    }
+
+    /// Resolve `auto` against a Tesseract `-l` string (`eng`, `deu`, `eng+deu`).
+    pub fn resolve(self, ocr_languages: &str) -> ResolvedHandwritingLanguage {
+        match self {
+            Self::En => ResolvedHandwritingLanguage::En,
+            Self::De => ResolvedHandwritingLanguage::De,
+            Self::Auto => ResolvedHandwritingLanguage::from_ocr_languages(ocr_languages),
+        }
+    }
+}
+
+/// Concrete language after resolving [`HandwritingLanguage::Auto`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedHandwritingLanguage {
+    En,
+    De,
+}
+
+impl ResolvedHandwritingLanguage {
+    /// Prefer the first of `deu` / `eng` in a `+`-separated Tess lang list.
+    pub fn from_ocr_languages(ocr_languages: &str) -> Self {
+        let parts: Vec<&str> = ocr_languages
+            .split(|c: char| c == '+' || c == ',' || c.is_whitespace())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        for p in &parts {
+            let l = p.to_ascii_lowercase();
+            if matches!(l.as_str(), "deu" | "de" | "ger" | "german") {
+                return Self::De;
+            }
+            if matches!(l.as_str(), "eng" | "en" | "english") {
+                return Self::En;
+            }
+        }
+        Self::En
+    }
 }
 
 fn default_pen_only_drawing() -> bool {
@@ -330,6 +410,7 @@ impl Default for Config {
             ics_urls: Vec::new(),
             ocr_enabled: default_ocr_enabled(),
             ocr_languages: default_ocr_languages(),
+            handwriting_language: HandwritingLanguage::default(),
             ocr_tessdata: None,
             htr_enabled: default_htr_enabled(),
             htr_model_dir: None,
@@ -504,6 +585,14 @@ fn apply_env_overrides(config: &mut Config) {
             config.ocr_languages = v;
         }
     }
+    if let Ok(v) = std::env::var("EPHEMERIS_HANDWRITING_LANG") {
+        match HandwritingLanguage::parse(&v) {
+            Some(lang) => config.handwriting_language = lang,
+            None => tracing::warn!(
+                "EPHEMERIS_HANDWRITING_LANG={v:?} not recognised (auto|en|de); ignoring"
+            ),
+        }
+    }
     if let Ok(v) = std::env::var("EPHEMERIS_PEN_ONLY") {
         match v.to_lowercase().as_str() {
             "0" | "false" | "off" | "no" => config.pen_only_drawing = false,
@@ -575,11 +664,36 @@ mod tests {
         assert_eq!(cfg.theme, "light");
         assert_eq!(cfg.sync_interval_secs, 60);
         assert_eq!(cfg.logging_level, "info");
-        assert!(cfg.ocr_enabled);
+        assert!(!cfg.ocr_enabled);
         assert_eq!(cfg.ocr_languages, "eng");
+        assert_eq!(cfg.handwriting_language, HandwritingLanguage::Auto);
         assert!(cfg.ocr_tessdata.is_none());
         assert!(cfg.pen_only_drawing);
         assert!(cfg.custom.is_empty());
+    }
+
+    #[test]
+    fn handwriting_language_auto_from_ocr_langs() {
+        assert_eq!(
+            HandwritingLanguage::Auto.resolve("deu"),
+            ResolvedHandwritingLanguage::De
+        );
+        assert_eq!(
+            HandwritingLanguage::Auto.resolve("eng"),
+            ResolvedHandwritingLanguage::En
+        );
+        assert_eq!(
+            HandwritingLanguage::Auto.resolve("eng+deu"),
+            ResolvedHandwritingLanguage::En
+        );
+        assert_eq!(
+            HandwritingLanguage::Auto.resolve("deu+eng"),
+            ResolvedHandwritingLanguage::De
+        );
+        assert_eq!(
+            HandwritingLanguage::De.resolve("eng"),
+            ResolvedHandwritingLanguage::De
+        );
     }
 
     // ── TOML file overrides defaults ──────────────────────────────────────────

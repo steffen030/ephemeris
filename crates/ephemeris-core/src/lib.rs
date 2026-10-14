@@ -21,7 +21,10 @@ pub mod sqlite;
 pub mod store;
 
 pub use action::{Action, ActionMap, ActionRouter, CanvasPoint, DefaultActionMap, RouterOutput};
-pub use config::{format_note_title, Config, TaskEngageConfig, TaskLaneConfig};
+pub use config::{
+    format_note_title, Config, HandwritingLanguage, ResolvedHandwritingLanguage, TaskEngageConfig,
+    TaskLaneConfig,
+};
 pub use error::{AppError, Result};
 pub use ink::{EraserConfig, EraserEngine, EraserUpdate, InkConfig, InkEngine, InkUpdate};
 pub use model::{
@@ -60,12 +63,15 @@ pub mod obsidian;
 pub mod pdf_export;
 pub mod prioritizer;
 pub mod profile_manager;
+pub mod recognition_cache;
 pub mod stroke_htr;
 pub mod stroke_persistence;
+pub mod stroke_render;
 pub mod task_cache;
 pub mod task_context;
 pub mod task_provider;
 pub mod transcriber;
+pub mod user_lexicon;
 pub mod vault_export;
 pub mod vault_git;
 pub use agenda::{filter_agenda, to_agenda_entries, AgendaEntry, AgendaRange};
@@ -80,27 +86,50 @@ pub use line_htr::{
 };
 pub use markdown_tasks::{MarkdownTaskExtractor, DEFAULT_TASKS_INBOX};
 pub use note_search::{
-    markdown_to_blocks, markdown_to_plain, search_events, search_local_notes, search_tasks,
-    strip_inline_markdown, MdBlock, MdBlockKind, SearchHit, VaultFtsIndex,
+    list_markdown_files, markdown_to_blocks, markdown_to_plain, search_events, search_local_notes,
+    search_tasks, strip_inline_markdown, MdBlock, MdBlockKind, SearchHit, VaultFtsIndex,
 };
 pub use pdf_export::{
     export_raster_pages_to_pdf, export_stroke_pages_to_pdf, pdf_export_is_current,
     raster_export_hash, PdfExportOptions, RasterPage,
 };
 pub use prioritizer::{rank_tasks, task_score};
+pub use recognition_cache::{
+    line_stroke_ids_hash, lower_thread_nice_priority, recognition_model_version,
+    stroke_line_ids_hash, BgRecogIdle, CachedLine, PageRecognitionCache, RecogCacheStats,
+    BG_RECOG_IDLE_DELAY, PENDING_LINE_MARKER, RECOGNITION_CACHE_FORMAT,
+};
+pub use stroke_htr::armrest;
 pub use stroke_htr::{
-    ctc_decode_with_lm, ctc_greedy_decode, ctc_prefix_beam_decode, decode_charset,
-    default_htr_language_context, default_line_gap, featurize_line, group_strokes_into_lines,
-    CharBigramLm, CtcBeamConfig, CtcFrame, HtrLexicon, StrokeLine,
+    bundled_htr_lexicon_text, ctc_decode_with_lm, ctc_greedy_decode, ctc_prefix_beam_decode,
+    decode_charset, default_htr_language_context, default_line_gap, featurize_line,
+    featurize_line_pieces, group_strokes_into_lines, group_strokes_into_lines_with_ruling,
+    is_structured_htr_token, merged_htr_lexicon, split_stroke_line_at_largest_x_gap,
+    tokenize_htr_text, CharBigramLm, CtcBeamConfig, CtcFrame, HtrLexicon, StrokeLine,
+    CARBUNE_POINTS_PER_UNIT, GENERIC_LEXICON_WEIGHT, LINED_TEMPLATE_PITCH,
+    MAX_STROKE_HTR_TIMESTEPS, STRUCTURED_TOKEN_WEIGHT, USER_LEXICON_WEIGHT,
+};
+pub use stroke_render::{
+    prepare_line_htr_from_strokes, render_stroke_line, render_strokes_page, StrokeRenderParams,
+    HTR_LINE_STROKE_WIDTH_PX, OCR_STROKE_WIDTH_PX, OCR_TARGET_LINE_HEIGHT_PX,
 };
 pub use task_cache::TaskCache;
 #[cfg(feature = "sqlite")]
 pub use task_provider::LocalTaskProvider;
 pub use task_provider::{ProviderCapabilities, TaskProvider};
 pub use transcriber::{
-    mean_confidence, parse_tesseract_tsv, CascadingTranscriber, FakeTranscriber,
-    LineImageHtrTranscriber, NoOpTranscriber, RasterOcrTranscriber, StrokeHtrTranscriber, TextSpan,
-    Transcriber,
+    calibrated_cascade_score, mean_confidence, parse_tesseract_tsv, pick_best_line_candidate,
+    select_line_cascade, CascadeBackend, CascadingTranscriber, FakeTranscriber,
+    LineImageHtrTranscriber, NoOpTranscriber, RasterOcrTranscriber, SharedHtrLexicon,
+    StrokeHtrFeatures, StrokeHtrTranscriber, TextSpan, Transcriber, CASCADE_ACCEPT_THRESHOLD,
+    CASCADE_LEXICON_WEIGHT,
+};
+pub use user_lexicon::{
+    accumulate_token_frequencies, build_and_save_user_lexicon, build_user_lexicon_tokens,
+    load_merged_htr_lexicon, load_user_lexicon_text, refresh_user_lexicon_if_stale,
+    save_user_lexicon, spawn_user_lexicon_refresh, user_lexicon_needs_refresh, user_lexicon_path,
+    UserLexiconSources, USER_LEXICON_FILENAME, USER_LEXICON_MAX_TOKENS,
+    USER_LEXICON_REFRESH_INTERVAL,
 };
 pub use vault_export::{
     export_note_markdown, notebook_export_dir, notebook_export_rel, path_under_export_subdir,

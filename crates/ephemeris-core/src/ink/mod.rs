@@ -22,4 +22,6 @@ pub mod width;
 pub use engine::{InkConfig, InkEngine, InkUpdate};
 pub use eraser::{EraserConfig, EraserEngine, EraserUpdate};
 pub use one_euro::{OneEuroConfig, OneEuroFilter, OneEuroFilter2D};
-pub use width::{width_for, WidthConfig};
+pub use width::{
+    pen_width_for_label, width_for, WidthConfig, PEN_WIDTH_MEDIUM, PEN_WIDTH_THICK, PEN_WIDTH_THIN,
+};

@@ -594,8 +594,8 @@ impl Stroke {
         for p in &self.points {
             r.union_point(p.x, p.y);
         }
-        // WidthConfig max_ratio is 1.6 — keep in sync with ink::width defaults.
-        r.inflate(self.base_width * 1.6 * 0.5 + 1.0)
+        // WidthConfig::default().max_ratio — keep in sync with ink::width.
+        r.inflate(self.base_width * crate::ink::WidthConfig::default().max_ratio * 0.5 + 1.0)
     }
 }
 

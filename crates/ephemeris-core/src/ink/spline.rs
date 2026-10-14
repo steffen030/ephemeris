@@ -77,6 +77,74 @@ fn catmull_rom_scalar(
     (t2 - t) / (t2 - t1) * b1 + (t - t1) / (t2 - t1) * b2
 }
 
+/// Sample one Catmull-Rom span from `p1` → `p2` using the four-point window
+/// `(p0, p1, p2, p3)`.
+///
+/// Returns `segments` points on the open-closed interval `(p1, p2]` — the start
+/// `p1` is excluded (already emitted by the previous span) and the end `p2` is
+/// included so the curve passes through every control point.
+pub fn catmull_rom_span(
+    p0: &Point,
+    p1: &Point,
+    p2: &Point,
+    p3: &Point,
+    segments: usize,
+) -> Vec<Point> {
+    let seg = segments.max(1);
+    let (c0, c1, c2, c3) = (
+        Ctrl::from(p0),
+        Ctrl::from(p1),
+        Ctrl::from(p2),
+        Ctrl::from(p3),
+    );
+
+    let t0 = 0.0;
+    let t1 = t0 + knot_delta(&c0, &c1);
+    let t2 = t1 + knot_delta(&c1, &c2);
+    let t3 = t2 + knot_delta(&c2, &c3);
+
+    let mut out = Vec::with_capacity(seg);
+    for s in 1..=seg {
+        let u = s as f32 / seg as f32;
+        let t = t1 + u * (t2 - t1);
+
+        let x = catmull_rom_scalar(c0.x, c1.x, c2.x, c3.x, t0, t1, t2, t3, t);
+        let y = catmull_rom_scalar(c0.y, c1.y, c2.y, c3.y, t0, t1, t2, t3, t);
+        let pr = catmull_rom_scalar(
+            c0.pressure,
+            c1.pressure,
+            c2.pressure,
+            c3.pressure,
+            t0,
+            t1,
+            t2,
+            t3,
+            t,
+        )
+        .clamp(0.0, 1.0);
+        let tilt = catmull_rom_scalar(c0.tilt, c1.tilt, c2.tilt, c3.tilt, t0, t1, t2, t3, t);
+        let tm = catmull_rom_scalar(c0.t_ms, c1.t_ms, c2.t_ms, c3.t_ms, t0, t1, t2, t3, t);
+
+        out.push(Point {
+            x,
+            y,
+            pressure: pr,
+            tilt,
+            t_ms: tm.max(0.0).round() as u32,
+        });
+    }
+    out
+}
+
+/// Adaptive Catmull-Rom segment count for a span of length `hypot(p2−p1)`.
+///
+/// `clamp(ceil(len / 2), 1, 8)` — long/fast spans stay smooth; short/slow ones
+/// stay cheap.
+pub fn adaptive_span_segments(p1: &Point, p2: &Point) -> usize {
+    let hypot = (p2.x - p1.x).hypot(p2.y - p1.y);
+    ((hypot / 2.0).ceil() as usize).clamp(1, 8)
+}
+
 /// Resample a polyline of [`Point`]s into a smooth curve using a centripetal
 /// Catmull-Rom spline.
 ///
@@ -93,59 +161,21 @@ pub fn catmull_rom(points: &[Point], segments_per_span: usize) -> Vec<Point> {
         return points.to_vec();
     }
 
-    // Build control array with duplicated endpoints so every real span has the
-    // two neighbours the basis needs.
-    let ctrls: Vec<Ctrl> = points.iter().map(Ctrl::from).collect();
-    let first = *ctrls.first().unwrap();
-    let last = *ctrls.last().unwrap();
-
-    let mut ext = Vec::with_capacity(ctrls.len() + 2);
-    ext.push(first);
-    ext.extend_from_slice(&ctrls);
-    ext.push(last);
-
     let mut out: Vec<Point> = Vec::with_capacity((points.len() - 1) * seg + 1);
     out.push(points[0]);
 
-    // Iterate over interior spans p1->p2 (indices 1..len-2 of `ext`).
-    for i in 1..ext.len() - 2 {
-        let (p0, p1, p2, p3) = (ext[i - 1], ext[i], ext[i + 1], ext[i + 2]);
-
-        let t0 = 0.0;
-        let t1 = t0 + knot_delta(&p0, &p1);
-        let t2 = t1 + knot_delta(&p1, &p2);
-        let t3 = t2 + knot_delta(&p2, &p3);
-
-        // Sample the span (t1..t2], skipping the start (already emitted).
-        for s in 1..=seg {
-            let u = s as f32 / seg as f32;
-            let t = t1 + u * (t2 - t1);
-
-            let x = catmull_rom_scalar(p0.x, p1.x, p2.x, p3.x, t0, t1, t2, t3, t);
-            let y = catmull_rom_scalar(p0.y, p1.y, p2.y, p3.y, t0, t1, t2, t3, t);
-            let pr = catmull_rom_scalar(
-                p0.pressure,
-                p1.pressure,
-                p2.pressure,
-                p3.pressure,
-                t0,
-                t1,
-                t2,
-                t3,
-                t,
-            )
-            .clamp(0.0, 1.0);
-            let tilt = catmull_rom_scalar(p0.tilt, p1.tilt, p2.tilt, p3.tilt, t0, t1, t2, t3, t);
-            let tm = catmull_rom_scalar(p0.t_ms, p1.t_ms, p2.t_ms, p3.t_ms, t0, t1, t2, t3, t);
-
-            out.push(Point {
-                x,
-                y,
-                pressure: pr,
-                tilt,
-                t_ms: tm.max(0.0).round() as u32,
-            });
-        }
+    // Iterate over spans points[i] → points[i+1] with endpoint duplication for
+    // the missing neighbours at the ends.
+    for i in 0..points.len() - 1 {
+        let p1 = &points[i];
+        let p2 = &points[i + 1];
+        let p0 = if i == 0 { p1 } else { &points[i - 1] };
+        let p3 = if i + 2 < points.len() {
+            &points[i + 2]
+        } else {
+            p2
+        };
+        out.extend(catmull_rom_span(p0, p1, p2, p3, seg));
     }
 
     out
@@ -235,5 +265,27 @@ mod tests {
         // Some interior point should have higher pressure than the endpoints.
         let max_p = out.iter().map(|p| p.pressure).fold(0.0_f32, f32::max);
         assert!(max_p > 0.5);
+    }
+
+    #[test]
+    fn adaptive_span_segments_clamps() {
+        assert_eq!(adaptive_span_segments(&pt(0.0, 0.0), &pt(1.0, 0.0)), 1);
+        assert_eq!(adaptive_span_segments(&pt(0.0, 0.0), &pt(10.0, 0.0)), 5);
+        assert_eq!(adaptive_span_segments(&pt(0.0, 0.0), &pt(100.0, 0.0)), 8);
+    }
+
+    #[test]
+    fn span_excludes_start_includes_end() {
+        let p0 = pt(0.0, 0.0);
+        let p1 = pt(10.0, 0.0);
+        let p2 = pt(20.0, 0.0);
+        let p3 = pt(30.0, 0.0);
+        let span = catmull_rom_span(&p0, &p1, &p2, &p3, 4);
+        assert_eq!(span.len(), 4);
+        let last = span.last().unwrap();
+        assert!((last.x - 20.0).abs() < 1e-3 && (last.y - 0.0).abs() < 1e-3);
+        // Start of span (p1) must not be the first emitted sample.
+        let first = span.first().unwrap();
+        assert!((first.x - 10.0).abs() > 1e-3 || (first.y - 0.0).abs() > 1e-3);
     }
 }

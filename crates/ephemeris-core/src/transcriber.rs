@@ -1,21 +1,25 @@
 //! Handwriting transcription trait (ADR ephemeris-2ri, ephemeris-97x.3 / 97x.6).
 //!
-//! Preferred path (ephemeris-5g2): [`CascadingTranscriber`] — online stroke HTR
-//! when strokes + model are available, else [`RasterOcrTranscriber`] (Tesseract).
+//! Preferred path (ephemeris-ktg.11): [`CascadingTranscriber`] — per-line calibrated
+//! selection with a language-aware primary (stroke HTR or line HTR), other neural
+//! models only when the primary score is weak, and Tesseract as an opt-in last resort.
 
+use crate::config::{HandwritingLanguage, ResolvedHandwritingLanguage};
 #[cfg(feature = "htr")]
-use crate::line_htr::{
-    ctc_greedy_decode_logits, decode_line_alphabet, line_logits_confidence, DE_HTR_V2_ALPHABET,
-};
+use crate::line_htr::{decode_line_alphabet, line_logits_confidence, DE_HTR_V2_ALPHABET};
 use crate::line_htr::{prepare_line_htr_input, split_ink_line_bands};
 use crate::model::{Point, Stroke, Tool};
 #[cfg(feature = "htr")]
 use crate::stroke_htr::{
+    armrest::{self, featurize_line_armrest_pieces},
     ctc_decode_with_lm, ctc_softmax_confidence, decode_charset_with_blank,
     default_htr_language_context, features_to_tensor, CharBigramLm, CtcBeamConfig, CtcFrame,
-    HtrLexicon,
 };
-use crate::stroke_htr::{default_line_gap, featurize_line, group_strokes_into_lines};
+use crate::stroke_htr::{
+    bundled_htr_lexicon_text, default_line_gap, featurize_line_pieces,
+    group_strokes_into_lines_with_ruling, HtrLexicon, StrokeLine, MAX_STROKE_HTR_TIMESTEPS,
+};
+use crate::stroke_render::{prepare_line_htr_from_strokes, render_stroke_line, StrokeRenderParams};
 #[cfg(feature = "ocr")]
 use std::path::Path;
 use std::path::PathBuf;
@@ -23,6 +27,10 @@ use std::path::PathBuf;
 use std::process::Command;
 #[cfg(feature = "htr")]
 use std::sync::Mutex;
+use std::sync::{Arc, RwLock};
+
+/// Shared lexicon updated by background user-vocabulary refresh (ktg.13).
+pub type SharedHtrLexicon = Arc<RwLock<HtrLexicon>>;
 
 /// A recognised text span anchored to a page-local bounding box (logical px).
 #[derive(Debug, Clone, PartialEq)]
@@ -120,13 +128,159 @@ pub fn mean_confidence(spans: &[TextSpan]) -> f32 {
     }
 }
 
-/// Cascade: stroke HTR + line-image HTR + Tesseract (ephemeris-5g2 / 9hh.1).
+/// Recogniser identity for calibrated cascade scoring (ephemeris-ktg.11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CascadeBackend {
+    StrokeHtr,
+    LineHtr,
+    Ocr,
+}
+
+/// Shared lexicon weight `b` in `score = a_r·conf + b·lexicon_hit_ratio + c_r`.
+///
+/// Reasoned (no personal corpus Platt fit). Lexicon hits are comparable across
+/// backends and help demote gibberish that still reports high softmax / Tess conf.
+pub const CASCADE_LEXICON_WEIGHT: f32 = 0.30;
+
+/// Primary calibrated score at/above which secondary recognisers are skipped.
+pub const CASCADE_ACCEPT_THRESHOLD: f32 = 0.55;
+
+/// Per-backend linear calibration coefficients `(a_r, c_r)`.
+///
+/// Fitted/reasoned without a personal corpus (Platt fit deferred to device CER
+/// work in ephemeris-ktg.14 / htr-eval cascade measurement):
+/// * Stroke HTR — CTC softmax peaks track quality reasonably → `a=0.70`, `c=+0.05`
+/// * Line HTR — similar CTC; slight positive bias as DE primary → `a=0.75`, `c=+0.10`
+/// * OCR — Tesseract word conf overstates handwriting → `a=0.40`, `c=-0.20`
+fn cascade_calib(backend: CascadeBackend) -> (f32, f32) {
+    match backend {
+        CascadeBackend::StrokeHtr => (0.70, 0.05),
+        CascadeBackend::LineHtr => (0.75, 0.10),
+        CascadeBackend::Ocr => (0.40, -0.20),
+    }
+}
+
+/// Calibrated score for one (recogniser, line) candidate.
+///
+/// `score = a_r · conf + b · lexicon_hit_ratio + c_r` with unknown conf (`< 0`)
+/// treated as `0.5`.
+pub fn calibrated_cascade_score(
+    backend: CascadeBackend,
+    confidence: f32,
+    lexicon_hit_ratio: f32,
+) -> f32 {
+    let (a, c) = cascade_calib(backend);
+    let conf = if confidence < 0.0 {
+        0.5
+    } else {
+        confidence.clamp(0.0, 1.0)
+    };
+    let hit = lexicon_hit_ratio.clamp(0.0, 1.0);
+    a * conf + CASCADE_LEXICON_WEIGHT * hit + c
+}
+
+/// Pick the highest calibrated-score candidate for one line.
+///
+/// Returns a clone of the winning span (with its bbox / line index preserved).
+pub fn pick_best_line_candidate(
+    candidates: &[(CascadeBackend, &TextSpan)],
+    lexicon: &HtrLexicon,
+) -> Option<TextSpan> {
+    let mut best: Option<(f32, TextSpan)> = None;
+    for &(backend, span) in candidates {
+        if span.text.trim().is_empty() {
+            continue;
+        }
+        let hit = lexicon.hit_ratio(&span.text);
+        let score = calibrated_cascade_score(backend, span.confidence, hit);
+        match &best {
+            Some((bs, _)) if *bs >= score => {}
+            _ => best = Some((score, span.clone())),
+        }
+    }
+    best.map(|(_, s)| s)
+}
+
+fn best_scored_candidate(
+    pool: &[(CascadeBackend, TextSpan)],
+    lexicon: &HtrLexicon,
+) -> Option<(f32, TextSpan)> {
+    let mut best: Option<(f32, TextSpan)> = None;
+    for (backend, span) in pool {
+        if span.text.trim().is_empty() {
+            continue;
+        }
+        let hit = lexicon.hit_ratio(&span.text);
+        let score = calibrated_cascade_score(*backend, span.confidence, hit);
+        match &best {
+            Some((bs, _)) if *bs >= score => {}
+            _ => best = Some((score, span.clone())),
+        }
+    }
+    best
+}
+
+/// Primary-first per-line selection: accept the primary when its calibrated
+/// score is ≥ `threshold`; otherwise evaluate `secondary` / `tertiary` lazily
+/// and pick the best calibrated candidate among those that ran.
+///
+/// Closures are not called once an earlier stage already accepted (CPU path).
+pub fn select_line_cascade<F, G>(
+    primary: Option<(CascadeBackend, TextSpan)>,
+    mut secondary: F,
+    mut tertiary: G,
+    threshold: f32,
+    lexicon: &HtrLexicon,
+) -> Option<TextSpan>
+where
+    F: FnMut() -> Option<(CascadeBackend, TextSpan)>,
+    G: FnMut() -> Option<(CascadeBackend, TextSpan)>,
+{
+    let mut pool: Vec<(CascadeBackend, TextSpan)> = Vec::with_capacity(3);
+    if let Some((b, span)) = primary {
+        let hit = lexicon.hit_ratio(&span.text);
+        let score = calibrated_cascade_score(b, span.confidence, hit);
+        if score >= threshold {
+            return Some(span);
+        }
+        pool.push((b, span));
+    }
+    if let Some(c) = secondary() {
+        pool.push(c);
+        if let Some((score, span)) = best_scored_candidate(&pool, lexicon) {
+            if score >= threshold {
+                return Some(span);
+            }
+        }
+    }
+    if let Some(c) = tertiary() {
+        pool.push(c);
+    }
+    best_scored_candidate(&pool, lexicon).map(|(_, s)| s)
+}
+
+fn cascade_lexicon(shared: Option<&SharedHtrLexicon>) -> HtrLexicon {
+    if let Some(shared) = shared {
+        if let Ok(guard) = shared.read() {
+            return guard.clone();
+        }
+    }
+    HtrLexicon::from_word_list(bundled_htr_lexicon_text())
+}
+
+/// Cascade: language-aware primary + calibrated per-line selection (ktg.11).
 pub struct CascadingTranscriber {
     pub htr: StrokeHtrTranscriber,
     pub line_htr: LineImageHtrTranscriber,
     pub ocr: RasterOcrTranscriber,
-    /// Minimum mean neural confidence to prefer over empty OCR.
+    /// Handwriting language preference (`auto` resolves via OCR langs).
+    pub language: HandwritingLanguage,
+    /// Accept primary when calibrated score ≥ this (skip fallbacks).
+    pub accept_threshold: f32,
+    /// Deprecated alias kept for callers/tests that still pass a soft floor.
     pub min_htr_confidence: f32,
+    /// Optional shared lexicon (bundled + user vocabulary).
+    pub shared_lexicon: Option<SharedHtrLexicon>,
 }
 
 impl CascadingTranscriber {
@@ -143,14 +297,122 @@ impl CascadingTranscriber {
             htr,
             line_htr,
             ocr,
-            // Slightly stricter than the old 0.35 so weak OnlineHTR guesses
-            // fall through to preprocessed Tesseract / line HTR.
+            language: HandwritingLanguage::Auto,
+            accept_threshold: CASCADE_ACCEPT_THRESHOLD,
             min_htr_confidence: 0.45,
+            shared_lexicon: None,
         }
     }
 
-    /// Transcribe a page: stroke HTR, line-image HTR, and Tesseract in parallel;
-    /// keep the highest mean-confidence non-empty result.
+    pub fn with_language(mut self, language: HandwritingLanguage) -> Self {
+        self.language = language;
+        self
+    }
+
+    /// Attach a shared lexicon and propagate it to stroke + line HTR backends.
+    pub fn with_shared_lexicon(mut self, lexicon: SharedHtrLexicon) -> Self {
+        self.htr.set_shared_lexicon(Arc::clone(&lexicon));
+        self.line_htr.set_shared_lexicon(Arc::clone(&lexicon));
+        self.shared_lexicon = Some(lexicon);
+        self
+    }
+
+    /// Resolved primary backend for the configured language.
+    pub fn primary_backend(&self) -> CascadeBackend {
+        match self.language.resolve(&self.ocr.languages) {
+            ResolvedHandwritingLanguage::De => CascadeBackend::LineHtr,
+            ResolvedHandwritingLanguage::En => CascadeBackend::StrokeHtr,
+        }
+    }
+
+    fn secondary_backend(&self) -> CascadeBackend {
+        match self.primary_backend() {
+            CascadeBackend::StrokeHtr => CascadeBackend::LineHtr,
+            CascadeBackend::LineHtr => CascadeBackend::StrokeHtr,
+            CascadeBackend::Ocr => CascadeBackend::StrokeHtr,
+        }
+    }
+
+    fn ruling_pitch(&self) -> Option<f32> {
+        self.htr
+            .ruling_pitch
+            .or(self.line_htr.ruling_pitch)
+            .or(self.ocr.ruling_pitch)
+    }
+
+    fn stroke_ready(&self) -> bool {
+        self.htr.enabled && self.htr.model_available()
+    }
+
+    fn line_ready(&self) -> bool {
+        self.line_htr.enabled && self.line_htr.model_available()
+    }
+
+    fn run_backend_line(
+        &self,
+        backend: CascadeBackend,
+        line: &StrokeLine,
+        line_idx: i32,
+    ) -> crate::Result<Option<(CascadeBackend, TextSpan)>> {
+        let span = match backend {
+            CascadeBackend::StrokeHtr => {
+                if !self.stroke_ready() {
+                    return Ok(None);
+                }
+                self.htr.transcribe_stroke_line(line, line_idx)?
+            }
+            CascadeBackend::LineHtr => {
+                if !self.line_ready() {
+                    return Ok(None);
+                }
+                self.line_htr.transcribe_stroke_line(line, line_idx)?
+            }
+            CascadeBackend::Ocr => {
+                if !self.ocr.enabled {
+                    return Ok(None);
+                }
+                self.ocr.transcribe_stroke_line(line, line_idx)?
+            }
+        };
+        Ok(span.map(|s| (backend, s)))
+    }
+
+    /// Recognise a single [`StrokeLine`] with primary-first calibrated selection.
+    ///
+    /// Used by the per-line recognition cache (ephemeris-ktg.12) so background
+    /// and See-text paths can refresh dirty lines without re-running the page.
+    pub fn transcribe_line(
+        &self,
+        line: &StrokeLine,
+        line_idx: i32,
+    ) -> crate::Result<Option<TextSpan>> {
+        let lexicon = cascade_lexicon(self.shared_lexicon.as_ref());
+        let primary = self.primary_backend();
+        let secondary = self.secondary_backend();
+        let threshold = self.accept_threshold;
+        let primary_c = self.run_backend_line(primary, line, line_idx)?;
+        Ok(select_line_cascade(
+            primary_c,
+            || {
+                self.run_backend_line(secondary, line, line_idx)
+                    .ok()
+                    .flatten()
+            },
+            || {
+                self.run_backend_line(CascadeBackend::Ocr, line, line_idx)
+                    .ok()
+                    .flatten()
+            },
+            threshold,
+            &lexicon,
+        ))
+    }
+
+    /// Transcribe a page with shared [`StrokeLine`] segmentation and primary-first
+    /// calibrated per-line selection.
+    ///
+    /// When `strokes` is non-empty, screen/`gray8` is ignored. Raster-only pages
+    /// use line-band HTR with OCR as optional last resort (no stroke HTR).
     pub fn transcribe_page(
         &self,
         strokes: &[Stroke],
@@ -158,101 +420,115 @@ impl CascadingTranscriber {
         height: u32,
         gray8: &[u8],
     ) -> crate::Result<Vec<TextSpan>> {
-        let run_stroke = !strokes.is_empty() && self.htr.enabled && self.htr.model_available();
-        let run_line = self.line_htr.enabled && self.line_htr.model_available();
-        let (stroke_r, line_r, ocr_r) = std::thread::scope(|scope| {
-            let stroke_h = scope.spawn(|| {
-                if run_stroke {
-                    self.htr.transcribe(strokes)
+        if strokes.is_empty() {
+            return self.transcribe_raster_cascade(width, height, gray8);
+        }
+        let gap = default_line_gap(strokes);
+        let lines = group_strokes_into_lines_with_ruling(strokes, gap, self.ruling_pitch());
+        let mut out = Vec::with_capacity(lines.len());
+        for (i, line) in lines.iter().enumerate() {
+            if let Some(span) = self.transcribe_line(line, i as i32)? {
+                out.push(span);
+            }
+        }
+        Ok(out)
+    }
+
+    fn transcribe_raster_cascade(
+        &self,
+        width: u32,
+        height: u32,
+        gray8: &[u8],
+    ) -> crate::Result<Vec<TextSpan>> {
+        // No strokes: prefer line HTR bands; OCR only when enabled and needed.
+        let lexicon = cascade_lexicon(self.shared_lexicon.as_ref());
+        let threshold = self.accept_threshold;
+        if self.line_ready() {
+            let line_spans = self.line_htr.transcribe_raster(width, height, gray8)?;
+            if line_spans.is_empty() {
+                return if self.ocr.enabled {
+                    self.ocr.transcribe_raster(width, height, gray8)
                 } else {
                     Ok(Vec::new())
-                }
-            });
-            let line_h = scope.spawn(|| {
-                if run_line {
-                    self.line_htr.transcribe_raster(width, height, gray8)
+                };
+            }
+            // Page-level primary-first: accept line HTR when mean calibrated
+            // score is strong; otherwise optionally merge with OCR by line index.
+            let mean_cal: f32 = {
+                let scores: Vec<f32> = line_spans
+                    .iter()
+                    .map(|s| {
+                        calibrated_cascade_score(
+                            CascadeBackend::LineHtr,
+                            s.confidence,
+                            lexicon.hit_ratio(&s.text),
+                        )
+                    })
+                    .collect();
+                if scores.is_empty() {
+                    0.0
                 } else {
-                    Ok(Vec::new())
+                    scores.iter().sum::<f32>() / scores.len() as f32
                 }
-            });
-            let ocr_h = scope.spawn(|| self.ocr.transcribe_raster(width, height, gray8));
-            (stroke_h.join(), line_h.join(), ocr_h.join())
-        });
-        let stroke_spans = join_worker(stroke_r, "stroke HTR")?;
-        let line_spans = join_worker(line_r, "line HTR")?;
-        let ocr_spans = join_worker(ocr_r, "OCR")?;
-        Ok(pick_best_cascade_spans(
-            &[&stroke_spans, &line_spans, &ocr_spans],
-            self.min_htr_confidence,
-        ))
+            };
+            if mean_cal >= threshold || !self.ocr.enabled {
+                return Ok(line_spans);
+            }
+            let ocr_spans = self.ocr.transcribe_raster(width, height, gray8)?;
+            return Ok(merge_raster_line_candidates(
+                &line_spans,
+                &ocr_spans,
+                &lexicon,
+            ));
+        }
+        if self.ocr.enabled {
+            self.ocr.transcribe_raster(width, height, gray8)
+        } else {
+            Ok(Vec::new())
+        }
     }
 }
 
-fn join_worker(
-    result: Result<crate::Result<Vec<TextSpan>>, Box<dyn std::any::Any + Send>>,
-    label: &str,
-) -> crate::Result<Vec<TextSpan>> {
-    match result {
-        Ok(Ok(s)) => Ok(s),
-        Ok(Err(e)) => Err(e),
-        Err(_) => Err(crate::AppError::InvalidInput(format!(
-            "{label} worker thread panicked"
-        ))),
-    }
-}
-
-/// Choose HTR vs OCR spans for the cascade (shared by page + stroke paths).
-fn pick_cascade_spans(
-    htr_spans: &[TextSpan],
-    ocr_spans: &[TextSpan],
-    min_htr_confidence: f32,
+/// Merge line-HTR and OCR raster spans by `line` index with calibrated pick.
+fn merge_raster_line_candidates(
+    line_htr: &[TextSpan],
+    ocr: &[TextSpan],
+    lexicon: &HtrLexicon,
 ) -> Vec<TextSpan> {
-    pick_best_cascade_spans(&[htr_spans, ocr_spans], min_htr_confidence)
-}
-
-fn effective_cascade_score(spans: &[TextSpan]) -> f32 {
-    let m = mean_confidence(spans);
-    if m < 0.0 {
-        0.5
-    } else {
-        m
+    use std::collections::BTreeMap;
+    let mut by_line: BTreeMap<i32, Vec<(CascadeBackend, TextSpan)>> = BTreeMap::new();
+    for s in line_htr {
+        let key = if s.line >= 0 { s.line } else { s.y as i32 };
+        by_line
+            .entry(key)
+            .or_default()
+            .push((CascadeBackend::LineHtr, s.clone()));
     }
-}
-
-/// Pick the highest mean-confidence non-empty candidate.
-///
-/// Unknown confidences (`< 0`) count as `0.5`. When a neural result is below
-/// `min_htr_confidence` and another candidate scores higher, the stronger one
-/// wins (same spirit as the old HTR→OCR gate).
-fn pick_best_cascade_spans(candidates: &[&[TextSpan]], min_htr_confidence: f32) -> Vec<TextSpan> {
-    let mut best: Option<(f32, &[TextSpan])> = None;
-    for spans in candidates.iter().copied().filter(|s| !s.is_empty()) {
-        let mut score = effective_cascade_score(spans);
-        // Soft-penalise very weak neural guesses so OCR/line peers can win.
-        if score < min_htr_confidence && spans.iter().all(|s| s.confidence >= 0.0) {
-            score *= 0.85;
-        }
-        match best {
-            Some((bs, _)) if bs >= score => {}
-            _ => best = Some((score, spans)),
+    for s in ocr {
+        let key = if s.line >= 0 { s.line } else { s.y as i32 };
+        by_line
+            .entry(key)
+            .or_default()
+            .push((CascadeBackend::Ocr, s.clone()));
+    }
+    let mut out = Vec::new();
+    for (_k, cands) in by_line {
+        let refs: Vec<(CascadeBackend, &TextSpan)> = cands.iter().map(|(b, s)| (*b, s)).collect();
+        if let Some(best) = pick_best_line_candidate(&refs, lexicon) {
+            out.push(best);
         }
     }
-    best.map(|(_, s)| s.to_vec()).unwrap_or_default()
+    out.sort_by(|a, b| {
+        a.line
+            .cmp(&b.line)
+            .then_with(|| a.y.partial_cmp(&b.y).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    out
 }
 
 impl Transcriber for CascadingTranscriber {
     fn transcribe(&self, strokes: &[Stroke]) -> crate::Result<Vec<TextSpan>> {
-        let htr_spans = if !strokes.is_empty() && self.htr.enabled && self.htr.model_available() {
-            self.htr.transcribe(strokes)?
-        } else {
-            Vec::new()
-        };
-        let ocr_spans = self.ocr.transcribe(strokes)?;
-        Ok(pick_cascade_spans(
-            &htr_spans,
-            &ocr_spans,
-            self.min_htr_confidence,
-        ))
+        self.transcribe_page(strokes, 0, 0, &[])
     }
 
     fn transcribe_raster(
@@ -261,16 +537,7 @@ impl Transcriber for CascadingTranscriber {
         height: u32,
         gray8: &[u8],
     ) -> crate::Result<Vec<TextSpan>> {
-        let line = if self.line_htr.enabled && self.line_htr.model_available() {
-            self.line_htr.transcribe_raster(width, height, gray8)?
-        } else {
-            Vec::new()
-        };
-        let ocr = self.ocr.transcribe_raster(width, height, gray8)?;
-        Ok(pick_best_cascade_spans(
-            &[&line, &ocr],
-            self.min_htr_confidence,
-        ))
+        self.transcribe_raster_cascade(width, height, gray8)
     }
 }
 
@@ -284,16 +551,41 @@ pub struct StrokeHtrTranscriber {
     pub model_dir: Option<PathBuf>,
     /// Points per unit length for stroke interpolation (OnlineHTR default: 20).
     pub points_per_unit: f32,
+    /// Optional lined-paper ruling pitch (logical px) for line grouping.
+    pub ruling_pitch: Option<f32>,
+    /// Shared bundled+user lexicon for CTC beam rescoring (ktg.13).
+    shared_lexicon: Option<SharedHtrLexicon>,
     #[cfg(feature = "htr")]
     session: Mutex<Option<HtrSession>>,
+}
+
+/// Stroke featurization selected by model `meta.json` `features` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StrokeHtrFeatures {
+    /// Carbune2020 / OnlineHTR `featuresLinInterpol20DxDyDtN` (default).
+    #[default]
+    Carbune2020,
+    /// Armrest spline pipeline (`normalize` → `smooth` → `min_distance` → DP).
+    ArmrestSpline,
+}
+
+impl StrokeHtrFeatures {
+    /// Parse `meta.json` `"features"` (`carbune2020` | `armrest_spline`).
+    pub fn from_meta(s: &str) -> Self {
+        match s.trim() {
+            "armrest_spline" | "armrest" => Self::ArmrestSpline,
+            _ => Self::Carbune2020,
+        }
+    }
 }
 
 #[cfg(feature = "htr")]
 struct HtrSession {
     model: rten::Model,
     charset: String,
-    /// CTC blank class index (OnlineHTR / Carbune uses `0`).
+    /// CTC blank class index (OnlineHTR / Carbune uses `0`; armrest blank-last).
     blank_index: usize,
+    features: StrokeHtrFeatures,
     /// Character bigram LM + note lexicon for beam rescoring (ephemeris-9hh).
     lm: CharBigramLm,
     lexicon: HtrLexicon,
@@ -306,6 +598,8 @@ impl Clone for StrokeHtrTranscriber {
             enabled: self.enabled,
             model_dir: self.model_dir.clone(),
             points_per_unit: self.points_per_unit,
+            ruling_pitch: self.ruling_pitch,
+            shared_lexicon: self.shared_lexicon.clone(),
             #[cfg(feature = "htr")]
             session: Mutex::new(None),
         }
@@ -318,6 +612,7 @@ impl std::fmt::Debug for StrokeHtrTranscriber {
             .field("enabled", &self.enabled)
             .field("model_dir", &self.model_dir)
             .field("points_per_unit", &self.points_per_unit)
+            .field("ruling_pitch", &self.ruling_pitch)
             .finish()
     }
 }
@@ -328,6 +623,8 @@ impl Default for StrokeHtrTranscriber {
             enabled: true,
             model_dir: None,
             points_per_unit: 20.0,
+            ruling_pitch: None,
+            shared_lexicon: None,
             #[cfg(feature = "htr")]
             session: Mutex::new(None),
         }
@@ -341,6 +638,11 @@ impl StrokeHtrTranscriber {
             model_dir,
             ..Self::default()
         }
+    }
+
+    /// Install a shared lexicon used by CTC beam decode (and session init).
+    pub fn set_shared_lexicon(&mut self, lexicon: SharedHtrLexicon) {
+        self.shared_lexicon = Some(lexicon);
     }
 
     /// True when a model file is present on disk (does not load it yet).
@@ -396,18 +698,35 @@ impl StrokeHtrTranscriber {
         };
         let model = rten::Model::load_file(&model_path)
             .map_err(|e| crate::AppError::InvalidInput(format!("load HTR model: {e}")))?;
-        let charset = load_charset(dir);
-        let blank_index = load_blank_index(dir);
-        let (lm, lexicon) = default_htr_language_context(&charset, blank_index);
+        let meta = load_stroke_htr_meta(dir);
+        let charset = meta.charset;
+        let blank_index = meta.blank_index;
+        let features = meta.features;
+        let (lm, default_lex) = default_htr_language_context(&charset, blank_index);
+        let lexicon = self
+            .shared_lexicon
+            .as_ref()
+            .and_then(|s| s.read().ok().map(|g| g.clone()))
+            .unwrap_or(default_lex);
         *guard = Some(HtrSession {
             model,
             charset,
             blank_index,
+            features,
             lm,
             lexicon,
             beam: CtcBeamConfig::default(),
         });
         Ok(())
+    }
+
+    #[cfg(feature = "htr")]
+    fn session_features(&self) -> StrokeHtrFeatures {
+        self.session
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|s| s.features))
+            .unwrap_or_default()
     }
 
     #[cfg(feature = "htr")]
@@ -445,6 +764,9 @@ impl StrokeHtrTranscriber {
             _ => return Ok((String::new(), 0.0)),
         };
         let blank = sess.blank_index.min(c.saturating_sub(1));
+        // Prefer live shared lexicon (user vocab refresh) over session snapshot.
+        let shared_guard = self.shared_lexicon.as_ref().and_then(|s| s.read().ok());
+        let lexicon = shared_guard.as_deref().unwrap_or(&sess.lexicon);
         // Prefix beam + char LM / lexicon (ASR-style context on device).
         let path = ctc_decode_with_lm(
             CtcFrame {
@@ -456,7 +778,7 @@ impl StrokeHtrTranscriber {
             },
             sess.beam,
             Some(&sess.lm),
-            Some(&sess.lexicon),
+            Some(lexicon),
         );
         let text = decode_charset_with_blank(&path, &sess.charset, blank);
         let conf = ctc_softmax_confidence(&logits, time, c, blank);
@@ -476,12 +798,12 @@ fn default_charset() -> &'static str {
 
 /// Load alphabet-only charset (no blank). Prefers line-based `charset.txt`.
 #[cfg(feature = "htr")]
-fn load_charset(dir: &std::path::Path) -> String {
+fn load_charset_file(dir: &std::path::Path) -> Option<String> {
     let path = StrokeHtrTranscriber::charset_path(dir);
     let Ok(raw) = std::fs::read_to_string(&path) else {
-        return default_charset().to_string();
+        return None;
     };
-    if raw.contains('\n') {
+    Some(if raw.contains('\n') {
         raw.lines()
             .map(|l| l.trim_end_matches('\r'))
             .filter(|l| !l.is_empty() && !l.starts_with('#'))
@@ -489,24 +811,129 @@ fn load_charset(dir: &std::path::Path) -> String {
             .collect()
     } else {
         raw.chars().filter(|c| *c != '\n' && *c != '\r').collect()
+    })
+}
+
+#[cfg(feature = "htr")]
+struct StrokeHtrMeta {
+    features: StrokeHtrFeatures,
+    blank_index: usize,
+    charset: String,
+}
+
+/// Read stroke-HTR `meta.json` (`features`, `blank_index`, optional `charset`).
+///
+/// Defaults: Carbune2020 features, `blank_index=0`, OnlineHTR charset.
+/// For `armrest_spline`, defaults blank-last ([`armrest::BLANK_INDEX`]) and
+/// [`armrest::CHARSET`] when not overridden.
+#[cfg(feature = "htr")]
+fn load_stroke_htr_meta(dir: &std::path::Path) -> StrokeHtrMeta {
+    #[derive(serde::Deserialize, Default)]
+    struct Meta {
+        #[serde(default)]
+        features: Option<String>,
+        #[serde(default)]
+        blank_index: Option<usize>,
+        #[serde(default)]
+        charset: Option<String>,
+    }
+    let meta: Meta = std::fs::read_to_string(dir.join("meta.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+    let features = meta
+        .features
+        .as_deref()
+        .map(StrokeHtrFeatures::from_meta)
+        .unwrap_or_default();
+    let charset = meta
+        .charset
+        .filter(|s| !s.is_empty())
+        .or_else(|| load_charset_file(dir))
+        .unwrap_or_else(|| match features {
+            StrokeHtrFeatures::ArmrestSpline => armrest::CHARSET.to_string(),
+            StrokeHtrFeatures::Carbune2020 => default_charset().to_string(),
+        });
+    let blank_index = meta.blank_index.unwrap_or(match features {
+        StrokeHtrFeatures::ArmrestSpline => armrest::BLANK_INDEX,
+        StrokeHtrFeatures::Carbune2020 => 0,
+    });
+    StrokeHtrMeta {
+        features,
+        blank_index,
+        charset,
     }
 }
 
-/// Read `meta.json` `blank_index` (default `0` for OnlineHTR).
-#[cfg(feature = "htr")]
-fn load_blank_index(dir: &std::path::Path) -> usize {
-    let path = dir.join("meta.json");
-    let Ok(raw) = std::fs::read_to_string(&path) else {
-        return 0;
-    };
-    #[derive(serde::Deserialize)]
-    struct Meta {
-        #[serde(default)]
-        blank_index: usize,
+impl StrokeHtrTranscriber {
+    /// Recognise one shared [`StrokeLine`], preserving `line_idx` + bbox.
+    pub fn transcribe_stroke_line(
+        &self,
+        line: &StrokeLine,
+        line_idx: i32,
+    ) -> crate::Result<Option<TextSpan>> {
+        if !self.enabled || line.strokes.is_empty() || !self.model_available() {
+            return Ok(None);
+        }
+        #[cfg(feature = "htr")]
+        {
+            self.ensure_session()?;
+        }
+        #[cfg(feature = "htr")]
+        let features = self.session_features();
+        #[cfg(not(feature = "htr"))]
+        let features = StrokeHtrFeatures::Carbune2020;
+        // Cap BiLSTM length: split at largest inter-stroke x-gap when T>4000.
+        let pieces: Vec<(StrokeLine, Vec<[f32; 4]>)> = match features {
+            StrokeHtrFeatures::ArmrestSpline => {
+                #[cfg(feature = "htr")]
+                {
+                    featurize_line_armrest_pieces(line, MAX_STROKE_HTR_TIMESTEPS)
+                }
+                #[cfg(not(feature = "htr"))]
+                {
+                    featurize_line_pieces(line, self.points_per_unit, MAX_STROKE_HTR_TIMESTEPS)
+                }
+            }
+            StrokeHtrFeatures::Carbune2020 => {
+                featurize_line_pieces(line, self.points_per_unit, MAX_STROKE_HTR_TIMESTEPS)
+            }
+        };
+        let mut piece_texts = Vec::new();
+        let mut conf_sum = 0.0f32;
+        let mut conf_n = 0u32;
+        for (_piece, feats) in &pieces {
+            if feats.is_empty() {
+                continue;
+            }
+            let (text, conf) = self.infer_line(feats)?;
+            let text = text.trim().to_string();
+            if text.is_empty() {
+                continue;
+            }
+            piece_texts.push(text);
+            conf_sum += conf;
+            conf_n += 1;
+        }
+        if piece_texts.is_empty() {
+            return Ok(None);
+        }
+        let text = piece_texts.join(" ");
+        let conf = if conf_n == 0 {
+            0.0
+        } else {
+            conf_sum / conf_n as f32
+        };
+        Ok(Some(TextSpan {
+            text,
+            x: line.x,
+            y: line.y,
+            width: line.width,
+            height: line.height,
+            confidence: conf,
+            line: line_idx,
+        }))
     }
-    serde_json::from_str::<Meta>(&raw)
-        .map(|m| m.blank_index)
-        .unwrap_or(0)
 }
 
 impl Transcriber for StrokeHtrTranscriber {
@@ -514,47 +941,32 @@ impl Transcriber for StrokeHtrTranscriber {
         if !self.enabled || strokes.is_empty() || !self.model_available() {
             return Ok(Vec::new());
         }
-        #[cfg(feature = "htr")]
-        {
-            self.ensure_session()?;
-        }
         let gap = default_line_gap(strokes);
-        let lines = group_strokes_into_lines(strokes, gap);
+        let lines = group_strokes_into_lines_with_ruling(strokes, gap, self.ruling_pitch);
         let mut spans = Vec::new();
-        for line in lines {
-            let feats = featurize_line(&line, self.points_per_unit);
-            if feats.is_empty() {
-                continue;
+        for (i, line) in lines.iter().enumerate() {
+            if let Some(span) = self.transcribe_stroke_line(line, i as i32)? {
+                spans.push(span);
             }
-            let (text, conf) = self.infer_line(&feats)?;
-            let text = text.trim().to_string();
-            if text.is_empty() {
-                continue;
-            }
-            spans.push(TextSpan {
-                text,
-                x: line.x,
-                y: line.y,
-                width: line.width,
-                height: line.height,
-                confidence: conf,
-                // Each HTR decode is one handwritten line.
-                line: spans.len() as i32,
-            });
         }
         Ok(spans)
     }
 }
 
-/// Line-image CTC HTR (ephemeris-9hh.1) — DE·HTR v2-class ONNX via RTen.
+/// Line-image CTC HTR (ephemeris-9hh.1 / ktg.10) — DE·HTR v2-class ONNX via RTen.
 ///
-/// Segments the page gray8 into ink bands, resizes each to 64×W, and runs a
-/// downloaded line model. Without the `htr` feature or model files, returns
-/// empty spans so the cascade falls through to Tesseract.
+/// Preferred path: shared stroke line grouping + vector render at height 64
+/// ([`prepare_line_htr_from_strokes`]). Raster bands remain for legacy page bins
+/// without strokes. Decode uses prefix beam + German lexicon
+/// ([`ctc_decode_with_lm`]) with greedy fallback.
 pub struct LineImageHtrTranscriber {
     pub enabled: bool,
     /// Directory with `model.onnx` (or `model.rten`) + `charset.txt` + `meta.json`.
     pub model_dir: Option<PathBuf>,
+    /// Optional lined-paper ruling pitch (logical px) for shared stroke line grouping.
+    pub ruling_pitch: Option<f32>,
+    /// Shared bundled+user lexicon for CTC beam rescoring (ktg.13).
+    shared_lexicon: Option<SharedHtrLexicon>,
     #[cfg(feature = "htr")]
     session: Mutex<Option<LineHtrSession>>,
 }
@@ -566,6 +978,9 @@ struct LineHtrSession {
     blank_index: usize,
     input_name: String,
     output_name: String,
+    lm: CharBigramLm,
+    lexicon: HtrLexicon,
+    beam: CtcBeamConfig,
 }
 
 impl Clone for LineImageHtrTranscriber {
@@ -573,6 +988,8 @@ impl Clone for LineImageHtrTranscriber {
         Self {
             enabled: self.enabled,
             model_dir: self.model_dir.clone(),
+            ruling_pitch: self.ruling_pitch,
+            shared_lexicon: self.shared_lexicon.clone(),
             #[cfg(feature = "htr")]
             session: Mutex::new(None),
         }
@@ -584,6 +1001,7 @@ impl std::fmt::Debug for LineImageHtrTranscriber {
         f.debug_struct("LineImageHtrTranscriber")
             .field("enabled", &self.enabled)
             .field("model_dir", &self.model_dir)
+            .field("ruling_pitch", &self.ruling_pitch)
             .finish()
     }
 }
@@ -593,6 +1011,8 @@ impl Default for LineImageHtrTranscriber {
         Self {
             enabled: true,
             model_dir: None,
+            ruling_pitch: None,
+            shared_lexicon: None,
             #[cfg(feature = "htr")]
             session: Mutex::new(None),
         }
@@ -604,9 +1024,13 @@ impl LineImageHtrTranscriber {
         Self {
             enabled,
             model_dir,
-            #[cfg(feature = "htr")]
-            session: Mutex::new(None),
+            ..Self::default()
         }
+    }
+
+    /// Install a shared lexicon used by CTC beam decode (and session init).
+    pub fn set_shared_lexicon(&mut self, lexicon: SharedHtrLexicon) {
+        self.shared_lexicon = Some(lexicon);
     }
 
     pub fn model_available(&self) -> bool {
@@ -650,12 +1074,21 @@ impl LineImageHtrTranscriber {
         let model = rten::Model::load_file(&model_path)
             .map_err(|e| crate::AppError::InvalidInput(format!("load line HTR model: {e}")))?;
         let (alphabet, blank_index, input_name, output_name) = load_line_htr_meta(dir);
+        let (lm, default_lex) = default_htr_language_context(&alphabet, blank_index);
+        let lexicon = self
+            .shared_lexicon
+            .as_ref()
+            .and_then(|s| s.read().ok().map(|g| g.clone()))
+            .unwrap_or(default_lex);
         *guard = Some(LineHtrSession {
             model,
             alphabet,
             blank_index,
             input_name,
             output_name,
+            lm,
+            lexicon,
+            beam: CtcBeamConfig::default(),
         });
         Ok(())
     }
@@ -736,7 +1169,23 @@ impl LineImageHtrTranscriber {
             _ => logits,
         };
         let blank = sess.blank_index.min(c.saturating_sub(1));
-        let path = ctc_greedy_decode_logits(&logits, time, c, blank);
+        // DE·HTR v2 emits raw logits; beam+LM expects log-probabilities.
+        let log_probs = logits_rows_to_log_softmax(&logits, time, c);
+        let shared_guard = self.shared_lexicon.as_ref().and_then(|s| s.read().ok());
+        let lexicon = shared_guard.as_deref().unwrap_or(&sess.lexicon);
+        let path = ctc_decode_with_lm(
+            CtcFrame {
+                log_probs: &log_probs,
+                time_steps: time,
+                num_classes: c,
+                blank,
+                charset: &sess.alphabet,
+            },
+            sess.beam,
+            Some(&sess.lm),
+            Some(lexicon),
+        );
+        // Greedy fallback is inside ctc_decode_with_lm when the beam is empty.
         let text = decode_line_alphabet(&path, &sess.alphabet, blank);
         let conf = line_logits_confidence(&logits, time, c, blank);
         Ok((text, conf))
@@ -749,6 +1198,29 @@ impl LineImageHtrTranscriber {
     ) -> crate::Result<(String, f32)> {
         Ok((String::new(), 0.0))
     }
+}
+
+/// Per-timestep log-softmax over class logits (row-major `[T * C]`).
+#[cfg(feature = "htr")]
+fn logits_rows_to_log_softmax(logits: &[f32], time_steps: usize, num_classes: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; time_steps * num_classes];
+    for t in 0..time_steps {
+        let base = t * num_classes;
+        let row = &logits[base..base + num_classes];
+        let mut m = f32::NEG_INFINITY;
+        for &v in row {
+            m = m.max(v);
+        }
+        let mut sum = 0.0f32;
+        for &v in row {
+            sum += (v - m).exp();
+        }
+        let log_z = m + sum.ln();
+        for i in 0..num_classes {
+            out[base + i] = logits[base + i] - log_z;
+        }
+    }
+    out
 }
 
 #[cfg(feature = "htr")]
@@ -804,13 +1276,54 @@ fn load_line_htr_meta(dir: &std::path::Path) -> (String, usize, String, String) 
     (alphabet, blank, input, output)
 }
 
+impl LineImageHtrTranscriber {
+    /// Recognise one shared [`StrokeLine`] via vector render, preserving index + bbox.
+    pub fn transcribe_stroke_line(
+        &self,
+        line: &StrokeLine,
+        line_idx: i32,
+    ) -> crate::Result<Option<TextSpan>> {
+        if !self.enabled || line.strokes.is_empty() || !self.model_available() {
+            return Ok(None);
+        }
+        #[cfg(feature = "htr")]
+        {
+            self.ensure_session()?;
+        }
+        let Some(input) = prepare_line_htr_from_strokes(line) else {
+            return Ok(None);
+        };
+        let (text, conf) = self.infer_line_image(&input)?;
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(TextSpan {
+            text,
+            x: line.x,
+            y: line.y,
+            width: line.width,
+            height: line.height,
+            confidence: conf,
+            line: line_idx,
+        }))
+    }
+}
+
 impl Transcriber for LineImageHtrTranscriber {
     fn transcribe(&self, strokes: &[Stroke]) -> crate::Result<Vec<TextSpan>> {
         if !self.enabled || strokes.is_empty() || !self.model_available() {
             return Ok(Vec::new());
         }
-        let (w, h, gray) = rasterize_strokes(strokes);
-        self.transcribe_raster(w, h, &gray)
+        let gap = default_line_gap(strokes);
+        let lines = group_strokes_into_lines_with_ruling(strokes, gap, self.ruling_pitch);
+        let mut spans = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if let Some(span) = self.transcribe_stroke_line(line, i as i32)? {
+                spans.push(span);
+            }
+        }
+        Ok(spans)
     }
 
     fn transcribe_raster(
@@ -866,6 +1379,8 @@ pub struct RasterOcrTranscriber {
     pub tessdata: Option<PathBuf>,
     /// Optional path to the `tesseract` binary; default looks up `PATH`.
     pub tesseract_bin: Option<PathBuf>,
+    /// Optional lined-paper ruling pitch (logical px) for stroke line grouping.
+    pub ruling_pitch: Option<f32>,
 }
 
 impl Default for RasterOcrTranscriber {
@@ -875,6 +1390,7 @@ impl Default for RasterOcrTranscriber {
             languages: "eng".into(),
             tessdata: None,
             tesseract_bin: None,
+            ruling_pitch: None,
         }
     }
 }
@@ -905,6 +1421,7 @@ impl RasterOcrTranscriber {
             },
             tessdata,
             tesseract_bin: None,
+            ruling_pitch: None,
         }
     }
 
@@ -945,13 +1462,48 @@ impl RasterOcrTranscriber {
     /// User-facing hint when See-text / export yields no spans.
     pub fn empty_result_hint(&self) -> String {
         if !self.enabled {
-            return "OCR is disabled (set EPHEMERIS_OCR=1 or ocr_enabled in config).".into();
+            return "OCR is off (Settings → Handwriting → Printed OCR, or EPHEMERIS_OCR=1).".into();
         }
         if !self.tesseract_available() {
             return "Tesseract not found. On PineNote: sudo apt install tesseract-ocr tesseract-ocr-eng"
                 .into();
         }
         "No text recognised. Try larger letters, or Settings → Handwriting for stroke HTR.".into()
+    }
+
+    /// Recognise one shared [`StrokeLine`] via vector render + Tesseract.
+    ///
+    /// Words are joined into a single span using the stroke line bbox / index so
+    /// vault PDF invisible text stays aligned with handwriting lines.
+    pub fn transcribe_stroke_line(
+        &self,
+        line: &StrokeLine,
+        line_idx: i32,
+    ) -> crate::Result<Option<TextSpan>> {
+        if !self.enabled || line.strokes.is_empty() {
+            return Ok(None);
+        }
+        let params = StrokeRenderParams::for_ocr_line(line.height.max(8.0));
+        let (w, h, gray) = render_stroke_line(line, &params);
+        let words = self.transcribe_raster(w, h, &gray)?;
+        if words.is_empty() {
+            return Ok(None);
+        }
+        let text = RasterOcrTranscriber::spans_to_text(&words);
+        let text = text.replace('\n', " ").trim().to_string();
+        if text.is_empty() {
+            return Ok(None);
+        }
+        let conf = mean_confidence(&words);
+        Ok(Some(TextSpan {
+            text,
+            x: line.x,
+            y: line.y,
+            width: line.width,
+            height: line.height,
+            confidence: conf,
+            line: line_idx,
+        }))
     }
 }
 
@@ -960,8 +1512,16 @@ impl Transcriber for RasterOcrTranscriber {
         if !self.enabled || strokes.is_empty() {
             return Ok(Vec::new());
         }
-        let (w, h, gray) = rasterize_strokes(strokes);
-        self.transcribe_raster(w, h, &gray)
+        // Per shared StrokeLine (cascade v2) — keeps line index + bbox stable.
+        let gap = default_line_gap(strokes);
+        let lines = group_strokes_into_lines_with_ruling(strokes, gap, self.ruling_pitch);
+        let mut spans = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if let Some(span) = self.transcribe_stroke_line(line, i as i32)? {
+                spans.push(span);
+            }
+        }
+        Ok(spans)
     }
 
     fn transcribe_raster(
@@ -1552,7 +2112,7 @@ mod tests {
             enabled: false,
             ..RasterOcrTranscriber::default()
         };
-        assert!(t.empty_result_hint().contains("disabled"));
+        assert!(t.empty_result_hint().contains("OCR is off"));
     }
 
     #[test]
@@ -1592,27 +2152,215 @@ level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theigh
     }
 
     #[test]
-    fn pick_cascade_prefers_higher_ocr_confidence() {
-        let htr = vec![TextSpan {
-            text: "xx".into(),
+    fn calibrated_score_demotes_overconfident_ocr_gibberish() {
+        // High Tess conf + no lexicon hits must lose to medium stroke HTR + lexicon.
+        let stroke = calibrated_cascade_score(CascadeBackend::StrokeHtr, 0.60, 1.0);
+        let ocr = calibrated_cascade_score(CascadeBackend::Ocr, 0.95, 0.0);
+        assert!(
+            stroke > ocr,
+            "stroke {stroke} should beat overconfident OCR gibberish {ocr}"
+        );
+    }
+
+    #[test]
+    fn calibrated_score_ordering_prefers_strong_line_htr_for_de_words() {
+        let line = calibrated_cascade_score(CascadeBackend::LineHtr, 0.70, 1.0);
+        let stroke = calibrated_cascade_score(CascadeBackend::StrokeHtr, 0.55, 0.5);
+        let ocr = calibrated_cascade_score(CascadeBackend::Ocr, 0.90, 0.5);
+        assert!(line > stroke && line > ocr);
+    }
+
+    #[test]
+    fn pick_best_line_candidate_keeps_bbox_and_line_index() {
+        let lex = HtrLexicon::from_word_list("hello\nworld\nthe\n");
+        let weak = TextSpan {
+            text: "xqz".into(),
+            x: 1.0,
+            y: 2.0,
+            width: 3.0,
+            height: 4.0,
+            confidence: 0.95,
+            line: 0,
+        };
+        let strong = TextSpan {
+            text: "hello".into(),
+            x: 10.0,
+            y: 20.0,
+            width: 30.0,
+            height: 14.0,
+            confidence: 0.62,
+            line: 0,
+        };
+        let picked = pick_best_line_candidate(
+            &[
+                (CascadeBackend::Ocr, &weak),
+                (CascadeBackend::StrokeHtr, &strong),
+            ],
+            &lex,
+        )
+        .expect("pick");
+        assert_eq!(picked.text, "hello");
+        assert_eq!(picked.x, 10.0);
+        assert_eq!(picked.y, 20.0);
+        assert_eq!(picked.line, 0);
+    }
+
+    #[test]
+    fn select_line_cascade_skips_fallbacks_when_primary_accepted() {
+        let lex = HtrLexicon::from_word_list("hello\nthe\n");
+        let primary = TextSpan {
+            text: "hello".into(),
+            x: 0.0,
+            y: 0.0,
+            width: 40.0,
+            height: 12.0,
+            confidence: 0.80,
+            line: 1,
+        };
+        let mut secondary_calls = 0u32;
+        let mut tertiary_calls = 0u32;
+        let picked = select_line_cascade(
+            Some((CascadeBackend::StrokeHtr, primary.clone())),
+            || {
+                secondary_calls += 1;
+                Some((
+                    CascadeBackend::LineHtr,
+                    TextSpan {
+                        text: "nope".into(),
+                        ..primary.clone()
+                    },
+                ))
+            },
+            || {
+                tertiary_calls += 1;
+                Some((
+                    CascadeBackend::Ocr,
+                    TextSpan {
+                        text: "ocr".into(),
+                        ..primary.clone()
+                    },
+                ))
+            },
+            CASCADE_ACCEPT_THRESHOLD,
+            &lex,
+        )
+        .expect("accepted");
+        assert_eq!(picked.text, "hello");
+        assert_eq!(secondary_calls, 0, "primary-first must not run secondary");
+        assert_eq!(tertiary_calls, 0, "primary-first must not run OCR");
+    }
+
+    #[test]
+    fn select_line_cascade_runs_secondary_when_primary_weak() {
+        let lex = HtrLexicon::from_word_list("hello\nmeeting\n");
+        let weak = TextSpan {
+            text: "xqz".into(),
             x: 0.0,
             y: 0.0,
             width: 10.0,
             height: 10.0,
-            confidence: 0.5,
-            line: -1,
-        }];
-        let ocr = vec![TextSpan {
-            text: "Hi".into(),
+            confidence: 0.35,
+            line: 0,
+        };
+        let secondary = TextSpan {
+            text: "meeting".into(),
+            x: 5.0,
+            y: 6.0,
+            width: 50.0,
+            height: 14.0,
+            confidence: 0.75,
+            line: 0,
+        };
+        let mut secondary_calls = 0u32;
+        let mut tertiary_calls = 0u32;
+        let picked = select_line_cascade(
+            Some((CascadeBackend::StrokeHtr, weak)),
+            || {
+                secondary_calls += 1;
+                Some((CascadeBackend::LineHtr, secondary.clone()))
+            },
+            || {
+                tertiary_calls += 1;
+                None
+            },
+            CASCADE_ACCEPT_THRESHOLD,
+            &lex,
+        )
+        .expect("secondary");
+        assert_eq!(picked.text, "meeting");
+        assert_eq!(picked.line, 0);
+        assert_eq!(secondary_calls, 1);
+        assert_eq!(tertiary_calls, 0, "strong secondary skips OCR");
+    }
+
+    #[test]
+    fn per_line_selection_can_mix_backends_across_lines() {
+        let lex = HtrLexicon::from_word_list("hello\nund\n");
+        let line0_stroke = TextSpan {
+            text: "hello".into(),
             x: 0.0,
             y: 0.0,
-            width: 10.0,
-            height: 10.0,
+            width: 40.0,
+            height: 12.0,
             confidence: 0.85,
-            line: -1,
-        }];
-        let picked = pick_cascade_spans(&htr, &ocr, 0.45);
-        assert_eq!(picked[0].text, "Hi");
+            line: 0,
+        };
+        let line1_weak = TextSpan {
+            text: "zzz".into(),
+            x: 0.0,
+            y: 40.0,
+            width: 20.0,
+            height: 12.0,
+            confidence: 0.20,
+            line: 1,
+        };
+        let line1_line_htr = TextSpan {
+            text: "und".into(),
+            x: 0.0,
+            y: 40.0,
+            width: 30.0,
+            height: 12.0,
+            confidence: 0.80,
+            line: 1,
+        };
+        let out0 = select_line_cascade(
+            Some((CascadeBackend::StrokeHtr, line0_stroke)),
+            || None,
+            || None,
+            CASCADE_ACCEPT_THRESHOLD,
+            &lex,
+        )
+        .expect("line0");
+        let out1 = select_line_cascade(
+            Some((CascadeBackend::StrokeHtr, line1_weak)),
+            || Some((CascadeBackend::LineHtr, line1_line_htr.clone())),
+            || None,
+            CASCADE_ACCEPT_THRESHOLD,
+            &lex,
+        )
+        .expect("line1");
+        assert_eq!(out0.text, "hello");
+        assert_eq!(out0.line, 0);
+        assert_eq!(out1.text, "und");
+        assert_eq!(out1.line, 1);
+        assert_eq!(out1.y, 40.0);
+    }
+
+    #[test]
+    fn primary_backend_follows_handwriting_language() {
+        let mut cascade = CascadingTranscriber::new(
+            StrokeHtrTranscriber::from_parts(true, None),
+            RasterOcrTranscriber::default(),
+        );
+        cascade.language = HandwritingLanguage::De;
+        assert_eq!(cascade.primary_backend(), CascadeBackend::LineHtr);
+        cascade.language = HandwritingLanguage::En;
+        assert_eq!(cascade.primary_backend(), CascadeBackend::StrokeHtr);
+        cascade.language = HandwritingLanguage::Auto;
+        cascade.ocr.languages = "deu".into();
+        assert_eq!(cascade.primary_backend(), CascadeBackend::LineHtr);
+        cascade.ocr.languages = "eng".into();
+        assert_eq!(cascade.primary_backend(), CascadeBackend::StrokeHtr);
     }
 
     #[test]

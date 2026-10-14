@@ -1,8 +1,18 @@
-//! Line-image handwriting recognition helpers (ephemeris-9hh.1).
+//! Line-image handwriting recognition helpers (ephemeris-9hh.1 / ktg.10).
 //!
 //! Splits a page gray8 into horizontal ink bands, resizes each to height 64
 //! for a CTC line model (DE·HTR v2 / similar), and provides preprocess tensors
-//! for RTen. The ONNX session lives in [`crate::transcriber::LineImageHtrTranscriber`].
+//! for RTen. Preferred path: vector-render each [`crate::stroke_htr::StrokeLine`]
+//! via [`crate::stroke_render::prepare_line_htr_from_strokes`] (no screen raster).
+//!
+//! # DE·HTR v2 preprocess (naeyn/de-htr-web-v2)
+//!
+//! - Polarity: **dark-on-light** (do not invert).
+//! - Float tensor in `[0, 1]` as `gray8 / 255`; white = 1.0.
+//! - **No** ImageNet mean/std (v2 normalises inside the model).
+//! - Height 64, aspect preserved, width right-padded to a multiple of 4 (≤1024).
+//!
+//! The ONNX session lives in [`crate::transcriber::LineImageHtrTranscriber`].
 
 /// One horizontal ink band in source page coordinates.
 #[derive(Debug, Clone, PartialEq)]
@@ -135,10 +145,13 @@ pub fn split_ink_line_bands(width: u32, height: u32, gray8: &[u8]) -> Vec<ImageL
 }
 
 /// Prepared line tensor for DE·HTR-style models: `1 × 1 × H × W` float32 in `[0, 1]`.
+///
+/// Polarity/norm: dark-on-light, white = 1.0, no mean/std (see module docs).
 #[derive(Debug, Clone)]
 pub struct LineHtrInput {
     pub width: u32,
     pub height: u32,
+    /// Row-major `[H * W]`, values in `[0, 1]`, white paper = 1.0.
     pub pixels: Vec<f32>,
     /// Source band (for placing [`crate::transcriber::TextSpan`]s).
     pub band: ImageLineBand,
@@ -146,7 +159,10 @@ pub struct LineHtrInput {
 
 /// Crop `band` from `gray8`, resize to height [`LINE_HTR_HEIGHT`], right-pad
 /// width to a multiple of [`LINE_HTR_WIDTH_ALIGN`] (cap [`LINE_HTR_MAX_WIDTH`]),
-/// and scale to `[0, 1]` (white = 1.0).
+/// and scale to `[0, 1]` (white = 1.0, dark ink → low values; no invert / mean-std).
+///
+/// Prefer [`crate::stroke_render::prepare_line_htr_from_strokes`] when strokes
+/// are available (vector render at native HTR resolution).
 pub fn prepare_line_htr_input(
     width: u32,
     height: u32,
@@ -286,7 +302,17 @@ mod tests {
         assert_eq!(prep.width % 4, 0);
         assert!(prep.width <= LINE_HTR_MAX_WIDTH);
         assert_eq!(prep.pixels.len(), (prep.width * prep.height) as usize);
-        // Some ink (< 1.0) present.
+        // Dark ink + white paper present (dark-on-light; not polarity-inverted).
         assert!(prep.pixels.iter().any(|&p| p < 0.5));
+        assert!(prep.pixels.iter().any(|&p| p > 0.95));
+    }
+
+    #[test]
+    fn de_htr_v2_preprocess_invariants_documented() {
+        // Encoded contract for meta.json / download path (ktg.10).
+        assert_eq!(LINE_HTR_HEIGHT, 64);
+        assert_eq!(LINE_HTR_MAX_WIDTH, 1024);
+        assert_eq!(LINE_HTR_WIDTH_ALIGN, 4);
+        assert_eq!(DE_HTR_V2_ALPHABET.chars().count(), 111);
     }
 }

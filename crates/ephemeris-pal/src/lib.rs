@@ -5,9 +5,11 @@
 //! in sibling crates or in this crate behind feature flags.
 
 pub mod display;
+pub mod ink_trace;
 pub mod input;
 
 pub use display::{
     covers_output, kiosk_enabled, DesktopWindow, Display, DisplayError, PixelBuf, Rect,
     RefreshMode, PINENOTE_PX,
 };
+pub use ink_trace::{enabled as ink_trace_enabled, InkLatencyTrace};

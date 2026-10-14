@@ -27,6 +27,7 @@ pub mod mock;
 pub mod palm;
 pub mod stylus_map;
 pub mod tablet_cursor;
+pub mod wake_coalesce;
 pub mod wayland;
 
 #[cfg(target_os = "linux")]
@@ -36,6 +37,7 @@ pub use ink_record::InkRecorder;
 pub use palm::{PalmRejector, PalmRejectorConfig};
 pub use stylus_map::{digitizer_to_window, orient_axes, window_to_ui};
 pub use tablet_cursor::TabletCursorHider;
+pub use wake_coalesce::WakeCoalesce;
 pub use wayland::WaylandInput;
 
 #[cfg(target_os = "linux")]

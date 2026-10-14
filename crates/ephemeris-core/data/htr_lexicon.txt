@@ -222,3 +222,14 @@ aufgabe
 termin
 besprechung
 projekt
+bäume
+baeume
+tür
+tuer
+baum
+türkei
+hause
+haus
+zimmer
+fenster
+türschild

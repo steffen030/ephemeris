@@ -23,16 +23,9 @@ const S: f32 = 1404.0 / 800.0;
 const BASE_WIDTH: f32 = 3.0;
 const PRESSURE: f32 = 0.5;
 
-/// Logical half-width of a constant-pressure stroke (raster default widths).
+/// Logical half-width of a constant-pressure stroke ([`WidthConfig::default`]).
 fn logical_hw() -> f32 {
-    WidthConfig {
-        min_ratio: 0.35,
-        max_ratio: 1.6,
-        gamma: 1.4,
-        min_px: 0.5,
-    }
-    .width_for(BASE_WIDTH, PRESSURE)
-        * 0.5
+    WidthConfig::default().width_for(BASE_WIDTH, PRESSURE) * 0.5
 }
 
 fn stroke(points: &[(f32, f32)]) -> Stroke {
@@ -120,6 +113,94 @@ fn circle_strokes() -> Vec<Stroke> {
         2.0 * std::f32::consts::PI,
         2.0,
     ))]
+}
+
+/// Block-capitals "Mmmm" — four humps, handwriting x-height ≈ 28 logical px.
+fn mmmm_strokes() -> Vec<Stroke> {
+    let step = 2.0;
+    let mut out = Vec::new();
+    // Capital M.
+    out.push(stroke(&line((20.0, 52.0), (20.0, 20.0), step)));
+    out.push(stroke(&line((20.0, 20.0), (34.0, 40.0), step)));
+    out.push(stroke(&line((34.0, 40.0), (48.0, 20.0), step)));
+    out.push(stroke(&line((48.0, 20.0), (48.0, 52.0), step)));
+    // Three lowercase m arches (each: up-arch-down × 2).
+    for i in 0..3 {
+        let x0 = 62.0 + i as f32 * 36.0;
+        let mut pts = line((x0, 52.0), (x0, 28.0), step);
+        pts.extend(
+            arc(x0 + 8.0, 28.0, 8.0, 10.0, std::f32::consts::PI, 0.0, step)
+                .into_iter()
+                .skip(1),
+        );
+        pts.extend(
+            arc(x0 + 24.0, 28.0, 8.0, 10.0, std::f32::consts::PI, 0.0, step)
+                .into_iter()
+                .skip(1),
+        );
+        pts.extend(
+            line((x0 + 32.0, 28.0), (x0 + 32.0, 52.0), step)
+                .into_iter()
+                .skip(1),
+        );
+        out.push(stroke(&pts));
+    }
+    out
+}
+
+/// German ß (Eszett) — tall bowl + descender hook (synthetic).
+fn eszett_strokes() -> Vec<Stroke> {
+    use std::f32::consts::PI;
+    let step = 2.0;
+    let mut pts = arc(40.0, 28.0, 14.0, 12.0, PI * 0.85, -0.15, step);
+    pts.extend(
+        arc(40.0, 48.0, 14.0, 14.0, -0.15, PI * 0.75, step)
+            .into_iter()
+            .skip(1),
+    );
+    pts.extend(
+        arc(28.0, 62.0, 10.0, 8.0, 0.0, PI, step)
+            .into_iter()
+            .skip(1),
+    );
+    vec![stroke(&pts)]
+}
+
+/// Archimedean spiral — continuous curvature for AA / width stability.
+fn spiral_strokes() -> Vec<Stroke> {
+    let step = 2.0;
+    let mut pts = Vec::new();
+    let turns = 2.5_f32;
+    let n = 120;
+    for i in 0..=n {
+        let t = i as f32 / n as f32;
+        let a = t * turns * 2.0 * std::f32::consts::PI;
+        let r = 6.0 + t * 42.0;
+        pts.push((70.0 + r * a.cos(), 70.0 + r * a.sin()));
+    }
+    // Resample at ~step spacing.
+    let mut out = vec![pts[0]];
+    for &p in &pts[1..] {
+        let last = *out.last().unwrap();
+        if ((p.0 - last.0).powi(2) + (p.1 - last.1).powi(2)).sqrt() >= step * 0.85 {
+            out.push(p);
+        }
+    }
+    vec![stroke(&out)]
+}
+
+/// Dark-pixel count + bbox smoke for glyphs too branched for the edge profile.
+fn assert_physical_ink(name: &str, strokes: &[Stroke], lw: u32, lh: u32, min_dark: usize) {
+    let buf = render_physical(strokes, lw, lh);
+    dump(name, &buf);
+    let dark = buf.data.iter().filter(|&&p| p < 200).count();
+    assert!(
+        dark >= min_dark,
+        "{name}: expected ≥{min_dark} dark px, got {dark}"
+    );
+    // At least some anti-aliased fringe (not a binary stamp).
+    let aa = buf.data.iter().filter(|&&p| (1..254).contains(&p)).count();
+    assert!(aa > 50, "{name}: expected AA fringe, got {aa} mid-tone px");
 }
 
 /// Ink plane at panel resolution (the ktg.4 path).
@@ -342,6 +423,22 @@ fn circle_at_pinenote_scale_is_smooth() {
 #[test]
 fn ago_at_pinenote_scale_is_smooth() {
     check("ago", &ago_strokes(), 140, 90);
+}
+
+#[test]
+fn mmmm_at_pinenote_scale_has_ink() {
+    assert_physical_ink("mmmm", &mmmm_strokes(), 200, 80, 800);
+}
+
+#[test]
+fn eszett_at_pinenote_scale_has_ink() {
+    assert_physical_ink("eszett", &eszett_strokes(), 80, 90, 400);
+}
+
+#[test]
+fn spiral_at_pinenote_scale_is_smooth() {
+    // Outer turns have clean normals for the edge profile.
+    check("spiral", &spiral_strokes(), 150, 150);
 }
 
 #[test]

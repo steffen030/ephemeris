@@ -585,7 +585,8 @@ fn sanitize_fts_query(query: &str) -> String {
     tokens.join(" ")
 }
 
-fn list_markdown_files(
+/// List `.md` files under `vault_root`, skipping hidden dirs and optional export tree.
+pub fn list_markdown_files(
     vault_root: &Path,
     exclude_subdir: Option<&Path>,
 ) -> crate::Result<Vec<PathBuf>> {

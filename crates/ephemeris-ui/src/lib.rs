@@ -107,7 +107,8 @@ use slint::platform::{Platform, WindowAdapter};
 use slint::{Model, PhysicalSize, SharedString};
 
 use ephemeris_core::ink::{
-    EraserConfig, EraserEngine, EraserUpdate, InkConfig, InkEngine, InkUpdate,
+    pen_width_for_label, EraserConfig, EraserEngine, EraserUpdate, InkConfig, InkEngine, InkUpdate,
+    PEN_WIDTH_MEDIUM,
 };
 use ephemeris_core::model::{Point, Stroke, StrokeId, Tool};
 use ephemeris_core::refresh::{DamageSource, RefreshConfig, RefreshScheduler};
@@ -306,7 +307,7 @@ pub const NAV_W: u32 = 80;
 /// Burger dropdown panel (`drawing-dropdown` in `main.slint`):
 /// `x = parent.width - 192`, `y = 60`, `width = 184`, `height = 200`.
 const DRAWING_MENU_W: u32 = 184;
-const DRAWING_MENU_H: u32 = 200;
+const DRAWING_MENU_H: u32 = 236;
 const DRAWING_MENU_RIGHT_PAD: u32 = 8; // 192 - 184
 const DRAWING_MENU_Y: u32 = 60;
 
@@ -457,6 +458,8 @@ pub struct EphemerisUi {
     pages: RefCell<PageBook>,
     /// Default [`InkConfig::base_width`], kept for constructing blank pages.
     default_base_width: f32,
+    /// Selected pen preset width (Thin/Med/Thick); applied when tool is Pen.
+    pen_width: Cell<f32>,
     /// Set when ink strokes were added/removed since last check (See-text
     /// invalidation). Cleared by [`take_strokes_dirty`].
     strokes_dirty: Cell<bool>,
@@ -537,6 +540,11 @@ impl EphemerisUi {
             in_progress_base_width: RefCell::new(default_base_width),
             pages: RefCell::new(PageBook::new(width, canvas_h, default_base_width)),
             default_base_width,
+            pen_width: Cell::new(if (default_base_width - PEN_WIDTH_MEDIUM).abs() < 0.01 {
+                PEN_WIDTH_MEDIUM
+            } else {
+                default_base_width
+            }),
             ink_damage: RefCell::new(Vec::new()),
             scheduler: RefCell::new(RefreshScheduler::default()),
             // The first frame paints a fresh screen — treat it as a screen
@@ -614,12 +622,12 @@ impl EphemerisUi {
     /// Switch the active drawing tool on the ink engine.
     ///
     /// Sets the appropriate base stroke width alongside the tool:
-    /// * [`Tool::Pen`]         → 3 px  (standard fine writing)
+    /// * [`Tool::Pen`]         → selected Thin/Med/Thick ([`Self::set_pen_width`])
     /// * [`Tool::Highlighter`] → 12 px (wide semi-transparent gray mark)
     /// * [`Tool::Eraser`]      → 10 px (eraser circle radius)
     pub fn set_tool(&self, tool: Tool) {
         let base_width = match tool {
-            Tool::Pen => 3.0,
+            Tool::Pen => self.pen_width.get(),
             Tool::Highlighter => 12.0,
             Tool::Eraser => 10.0,
         };
@@ -630,6 +638,27 @@ impl EphemerisUi {
         if tool == Tool::Eraser {
             *self.eraser.borrow_mut() = EraserEngine::new(EraserConfig { radius: base_width });
         }
+    }
+
+    /// Set the pen width preset (`"thin"` / `"medium"` / `"thick"`) and switch
+    /// to the pen tool. Medium (3 px) is the ktg.6 sweep default.
+    pub fn set_pen_width(&self, label: &str) {
+        let w = pen_width_for_label(label);
+        self.pen_width.set(w);
+        let mut engine = self.engine.borrow_mut();
+        engine.set_tool(Tool::Pen);
+        engine.set_base_width(w);
+        drop(engine);
+        self.component.set_active_pen_width(match label {
+            "thin" | "thick" => label.into(),
+            _ => "medium".into(),
+        });
+        self.component.set_active_tool("pen".into());
+    }
+
+    /// Current pen preset width in logical pixels.
+    pub fn pen_width(&self) -> f32 {
+        self.pen_width.get()
     }
 
     /// Switch between start page (task list) and canvas (ink) view.
@@ -714,6 +743,15 @@ impl EphemerisUi {
     {
         self.component
             .on_tool_selected(move |tool| handler(tool.to_string()));
+    }
+
+    /// Wire the burger Thin/Med/Thick control.
+    pub fn on_pen_width_selected<F>(&self, mut handler: F)
+    where
+        F: FnMut(String) + 'static,
+    {
+        self.component
+            .on_pen_width_selected(move |w| handler(w.to_string()));
     }
 
     /// Register a closure called when the user presses "Clear".
@@ -810,6 +848,36 @@ impl EphemerisUi {
     pub fn is_canvas_active(&self) -> bool {
         let c = &self.component;
         self.is_note_canvas_page() && !c.get_drawing_menu_open() && !c.get_note_see_text()
+    }
+
+    /// Geometry gate for starting ink without Slint pointer dispatch.
+    ///
+    /// Returns `true` when the open note canvas is active and `(x, y)` is not
+    /// over interactive chrome (nav rail, burger). Used to skip Slint press
+    /// routing for pen-down on the ink plane (latency stall).
+    pub fn hits_inkable_canvas(&self, x: f32, y: f32) -> bool {
+        if !self.is_canvas_active() || x < 0.0 || y < 0.0 {
+            return false;
+        }
+        let xi = x as u32;
+        let yi = y as u32;
+        if xi >= self.width || yi >= self.height {
+            return false;
+        }
+        // Nav rail owns the left strip.
+        if xi < NAV_W {
+            return false;
+        }
+        // Top-right burger / close button.
+        let burger_x = self.width.saturating_sub(BURGER_W + BURGER_RIGHT_PAD);
+        if xi >= burger_x
+            && xi < burger_x.saturating_add(BURGER_W)
+            && yi >= BURGER_Y
+            && yi < BURGER_Y.saturating_add(BURGER_H)
+        {
+            return false;
+        }
+        true
     }
 
     /// `true` when committed/in-progress ink should be blended into the frame.
@@ -1461,6 +1529,27 @@ impl EphemerisUi {
 
     pub fn on_settings_line_htr_delete<F: FnMut() + 'static>(&self, handler: F) {
         self.component.on_settings_line_htr_delete(handler);
+    }
+
+    /// Settings › Handwriting language (`auto` / `en` / `de`).
+    pub fn set_settings_handwriting_lang(&self, lang: &str) {
+        self.component
+            .set_settings_handwriting_lang(slint::SharedString::from(lang));
+    }
+
+    pub fn get_settings_handwriting_lang(&self) -> String {
+        self.component
+            .get_settings_handwriting_lang()
+            .to_string()
+    }
+
+    /// Settings › Handwriting printed-OCR / Tesseract last-resort toggle.
+    pub fn set_settings_ocr_enabled(&self, enabled: bool) {
+        self.component.set_settings_ocr_enabled(enabled);
+    }
+
+    pub fn get_settings_ocr_enabled(&self) -> bool {
+        self.component.get_settings_ocr_enabled()
     }
 
     pub fn on_settings_profile_add<F>(&self, mut handler: F)
@@ -2675,58 +2764,89 @@ impl EphemerisUi {
                     );
                 }
             }
-            InkUpdate::Extended { damage } => {
-                // Use One-Euro-smoothed engine points for live ink. Stamping raw
-                // PenSample coords drew ahead of the damage rect (tip lag) and
-                // left a jagged polyline that never matched the committed spline.
-                if let Some(pt) = self.engine.borrow().last_point() {
-                    let seg = {
-                        let mut pts = self.in_progress.borrow_mut();
-                        pts.push(pt);
-                        if pts.len() >= 2 {
-                            Some([pts[pts.len() - 2], pts[pts.len() - 1]])
-                        } else {
-                            None
+            InkUpdate::Extended { points, damage } => {
+                // Stamp the engine's newly emitted Catmull-Rom samples. Span
+                // points exclude the previous tip, so chain from the last
+                // in-progress point for capsule continuity.
+                if !points.is_empty() {
+                    let bw = *self.in_progress_base_width.borrow();
+                    let stamp: Vec<Point> = {
+                        let mut ip = self.in_progress.borrow_mut();
+                        let mut chain = Vec::with_capacity(points.len() + 1);
+                        if let Some(prev) = ip.last().copied() {
+                            chain.push(prev);
                         }
+                        chain.extend_from_slice(points);
+                        for p in points {
+                            ip.push(*p);
+                        }
+                        chain
                     };
-                    // Stamp only the new segment — O(1) vs re-rasterizing the
-                    // whole live stroke every sample (was freezing long strokes).
-                    if let Some(seg) = seg {
-                        let bw = *self.in_progress_base_width.borrow();
-                        raster::rasterize_points(
-                            &mut self.in_progress_layer.borrow_mut(),
-                            &seg,
-                            bw,
-                            tool,
-                            scale,
-                        );
-                    }
+                    raster::rasterize_points(
+                        &mut self.in_progress_layer.borrow_mut(),
+                        &stamp,
+                        bw,
+                        tool,
+                        scale,
+                    );
                 }
                 self.push_ink_damage(*damage);
             }
             InkUpdate::Finished { stroke, damage } => {
                 // Never store eraser strokes — eraser is handled above.
-                if stroke.tool != Tool::Eraser && stroke.points.len() >= 2 {
+                if stroke.tool != Tool::Eraser && !stroke.points.is_empty() {
+                    let bw = *self.in_progress_base_width.borrow();
+                    // Stamp any final tip-span points not yet pushed via Extended.
                     {
+                        let already = self.in_progress.borrow().len();
+                        if already < stroke.points.len() {
+                            let mut stamp = Vec::new();
+                            if let Some(prev) = self.in_progress.borrow().last().copied() {
+                                stamp.push(prev);
+                            }
+                            stamp.extend_from_slice(&stroke.points[already..]);
+                            raster::rasterize_points(
+                                &mut self.in_progress_layer.borrow_mut(),
+                                &stamp,
+                                bw,
+                                tool,
+                                scale,
+                            );
+                            self.in_progress
+                                .borrow_mut()
+                                .extend_from_slice(&stroke.points[already..]);
+                        }
+                    }
+
+                    // Promote live → committed with min (no re-raster). Merge
+                    // over the stroke bbox ∪ last-span damage so every stamped
+                    // pixel is copied; present damage stays last-span only.
+                    let merge_rect = stroke.approx_bbox().union(damage).inflate(bw + 1.0);
+                    {
+                        let ip = self.in_progress_layer.borrow();
                         let mut arc = self.committed_layer.borrow_mut();
-                        raster::rasterize_stroke(Arc::make_mut(&mut arc), stroke, scale);
+                        raster::merge_min_rect(Arc::make_mut(&mut arc), &ip, &merge_rect, scale);
                     }
-                    self.strokes.borrow_mut().push((**stroke).clone());
-                    {
-                        let mut book = self.pages.borrow_mut();
-                        let page = book.current_page_mut();
-                        page.strokes = self.strokes.borrow().clone();
-                        // Do NOT Arc::clone committed into PageBook here — that
-                        // shares ownership so the next stroke's Arc::make_mut
-                        // COWs the full canvas (~2.6MB at PineNote 1:1). Live
-                        // `committed_layer` stays unique; save_current_page /
-                        // navigate sync PageBook.
+
+                    if stroke.points.len() >= 2 {
+                        self.strokes.borrow_mut().push((**stroke).clone());
+                        {
+                            let mut book = self.pages.borrow_mut();
+                            let page = book.current_page_mut();
+                            page.strokes = self.strokes.borrow().clone();
+                            // Do NOT Arc::clone committed into PageBook here —
+                            // that shares ownership so the next stroke's
+                            // Arc::make_mut COWs the full canvas. Live
+                            // `committed_layer` stays unique; save_current_page
+                            // / navigate sync PageBook.
+                        }
+                        self.strokes_dirty.set(true);
                     }
-                    self.strokes_dirty.set(true);
                 }
                 self.in_progress.borrow_mut().clear();
                 self.clear_in_progress_layer(tool);
-                // `damage` is the full stroke bbox from the engine (not tip-only).
+                // Last-span damage only — the rest of the stroke is already on
+                // screen from Extended presents and needs no re-present.
                 self.push_ink_damage(*damage);
             }
             InkUpdate::Idle => {}
@@ -3098,6 +3218,10 @@ impl EphemerisUi {
 
         // 6. Compose `min(bg, ink)` 1:1 into the physical present buffer for
         //    the physical footprint of every damage rect.
+        //
+        // When the drawing menu is open, chrome is restored from `bg_phys`
+        // only inside damage∩chrome (no full-panel `pre_ink` snapshot — that
+        // stall was removed in ephemeris-ktg.4 / this path).
         let phys_damage: Vec<Rect> = present
             .damage
             .iter()
@@ -3524,6 +3648,22 @@ mod tests {
         assert_eq!(*fired.borrow(), "highlighter");
     }
 
+    #[test]
+    fn pen_width_presets_update_engine_base_width() {
+        let ui = EphemerisUi::new(800, 600).expect("UI construction failed");
+        ui.set_pen_width("thin");
+        assert!((ui.pen_width() - 2.0).abs() < 1e-4);
+        assert!((ui.engine.borrow().config().base_width - 2.0).abs() < 1e-4);
+        ui.set_pen_width("thick");
+        assert!((ui.pen_width() - 4.5).abs() < 1e-4);
+        // Switching tools then back to pen restores the preset.
+        ui.set_tool(Tool::Highlighter);
+        ui.set_tool(Tool::Pen);
+        assert!((ui.engine.borrow().config().base_width - 4.5).abs() < 1e-4);
+        ui.set_pen_width("medium");
+        assert!((ui.pen_width() - 3.0).abs() < 1e-4);
+    }
+
     /// Wire the canvas-touch callback and verify it fires without panic.
     #[test]
     fn canvas_touch_callback_fires() {
@@ -3686,6 +3826,60 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Acceptance (ephemeris-ktg.5): outside the last-span damage, committed
+    /// pixels after PenUp match the live layer just before PenUp (min-merge,
+    /// no full-stroke re-raster).
+    #[test]
+    fn pen_up_merge_matches_live_outside_last_span() {
+        let ui = EphemerisUi::new(800, 600).expect("UI construction failed");
+        let mut t = 0u32;
+        let step = 8u32;
+        ui.feed_input(&InputEvent::PenDown(pen_sample(80.0, 120.0)), t);
+        t += step;
+        for x in (90..520u32).step_by(8) {
+            ui.feed_input(&InputEvent::PenMove(pen_sample(x as f32, 120.0)), t);
+            t += step;
+        }
+
+        // Snapshot live ink immediately before PenUp.
+        let live_before = ui.in_progress_layer.borrow().clone();
+        let scale = ui.ink_scale();
+        let (iw, ih) = (live_before.width, live_before.height);
+
+        let update = ui.feed_input(&InputEvent::PenUp(pen_sample(520.0, 120.0)), t);
+        let InkUpdate::Finished { stroke, damage } = update else {
+            panic!("expected Finished, got {update:?}");
+        };
+
+        let committed = ui.committed_layer.borrow();
+        let Some((lx0, ly0, lx1, ly1)) = raster::ink_pixel_bounds(&damage, scale, iw, ih) else {
+            panic!("last-span damage must map to ink pixels: {damage:?}");
+        };
+
+        // Outside the last-span footprint, committed must equal the pre-PenUp
+        // live layer (empty committed was white → pure copy via min-merge).
+        let mut mismatches = 0u32;
+        for y in 0..ih {
+            for x in 0..iw {
+                if x >= lx0 && x < lx1 && y >= ly0 && y < ly1 {
+                    continue;
+                }
+                let i = y as usize * live_before.stride as usize + x as usize;
+                let j = y as usize * committed.stride as usize + x as usize;
+                if live_before.data[i] != committed.data[j] {
+                    mismatches += 1;
+                }
+            }
+        }
+        assert_eq!(
+            mismatches,
+            0,
+            "committed diverged from pre-PenUp live outside last span {damage:?} \
+             (stroke {} pts)",
+            stroke.points.len()
+        );
     }
 
     /// Committed strokes survive a subsequent render call.
@@ -4461,6 +4655,31 @@ mod tests {
         assert!(
             ui.should_composite_ink(),
             "ink must stay composited under the floating drawing menu"
+        );
+    }
+
+    /// Canvas gate for pen fast-path: open ink plane, not nav/burger chrome.
+    #[test]
+    fn hits_inkable_canvas_excludes_chrome() {
+        let ui = EphemerisUi::new(800, 600).expect("UI construction failed");
+        assert!(ui.is_canvas_active());
+        assert!(
+            ui.hits_inkable_canvas(400.0, 300.0),
+            "centre of canvas must accept ink"
+        );
+        assert!(
+            !ui.hits_inkable_canvas(10.0, 300.0),
+            "nav rail must not start ink without Slint"
+        );
+        let burger_x = 800.0 - (BURGER_W + BURGER_RIGHT_PAD) as f32 + 2.0;
+        assert!(
+            !ui.hits_inkable_canvas(burger_x, BURGER_Y as f32 + 2.0),
+            "burger button must not start ink without Slint"
+        );
+        ui.set_drawing_menu_open(true);
+        assert!(
+            !ui.hits_inkable_canvas(400.0, 300.0),
+            "drawing menu open ⇒ canvas inactive"
         );
     }
 

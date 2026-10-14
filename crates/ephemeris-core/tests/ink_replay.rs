@@ -132,7 +132,7 @@ fn only_stroke_bbox_is_reported_as_damage() {
     let mut union = Rect::empty();
     for u in &updates {
         let damage = match u {
-            InkUpdate::Extended { damage } => Some(*damage),
+            InkUpdate::Extended { damage, .. } => Some(*damage),
             InkUpdate::Finished { damage, .. } => Some(*damage),
             _ => None,
         };
