@@ -14,6 +14,7 @@ pub mod error;
 pub mod geom;
 pub mod ics;
 pub mod ink;
+pub mod ink_layout;
 pub mod model;
 pub mod refresh;
 #[cfg(feature = "sqlite")]
@@ -80,6 +81,7 @@ pub use aggregation::AggregationService;
 #[cfg(feature = "caldav")]
 pub use caldav::{default_sync_window, CalDavCalendar, CalDavClient, CalDavConfig};
 pub use calendar_cache::CalendarCache;
+pub use ink_layout::{classify_mark_strokes, split_page_ink, MarkKind, MarkStroke, PageInk};
 pub use line_htr::{
     prepare_line_htr_input, split_ink_line_bands, ImageLineBand, LineHtrInput, DE_HTR_V2_ALPHABET,
     LINE_HTR_HEIGHT, LINE_HTR_MAX_WIDTH,
