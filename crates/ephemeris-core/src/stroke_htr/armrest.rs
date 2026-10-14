@@ -279,6 +279,7 @@ fn douglas_peucker(data: &ArmrestInk, distance: f32) -> ArmrestInk {
 
 fn from_stroke_line(line: &StrokeLine) -> ArmrestInk {
     let mut ink = ArmrestInk::default();
+    let base_ms = super::line_time_base_ms(line);
     let mut next_synth_t0 = 0.0f32;
     for stroke in &line.strokes {
         if stroke.points.is_empty() {
@@ -287,7 +288,7 @@ fn from_stroke_line(line: &StrokeLine) -> ArmrestInk {
         let t0 = if stroke.t0_ms == 0 {
             next_synth_t0
         } else {
-            stroke.t0_ms as f32 / 1000.0
+            stroke.t0_ms.saturating_sub(base_ms) as f32 / 1000.0
         };
         let mut last_t = t0;
         for p in &stroke.points {
@@ -430,6 +431,14 @@ pub fn stroke_line_from_armrest_ink(ink_literal: &str) -> StrokeLine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn featurize_is_invariant_to_epoch_ms_t0() {
+        use crate::stroke_htr::tests::{assert_features_close, epoch_offset_line};
+        let small = featurize_line_armrest(&epoch_offset_line(1_000));
+        let epoch = featurize_line_armrest(&epoch_offset_line(4_293_604_864));
+        assert_features_close(&small, &epoch);
+    }
 
     #[test]
     fn charset_blank_index_matches_armrest() {

@@ -21,7 +21,8 @@
 //! ## Stroke serialization
 //!
 //! `Stroke.points: Vec<Point>` is serialized as a **JSON array** using
-//! `serde_json`.  Each `Point` is `{x,y,pressure,tilt,t_ms}`.  This keeps the
+//! `serde_json`.  Each `Point` is `{x,y,pressure,tilt,t_ms}` (stroke-relative;
+//! the stroke's absolute start lives in the `t0_ms` column).  This keeps the
 //! schema human-readable and avoids platform-endian issues.  If write
 //! performance becomes critical, replace the `points` column with a packed
 //! binary blob (5×f32 + u32 = 24 bytes/point); the column name is unchanged so
@@ -210,7 +211,7 @@ fn row_to_task(
 
 /// Current schema version. Bump this and add a migration step in
 /// [`run_migrations`] whenever the schema changes.
-const CURRENT_VERSION: u32 = 5;
+const CURRENT_VERSION: u32 = 6;
 
 /// The migration SQL for each version level, indexed `0..CURRENT_VERSION`.
 /// Entry `i` takes the schema from version `i` to `i+1`.
@@ -314,6 +315,11 @@ static MIGRATIONS: &[&str] = &[
         PRIMARY KEY (source, task_id)
     );
     UPDATE schema_version SET version = 5;
+    "#,
+    // 5 → 6: stroke start time (epoch ms) for stroke HTR timing; 0 = unknown
+    r#"
+    ALTER TABLE strokes ADD COLUMN t0_ms INTEGER NOT NULL DEFAULT 0;
+    UPDATE schema_version SET version = 6;
     "#,
 ];
 
@@ -1291,8 +1297,8 @@ impl SqliteStore {
         self.conn
             .execute(
                 "INSERT INTO strokes
-                 (id, page_id, tool, color_r, color_g, color_b, color_a, base_width, points, z_order)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                 (id, page_id, tool, color_r, color_g, color_b, color_a, base_width, points, t0_ms, z_order)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
                          COALESCE((SELECT z_order FROM strokes WHERE id = ?1),
                                   (SELECT COALESCE(MAX(z_order), 0) + 1 FROM strokes WHERE page_id = ?2)))
                  ON CONFLICT(id) DO UPDATE SET
@@ -1302,7 +1308,8 @@ impl SqliteStore {
                      color_b    = excluded.color_b,
                      color_a    = excluded.color_a,
                      base_width = excluded.base_width,
-                     points     = excluded.points",
+                     points     = excluded.points,
+                     t0_ms      = excluded.t0_ms",
                 params![
                     stroke.id.0.to_string(),
                     page_id.0.to_string(),
@@ -1313,6 +1320,7 @@ impl SqliteStore {
                     stroke.color.a as i64,
                     stroke.base_width as f64,
                     points_json,
+                    stroke.t0_ms as i64,
                 ],
             )
             .map_err(storage_err)?;
@@ -1324,7 +1332,7 @@ impl SqliteStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, tool, color_r, color_g, color_b, color_a, base_width, points
+                "SELECT id, tool, color_r, color_g, color_b, color_a, base_width, points, t0_ms
                  FROM strokes WHERE id = ?1",
             )
             .map_err(storage_err)?;
@@ -1338,9 +1346,10 @@ impl SqliteStore {
                 row.get::<_, i64>(5)?,
                 row.get::<_, f64>(6)?,
                 row.get::<_, String>(7)?,
+                row.get::<_, i64>(8)?,
             ))
         }) {
-            Ok((id_s, tool_s, r, g, b, a, bw, pts_s)) => {
+            Ok((id_s, tool_s, r, g, b, a, bw, pts_s, t0)) => {
                 let id = id_s
                     .parse()
                     .map_err(|e| AppError::Storage(format!("bad stroke uuid: {e}")))?;
@@ -1357,7 +1366,7 @@ impl SqliteStore {
                     },
                     base_width: bw as f32,
                     points,
-                    t0_ms: 0,
+                    t0_ms: t0 as u64,
                 }))
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -1370,7 +1379,7 @@ impl SqliteStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, tool, color_r, color_g, color_b, color_a, base_width, points
+                "SELECT id, tool, color_r, color_g, color_b, color_a, base_width, points, t0_ms
                  FROM strokes WHERE page_id = ?1 ORDER BY z_order ASC",
             )
             .map_err(storage_err)?;
@@ -1385,12 +1394,13 @@ impl SqliteStore {
                     row.get::<_, i64>(5)?,
                     row.get::<_, f64>(6)?,
                     row.get::<_, String>(7)?,
+                    row.get::<_, i64>(8)?,
                 ))
             })
             .map_err(storage_err)?;
         let mut out = Vec::new();
         for row in rows {
-            let (id_s, tool_s, r, g, b, a, bw, pts_s) = row.map_err(storage_err)?;
+            let (id_s, tool_s, r, g, b, a, bw, pts_s, t0) = row.map_err(storage_err)?;
             let id = id_s
                 .parse()
                 .map_err(|e| AppError::Storage(format!("bad stroke uuid: {e}")))?;
@@ -1407,7 +1417,7 @@ impl SqliteStore {
                 },
                 base_width: bw as f32,
                 points,
-                t0_ms: 0,
+                t0_ms: t0 as u64,
             });
         }
         Ok(out)
@@ -1894,6 +1904,52 @@ mod tests {
         assert_eq!(loaded.points[0].x, s.points[0].x);
         assert_eq!(loaded.points[1].tilt, s.points[1].tilt);
         assert_eq!(loaded.tool, Tool::Highlighter);
+    }
+
+    #[test]
+    fn stroke_t0_ms_roundtrips() {
+        let store = open();
+        let page = make_page_in_store(&store);
+
+        // Live strokes carry wall-clock epoch ms (~4.29e9 after u32 wrap).
+        let mut s = make_stroke();
+        s.t0_ms = 4_293_604_864;
+        store.upsert_stroke(page.id, &s).unwrap();
+        let loaded = store.get_stroke(s.id).unwrap().expect("must be found");
+        assert_eq!(loaded.t0_ms, s.t0_ms);
+        assert_eq!(
+            store.list_strokes_for_page(page.id).unwrap()[0].t0_ms,
+            s.t0_ms
+        );
+
+        s.t0_ms += 500;
+        store.upsert_stroke(page.id, &s).unwrap();
+        assert_eq!(store.get_stroke(s.id).unwrap().unwrap().t0_ms, s.t0_ms);
+    }
+
+    #[test]
+    fn migration_5_to_6_keeps_old_strokes_with_unknown_t0() {
+        let conn = Connection::open_in_memory().unwrap();
+        for sql in &MIGRATIONS[..5] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO notes VALUES ('n', 'Note', 0, 0);
+             INSERT INTO pages VALUES ('p', 'n', 0, 'Blank');",
+        )
+        .unwrap();
+        let id = StrokeId::new();
+        conn.execute(
+            "INSERT INTO strokes
+             (id, page_id, tool, color_r, color_g, color_b, color_a, base_width, points, z_order)
+             VALUES (?1, 'p', 'Pen', 0, 0, 0, 255, 2.0, '[]', 1)",
+            params![id.0.to_string()],
+        )
+        .unwrap();
+
+        run_migrations(&conn).unwrap();
+        let store = SqliteStore { conn };
+        assert_eq!(store.get_stroke(id).unwrap().unwrap().t0_ms, 0);
     }
 
     // ── Integration: full lifecycle across all models ─────────────────────────
