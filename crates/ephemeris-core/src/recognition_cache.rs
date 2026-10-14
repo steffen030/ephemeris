@@ -430,6 +430,33 @@ impl PageRecognitionCache {
         }
     }
 
+    /// Take user corrections from `current` for lines with the same stroke
+    /// hash. A background job recognises a snapshot; edits saved while it ran
+    /// live only in `current` and must survive the job's result. Returns true
+    /// when anything changed.
+    pub fn adopt_corrections_from(&mut self, current: &PageRecognitionCache) -> bool {
+        let mut changed = false;
+        for line in &mut self.lines {
+            let Some(cur) = current
+                .lines
+                .iter()
+                .find(|c| c.stroke_ids_hash == line.stroke_ids_hash)
+            else {
+                continue;
+            };
+            if line.user_text != cur.user_text
+                || line.user_format != cur.user_format
+                || line.user_stale != cur.user_stale
+            {
+                line.user_text = cur.user_text.clone();
+                line.user_format = cur.user_format.clone();
+                line.user_stale = cur.user_stale;
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// True when at least one line still needs recognition.
     pub fn has_pending(&self) -> bool {
         self.lines.iter().any(|l| l.pending)
@@ -1067,5 +1094,27 @@ mod tests {
         assert_eq!(cache.to_spans()[0].text, "Edited");
         cache.clear_line_correction(0);
         assert_eq!(cache.completed_markdown(), "raw");
+    }
+
+    #[test]
+    fn job_result_adopts_corrections_saved_meanwhile() {
+        let (a1, a2, b1, b2) = two_line_strokes();
+        let strokes = vec![a1, a2, b1, b2];
+        let mut current = PageRecognitionCache::new("v1");
+        current.sync_strokes(&strokes, None, "v1");
+        // Snapshot handed to the background job before the user edits.
+        let mut job = current.clone();
+        let _ = job.recognise_pending(&strokes, None, &|| false, |_, idx| {
+            Ok(Some(TextSpan::new(format!("r{idx}"), 0.0, 0.0, 1.0, 1.0)))
+        });
+        current.set_line_correction(1, Some("Edited".into()), None);
+        assert!(job.adopt_corrections_from(&current));
+        assert_eq!(job.lines[1].effective_text(), "Edited");
+        assert_eq!(job.lines[0].effective_text(), "r0");
+        // Reset while the job ran also wins.
+        current.clear_line_correction(1);
+        assert!(job.adopt_corrections_from(&current));
+        assert_eq!(job.lines[1].effective_text(), "r1");
+        assert!(!job.adopt_corrections_from(&current));
     }
 }

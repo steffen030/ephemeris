@@ -130,6 +130,11 @@ impl BackgroundRecogQueue {
         self.caches.borrow_mut().insert((note_id, doc_page), cache);
     }
 
+    /// In-memory cache for a page, if loaded (holds the latest user edits).
+    fn current(&self, note_id: u32, doc_page: usize) -> Option<PageRecognitionCache> {
+        self.caches.borrow().get(&(note_id, doc_page)).cloned()
+    }
+
     fn drop_note(&self, note_id: u32, doc_page_count: usize) {
         let mut caches = self.caches.borrow_mut();
         for p in 0..doc_page_count.max(1) {
@@ -6107,8 +6112,19 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
             }
         }
         if let Ok(mut guard) = self.bg_recog.result.lock() {
-            if let Some(job) = guard.take() {
+            if let Some(mut job) = guard.take() {
                 drop(guard);
+                // See-text edits saved while the job ran must not be clobbered.
+                if let Some(current) = self.bg_recog.current(job.note_id, job.doc_page) {
+                    if job.cache.adopt_corrections_from(&current) {
+                        if let Err(e) = job.cache.save(&self.data_dir, job.note_id, job.doc_page) {
+                            tracing::warn!(
+                                "Failed to save recognition cache for note {}: {e}",
+                                job.note_id
+                            );
+                        }
+                    }
+                }
                 let completed = job.cache.completed_markdown();
                 let rows = see_text_rows(&job.cache, Some(&completed));
                 self.bg_recog
