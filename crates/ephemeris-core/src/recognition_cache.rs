@@ -8,8 +8,9 @@
 //! [`BG_RECOG_IDLE_DELAY`] after the last PenUp, cancelled on PenDown, and
 //! never while drawing.
 
+use crate::ink_layout::split_page_ink;
 use crate::model::{Stroke, StrokeId};
-use crate::stroke_htr::{default_line_gap, group_strokes_into_lines_with_ruling, StrokeLine};
+use crate::stroke_htr::StrokeLine;
 use crate::text_format::{lines_to_markdown, LineFormat};
 use crate::transcriber::TextSpan;
 use serde::{Deserialize, Serialize};
@@ -22,7 +23,7 @@ use std::time::{Duration, Instant};
 pub const BG_RECOG_IDLE_DELAY: Duration = Duration::from_millis(1500);
 
 /// Bump when cascade / feature pipeline changes invalidate stored line text.
-pub const RECOGNITION_CACHE_FORMAT: &str = "cascade-v2";
+pub const RECOGNITION_CACHE_FORMAT: &str = "cascade-v3";
 
 /// Placeholder shown in See-text for lines not yet recognised.
 pub const PENDING_LINE_MARKER: &str = "…";
@@ -181,8 +182,8 @@ impl PageRecognitionCache {
         ruling_pitch: Option<f32>,
         model_version: &str,
     ) -> RecogCacheStats {
-        let gap = default_line_gap(strokes);
-        let live = group_strokes_into_lines_with_ruling(strokes, gap, ruling_pitch);
+        // Same mark-free lines as `CascadingTranscriber::transcribe_page`.
+        let live = split_page_ink(strokes, ruling_pitch).lines;
         let version_ok = self.model_version == model_version;
         let mut by_hash: std::collections::HashMap<u64, CachedLine> =
             std::collections::HashMap::new();
@@ -308,8 +309,8 @@ impl PageRecognitionCache {
     where
         F: FnMut(&StrokeLine, i32) -> crate::Result<Option<TextSpan>>,
     {
-        let gap = default_line_gap(strokes);
-        let live = group_strokes_into_lines_with_ruling(strokes, gap, ruling_pitch);
+        // Same mark-free lines as `CascadingTranscriber::transcribe_page`.
+        let live = split_page_ink(strokes, ruling_pitch).lines;
         let mut stats = RecogCacheStats::default();
         if live.len() != self.lines.len() {
             // Caller should sync first; still attempt by hash.
