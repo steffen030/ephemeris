@@ -208,7 +208,8 @@ fn run(args: Args) -> Result<(), String> {
     let stroke = StrokeHtrTranscriber::from_parts(true, htr_dir.clone());
     let line = LineImageHtrTranscriber::from_parts(true, line_dir.clone());
     let ocr = RasterOcrTranscriber::from_parts(true, ocr_langs.clone(), tessdata);
-    let cascade = CascadingTranscriber::with_line_htr(stroke.clone(), line.clone(), ocr.clone());
+    let cascade = CascadingTranscriber::with_line_htr(stroke.clone(), line.clone(), ocr.clone())
+        .with_language(config.handwriting_language);
 
     let stroke_status = model_status(stroke.model_available(), &htr_dir, "model.onnx|model.rten");
     let line_status = model_status(line.model_available(), &line_dir, "model.onnx|model.rten");
@@ -234,12 +235,25 @@ fn run(args: Args) -> Result<(), String> {
         Recogniser {
             id: "line-htr",
             availability: line_status,
-            run: Box::new(|_, w, h, gray| line.transcribe_raster(w, h, gray)),
+            // Strokes → shared line grouping + vector render (ktg.10); raster only if empty.
+            run: Box::new(|strokes, w, h, gray| {
+                if strokes.is_empty() {
+                    line.transcribe_raster(w, h, gray)
+                } else {
+                    line.transcribe(strokes)
+                }
+            }),
         },
         Recogniser {
             id: "ocr",
             availability: ocr_status,
-            run: Box::new(|_, w, h, gray| ocr.transcribe_raster(w, h, gray)),
+            run: Box::new(|strokes, w, h, gray| {
+                if strokes.is_empty() {
+                    ocr.transcribe_raster(w, h, gray)
+                } else {
+                    ocr.transcribe(strokes)
+                }
+            }),
         },
         Recogniser {
             id: "cascade",

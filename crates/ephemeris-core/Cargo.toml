@@ -57,5 +57,8 @@ reqwest = { workspace = true, optional = true }
 rten = { workspace = true, optional = true }
 rten-tensor = { workspace = true, optional = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"

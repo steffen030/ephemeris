@@ -117,6 +117,19 @@ The public keyring also lives in-tree at
   commits accumulate in a Release PR that a human merges when ready (one click).
   Dependabot opens Cargo/Actions update PRs; patch/minor auto-merge after CI.
 
+## Handwriting models (optional)
+
+Stroke HTR loads a model directory (`model.onnx` or `model.rten`, `charset.txt`,
+`meta.json`). The `meta.json` `features` field selects preprocessing:
+
+| `features` | Model | Notes |
+|------------|--------|--------|
+| `carbune2020` (default) | OnlineHTR / Carbune IAM-OnDB | Prefer for **DE** (umlauts / ß via alphabet) |
+| `armrest_spline` | [armrest](https://github.com/bkirwi/armrest) `english_ascii` | EN ASCII candidate; no umlauts |
+
+Export helpers: `scripts/export-htr-model.sh` (Carbune), `scripts/export-armrest-model.sh`
+(armrest TFLite→ONNX). Third-party attributions: [`crates/ephemeris-core/NOTICE`](crates/ephemeris-core/NOTICE).
+
 ## License
 
 Licensed under either of
@@ -131,3 +144,6 @@ at your option.
 Unless you explicitly state otherwise, any contribution intentionally submitted
 for inclusion in this work shall be dual-licensed as above, without additional
 terms or conditions.
+
+Third-party notices (including the armrest Apache-2.0 preprocessing port) are in
+[`crates/ephemeris-core/NOTICE`](crates/ephemeris-core/NOTICE).

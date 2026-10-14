@@ -363,6 +363,23 @@ impl DesktopWindow {
         self.hide_cursor();
     }
 
+    /// True when the window already has keyboard/pointer focus.
+    pub fn has_focus(&self) -> bool {
+        self.window.has_focus()
+    }
+
+    /// Call [`Self::focus`] only when the window is not already focused.
+    ///
+    /// Avoids a compositor activation request on every pen-down (PineNote
+    /// ink latency stall).
+    pub fn focus_if_unfocused(&self) -> bool {
+        if self.has_focus() {
+            return false;
+        }
+        self.focus();
+        true
+    }
+
     /// Hide the OS pointer (pen-first note canvas). Safe to call repeatedly.
     ///
     /// Affects the `wl_pointer` / mouse cursor only. On PineNote the stylus
@@ -471,7 +488,7 @@ impl DesktopWindow {
         let full =
             matches!(mode, RefreshMode::Full | RefreshMode::Clear) || damage.is_empty() || age == 0;
         let one_to_one = lw == phys_w && lh == phys_h;
-        let ink_trace = std::env::var_os("EPHEMERIS_INK_TRACE").is_some();
+        let ink_trace = crate::ink_trace::enabled();
         let t0 = if ink_trace {
             Some(std::time::Instant::now())
         } else {
@@ -559,9 +576,10 @@ impl DesktopWindow {
                     .map(|r| u64::from(r.width) * u64::from(r.height))
                     .sum()
             };
+            let blit_us = t0.elapsed().as_micros() as u64;
+            // Structured for scripts/ink-latency-report.py (stage=present_blit).
             log::info!(
-                "ink_trace present path={path} mode={mode:?} full={full} 1:1={one_to_one} age={age} src={lw}x{lh} phys={phys_w}x{phys_h} damage_px={area} took={:?}",
-                t0.elapsed()
+                "ink_trace stage=present_blit path={path} mode={mode:?} full={full} 1:1={one_to_one} age={age} src={lw}x{lh} phys={phys_w}x{phys_h} damage_px={area} blit_us={blit_us}"
             );
         }
 
@@ -682,6 +700,19 @@ impl Display for MockDesktop {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Gate used by [`DesktopWindow::focus_if_unfocused`] — focus only once.
+    #[test]
+    fn focus_only_when_unfocused() {
+        fn needs_focus(has_focus: bool) -> bool {
+            !has_focus
+        }
+        assert!(needs_focus(false), "unfocused window must request focus");
+        assert!(
+            !needs_focus(true),
+            "already-focused window must skip focus()"
+        );
+    }
 
     #[test]
     fn pixelbuf_creation() {

@@ -1394,6 +1394,7 @@ dependencies = [
  "chrono-tz",
  "ephemeris-pal",
  "icalendar",
+ "libc",
  "log",
  "printpdf",
  "reqwest 0.12.28",

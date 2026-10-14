@@ -19,6 +19,7 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use evdev::{AbsoluteAxisCode, Device, EventSummary, KeyCode, PropType};
 
 use super::stylus_map::{digitizer_to_window, window_to_ui};
+use super::wake_coalesce::WakeCoalesce;
 use super::{InputEvent, PenSample};
 
 const CHANNEL_CAPACITY: usize = 256;
@@ -80,6 +81,8 @@ pub type PenWake = Arc<dyn Fn() + Send + Sync>;
 pub struct EvdevPenSource {
     rx: Receiver<InputEvent>,
     stop: Arc<AtomicBool>,
+    /// Shared with the reader thread: at most one wake until [`Self::try_iter`].
+    wake_coalesce: Arc<WakeCoalesce>,
     _join: Option<JoinHandle<()>>,
 }
 
@@ -94,10 +97,12 @@ impl EvdevPenSource {
         let (tx, rx) = bounded(CHANNEL_CAPACITY);
         let stop = Arc::new(AtomicBool::new(false));
         let stop_w = Arc::clone(&stop);
+        let wake_coalesce = Arc::new(WakeCoalesce::new());
+        let wake_c = Arc::clone(&wake_coalesce);
         let join = thread::Builder::new()
             .name("ephemeris-evdev-pen".into())
             .spawn(move || {
-                if let Err(e) = run_device(&path, target, tx, stop_w, wake) {
+                if let Err(e) = run_device(&path, target, tx, stop_w, wake, wake_c) {
                     log::warn!("evdev pen reader stopped: {e}");
                 }
             })
@@ -106,6 +111,7 @@ impl EvdevPenSource {
         Some(Self {
             rx,
             stop,
+            wake_coalesce,
             _join: Some(join),
         })
     }
@@ -115,7 +121,11 @@ impl EvdevPenSource {
     }
 
     /// Drain all pending events (non-blocking).
+    ///
+    /// Clears the wake-coalesce flag first so a concurrent emit can re-wake
+    /// the loop if more samples arrive while this drain is in flight.
     pub fn try_iter(&self) -> crossbeam_channel::TryIter<'_, InputEvent> {
+        self.wake_coalesce.clear();
         self.rx.try_iter()
     }
 }
@@ -185,10 +195,15 @@ fn pen_score(device: &Device) -> i32 {
     score
 }
 
-fn emit(tx: &Sender<InputEvent>, wake: &Option<PenWake>, event: InputEvent) {
+fn emit(
+    tx: &Sender<InputEvent>,
+    wake: &Option<PenWake>,
+    wake_coalesce: &WakeCoalesce,
+    event: InputEvent,
+) {
     if tx.try_send(event).is_ok() {
         if let Some(w) = wake {
-            w();
+            wake_coalesce.request(|| w());
         }
     }
 }
@@ -199,6 +214,7 @@ fn run_device(
     tx: Sender<InputEvent>,
     stop: Arc<AtomicBool>,
     wake: Option<PenWake>,
+    wake_coalesce: Arc<WakeCoalesce>,
 ) -> Result<(), String> {
     let mut device = Device::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     // Optional exclusive grab (EPHEMERIS_GRAB_PEN=1). Default off so the
@@ -261,7 +277,7 @@ fn run_device(
                             raw_x, raw_y, raw_p, false, t_us, &target, digitizer, x_min, x_max,
                             y_min, y_max, p_min, p_max,
                         );
-                        emit(&tx, &wake, InputEvent::PenUp(sample));
+                        emit(&tx, &wake, &wake_coalesce, InputEvent::PenUp(sample));
                     }
                 }
                 EventSummary::Key(_, KeyCode::BTN_TOUCH | KeyCode::BTN_LEFT, val) => {
@@ -275,14 +291,19 @@ fn run_device(
                     );
                     if pressed && !tip_down {
                         tip_down = true;
-                        emit(&tx, &wake, InputEvent::PenDown(s));
+                        emit(&tx, &wake, &wake_coalesce, InputEvent::PenDown(s));
                     } else if !pressed && tip_down {
                         tip_down = false;
-                        emit(&tx, &wake, InputEvent::PenUp(s));
+                        emit(&tx, &wake, &wake_coalesce, InputEvent::PenUp(s));
                     }
                 }
                 EventSummary::Key(_, KeyCode::BTN_STYLUS | KeyCode::BTN_STYLUS2, val) => {
-                    emit(&tx, &wake, InputEvent::PenButton { pressed: val != 0 });
+                    emit(
+                        &tx,
+                        &wake,
+                        &wake_coalesce,
+                        InputEvent::PenButton { pressed: val != 0 },
+                    );
                 }
                 EventSummary::Synchronization(_, _, _) if have_pos && (tip_down || in_range) => {
                     let s = sample(
@@ -301,11 +322,12 @@ fn run_device(
                         p_max,
                     );
                     if tip_down {
-                        emit(&tx, &wake, InputEvent::PenMove(s));
+                        emit(&tx, &wake, &wake_coalesce, InputEvent::PenMove(s));
                     } else if in_range {
                         emit(
                             &tx,
                             &wake,
+                            &wake_coalesce,
                             InputEvent::Hover {
                                 x: s.x,
                                 y: s.y,

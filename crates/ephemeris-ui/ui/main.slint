@@ -377,6 +377,8 @@ export component EphemerisPage inherits Window {
 
     // ── Active tool (pen / highlighter / eraser) ─────────────────────────
     in-out property <string> active-tool: "pen";
+    // Pen stroke width preset: thin | medium | thick (ephemeris-ktg.6).
+    in-out property <string> active-pen-width: "medium";
 
     // ── View visibility flags ────────────────────────────────────────────
     in property <bool> show-start-page: false;
@@ -548,6 +550,10 @@ export component EphemerisPage inherits Window {
     in property <bool> htr-downloading: false;
     in property <bool> line-htr-model-installed: false;
     in property <bool> line-htr-downloading: false;
+    // Handwriting cascade language: auto | en | de (ephemeris-ktg.11).
+    in-out property <string> settings-handwriting-lang: "auto";
+    // Tesseract last resort / printed-text OCR (off by default for handwriting).
+    in-out property <bool> settings-ocr-enabled: false;
 
     // ── File browser ─────────────────────────────────────────────────────
     // 0 = vault folder, 1 = ICS file, 2 = profile icon image
@@ -851,6 +857,7 @@ export component EphemerisPage inherits Window {
     callback swipe-left();
     callback swipe-right();
     callback tool-selected(string);
+    callback pen-width-selected(string);
     callback clear-page();
 
     // ── Canvas ───────────────────────────────────────────────────────────
@@ -2958,7 +2965,7 @@ export component EphemerisPage inherits Window {
     drawing-dropdown := Rectangle {
         visible: root.drawing-menu-open && root.is-canvas-context;
         x: parent.width - 192px; y: 60px;
-        width: 184px; height: 200px;
+        width: 184px; height: 236px;
         background: EinkTheme.chrome-bg;
         border-width: 2px; border-color: EinkTheme.chrome-border;
         border-radius: 6px;
@@ -3016,12 +3023,62 @@ export component EphemerisPage inherits Window {
             TouchArea { clicked => { root.clear-page(); root.drawing-menu-open = false; } }
         }
 
+        // -- Pen width: Thin / Med / Thick --
+        Rectangle {
+            x: 6px; y: 78px; width: 54px; height: 28px;
+            background: root.active-pen-width == "thin" ? EinkTheme.btn-active-bg : transparent;
+            border-radius: 3px;
+            Text { text: "Thin"; font-size: 11px;
+                   color: root.active-pen-width == "thin" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                   horizontal-alignment: center; vertical-alignment: center;
+                   width: parent.width; height: parent.height; }
+            TouchArea { clicked => {
+                root.active-pen-width = "thin";
+                root.pen-width-selected("thin");
+                root.active-tool = "pen";
+                root.tool-selected("pen");
+                root.drawing-menu-open = false;
+            } }
+        }
+        Rectangle {
+            x: 64px; y: 78px; width: 54px; height: 28px;
+            background: root.active-pen-width == "medium" ? EinkTheme.btn-active-bg : transparent;
+            border-radius: 3px;
+            Text { text: "Med"; font-size: 11px;
+                   color: root.active-pen-width == "medium" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                   horizontal-alignment: center; vertical-alignment: center;
+                   width: parent.width; height: parent.height; }
+            TouchArea { clicked => {
+                root.active-pen-width = "medium";
+                root.pen-width-selected("medium");
+                root.active-tool = "pen";
+                root.tool-selected("pen");
+                root.drawing-menu-open = false;
+            } }
+        }
+        Rectangle {
+            x: 122px; y: 78px; width: 56px; height: 28px;
+            background: root.active-pen-width == "thick" ? EinkTheme.btn-active-bg : transparent;
+            border-radius: 3px;
+            Text { text: "Thick"; font-size: 11px;
+                   color: root.active-pen-width == "thick" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                   horizontal-alignment: center; vertical-alignment: center;
+                   width: parent.width; height: parent.height; }
+            TouchArea { clicked => {
+                root.active-pen-width = "thick";
+                root.pen-width-selected("thick");
+                root.active-tool = "pen";
+                root.tool-selected("pen");
+                root.drawing-menu-open = false;
+            } }
+        }
+
         // Separator
-        Rectangle { x: 6px; y: 78px; width: 172px; height: 1px; background: EinkTheme.chrome-border; }
+        Rectangle { x: 6px; y: 112px; width: 172px; height: 1px; background: EinkTheme.chrome-border; }
 
         // -- Paper row 1: Blank / Lined --
         Rectangle {
-            x: 6px; y: 83px; width: 84px; height: 32px;
+            x: 6px; y: 117px; width: 84px; height: 32px;
             background: root.active-paper == "blank" ? EinkTheme.btn-active-bg : transparent;
             border-radius: 3px;
             Text { text: "Blank"; font-size: 12px;
@@ -3031,7 +3088,7 @@ export component EphemerisPage inherits Window {
             TouchArea { clicked => { root.active-paper = "blank"; root.paper-type-tapped("blank"); root.drawing-menu-open = false; } }
         }
         Rectangle {
-            x: 94px; y: 83px; width: 84px; height: 32px;
+            x: 94px; y: 117px; width: 84px; height: 32px;
             background: root.active-paper == "lined" ? EinkTheme.btn-active-bg : transparent;
             border-radius: 3px;
             Text { text: "Lined"; font-size: 12px;
@@ -3043,7 +3100,7 @@ export component EphemerisPage inherits Window {
 
         // -- Paper row 2: Dotted / Squared --
         Rectangle {
-            x: 6px; y: 119px; width: 84px; height: 32px;
+            x: 6px; y: 153px; width: 84px; height: 32px;
             background: root.active-paper == "dotted" ? EinkTheme.btn-active-bg : transparent;
             border-radius: 3px;
             Text { text: "Dotted"; font-size: 12px;
@@ -3053,7 +3110,7 @@ export component EphemerisPage inherits Window {
             TouchArea { clicked => { root.active-paper = "dotted"; root.paper-type-tapped("dotted"); root.drawing-menu-open = false; } }
         }
         Rectangle {
-            x: 94px; y: 119px; width: 84px; height: 32px;
+            x: 94px; y: 153px; width: 84px; height: 32px;
             background: root.active-paper == "squared" ? EinkTheme.btn-active-bg : transparent;
             border-radius: 3px;
             Text { text: "Squared"; font-size: 11px;
@@ -3064,11 +3121,11 @@ export component EphemerisPage inherits Window {
         }
 
         // Separator
-        Rectangle { x: 6px; y: 155px; width: 172px; height: 1px; background: EinkTheme.chrome-border; }
+        Rectangle { x: 6px; y: 189px; width: 172px; height: 1px; background: EinkTheme.chrome-border; }
 
         // -- See text toggle (OCR / transcribed layer)
         Rectangle {
-            x: 6px; y: 160px; width: 172px; height: 32px;
+            x: 6px; y: 194px; width: 172px; height: 32px;
             background: root.note-see-text ? EinkTheme.btn-active-bg : transparent;
             border-radius: 3px;
             Text {
@@ -4506,6 +4563,76 @@ export component EphemerisPage inherits Window {
                                     Text { text: "Delete"; font-size: 12px; color: EinkTheme.danger-fg;
                                            horizontal-alignment: center; vertical-alignment: center; }
                                     TouchArea { clicked => { root.settings-line-htr-delete(); } }
+                                }
+                            }
+                        }
+
+                        Rectangle {
+                            height: 48px;
+                            background: EinkTheme.canvas-bg;
+                            HorizontalLayout {
+                                padding-left: 16px; padding-right: 16px;
+                                padding-top: 6px; padding-bottom: 6px;
+                                spacing: 8px;
+
+                                Text {
+                                    text: "Language";
+                                    font-size: 14px; color: EinkTheme.btn-fg;
+                                    vertical-alignment: center; width: 110px;
+                                }
+
+                                for lang-opt in ["auto", "en", "de"]: Rectangle {
+                                    property <string> lbl: lang-opt == "auto" ? "Auto"
+                                        : lang-opt == "en" ? "English" : "German";
+                                    property <bool> active: root.settings-handwriting-lang == lang-opt;
+                                    width: 72px; height: 32px;
+                                    background: active ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+                                    border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                                    Text { text: lbl; font-size: 12px;
+                                           color: active ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                                           horizontal-alignment: center; vertical-alignment: center; }
+                                    TouchArea { clicked => { root.settings-handwriting-lang = lang-opt; } }
+                                }
+
+                                Rectangle { horizontal-stretch: 1; }
+                            }
+                        }
+
+                        Rectangle {
+                            height: 48px;
+                            background: EinkTheme.canvas-bg;
+                            HorizontalLayout {
+                                padding-left: 16px; padding-right: 16px;
+                                padding-top: 6px; padding-bottom: 6px;
+                                spacing: 8px;
+
+                                Text {
+                                    text: "Printed OCR";
+                                    font-size: 14px; color: EinkTheme.btn-fg;
+                                    vertical-alignment: center; width: 110px;
+                                }
+
+                                Text {
+                                    text: "Tesseract last resort (printed / weak lines)";
+                                    font-size: 12px; color: EinkTheme.text-secondary;
+                                    vertical-alignment: center; horizontal-stretch: 1;
+                                }
+
+                                Rectangle {
+                                    width: 52px; height: 32px;
+                                    background: root.settings-ocr-enabled ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+                                    border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                                    Text {
+                                        text: root.settings-ocr-enabled ? "On" : "Off";
+                                        font-size: 12px;
+                                        color: root.settings-ocr-enabled ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                                        horizontal-alignment: center; vertical-alignment: center;
+                                    }
+                                    TouchArea {
+                                        clicked => {
+                                            root.settings-ocr-enabled = !root.settings-ocr-enabled;
+                                        }
+                                    }
                                 }
                             }
                         }

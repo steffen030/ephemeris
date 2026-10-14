@@ -95,6 +95,33 @@ pub fn ink_pixel_bounds(
     (x1 > x0 && y1 > y0).then_some((x0, y0, x1, y1))
 }
 
+/// Merge `src` into `dst` with per-pixel `min` over the ink-plane footprint of
+/// logical `rect` (union blend for pen/highlighter). Used at PenUp to promote
+/// the live layer into committed without re-rasterising the stroke.
+pub fn merge_min_rect(
+    dst: &mut PixelBuf,
+    src: &PixelBuf,
+    rect: &ephemeris_core::geom::Rect,
+    scale: InkScale,
+) {
+    let w = dst.width.min(src.width);
+    let h = dst.height.min(src.height);
+    let Some((x0, y0, x1, y1)) = ink_pixel_bounds(rect, scale, w, h) else {
+        return;
+    };
+    let dst_stride = dst.stride as usize;
+    let src_stride = src.stride as usize;
+    for y in y0..y1 {
+        let drow = y as usize * dst_stride;
+        let srow = y as usize * src_stride;
+        for x in x0..x1 {
+            let di = drow + x as usize;
+            let si = srow + x as usize;
+            dst.data[di] = dst.data[di].min(src.data[si]);
+        }
+    }
+}
+
 // ── Public entry points ───────────────────────────────────────────────────────
 
 /// Rasterize a completed [`Stroke`] into the canvas-sized ink plane `buf`.
@@ -151,20 +178,13 @@ pub fn rasterize_points(
 }
 
 /// Half stroke width in ink-plane pixels for `pressure` at width factor `wf`.
+///
+/// Uses [`WidthConfig::default`] — the same curve as [`ephemeris_core::ink::InkConfig`]
+/// — so raster and engine damage stay in lockstep (ephemeris-ktg.6).
 #[inline]
 pub fn half_width_px(base_width: f32, pressure: f32, wf: f32) -> f32 {
-    WIDTHS.width_for(base_width, pressure) * 0.5 * wf
+    WidthConfig::default().width_for(base_width, pressure) * 0.5 * wf
 }
-
-// ── Width config ──────────────────────────────────────────────────────────────
-
-/// Default pressure→width config, shared with the ink engine's damage math.
-const WIDTHS: WidthConfig = WidthConfig {
-    min_ratio: 0.35,
-    max_ratio: 1.6,
-    gamma: 1.4,
-    min_px: 0.5,
-};
 
 // ── Capsule renderer ──────────────────────────────────────────────────────────
 
@@ -382,5 +402,18 @@ mod tests {
         );
         let off = ephemeris_core::geom::Rect::new(200.0, 0.0, 210.0, 5.0);
         assert_eq!(ink_pixel_bounds(&off, InkScale::IDENTITY, 100, 100), None);
+    }
+
+    #[test]
+    fn merge_min_rect_keeps_darker_pixels() {
+        let mut dst = canvas();
+        let mut src = canvas();
+        dst.data[50 * 100 + 50] = 200;
+        src.data[50 * 100 + 50] = 40;
+        let r = ephemeris_core::geom::Rect::new(40.0, 40.0, 60.0, 60.0);
+        merge_min_rect(&mut dst, &src, &r, InkScale::IDENTITY);
+        assert_eq!(dst.data[50 * 100 + 50], 40);
+        // Outside the rect is untouched.
+        assert_eq!(dst.data[0], 255);
     }
 }

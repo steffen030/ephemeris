@@ -3,15 +3,14 @@
 //! Pipeline for a single stroke:
 //!
 //! 1. `PenDown` starts a new [`StrokeBuilder`].
-//! 2. Each `PenMove` sample is smoothed by a [`OneEuroFilter2D`] and appended.
-//!    The engine reports the **incremental damage rect** — the bounding box of
-//!    just the newly rendered segment (inflated by the local half-width) — so
-//!    the caller can drive the eink *Fast* refresh path on that region only.
-//! 3. `PenUp` finalises the stroke: the collected samples are resampled with a
-//!    centripetal Catmull-Rom spline and returned as a [`Stroke`].
-//!
-//! The engine never redraws the whole canvas: total stroke damage is the union
-//! of the per-segment damage rects, always bounded by the stroke's bbox.
+//! 2. Each accepted `PenMove` sample is smoothed by a [`OneEuroFilter2D`] and
+//!    appended as a *control* point. When a new control makes a Catmull-Rom
+//!    span available (1-sample lookbehind), the engine emits the incremental
+//!    spline points plus their damage rect so the UI can stamp live ink that
+//!    already matches the committed stroke.
+//! 3. `PenUp` anchors the tip, emits the remaining open spans, and returns the
+//!    accumulated smoothed polyline as the [`Stroke`] (no second full spline).
+//!    Finished damage is the **last span only**.
 
 use ephemeris_pal::input::{InputEvent, PenSample};
 
@@ -19,7 +18,7 @@ use crate::geom::Rect;
 use crate::model::{Color, Point, Stroke, Tool};
 
 use super::one_euro::{OneEuroConfig, OneEuroFilter2D};
-use super::spline::catmull_rom;
+use super::spline::{adaptive_span_segments, catmull_rom_span};
 use super::width::WidthConfig;
 
 /// Tunable parameters for the ink engine.
@@ -35,7 +34,8 @@ pub struct InkConfig {
     pub one_euro: OneEuroConfig,
     /// Pressure→width configuration.
     pub width: WidthConfig,
-    /// Catmull-Rom segments generated per input span at finalisation.
+    /// Catmull-Rom segments per span (legacy / tests). Live emission uses
+    /// [`adaptive_span_segments`] instead.
     pub spline_segments: usize,
     /// Minimum distance (logical px) between accepted raw samples.  Filters out
     /// near-duplicate points that add cost without adding shape.
@@ -61,13 +61,15 @@ impl Default for InkConfig {
 pub enum InkUpdate {
     /// Nothing happened for this event (e.g. hover, touch, no-op sample).
     Idle,
-    /// A stroke was started; no ink drawn yet.
+    /// A stroke was started; no ink drawn yet beyond the seeded tip.
     Started,
-    /// The in-progress stroke grew; `damage` is the region that changed and
-    /// must be repainted (already inflated to cover the brush half-width).
-    Extended { damage: Rect },
-    /// The stroke finished; the completed [`Stroke`] is returned along with the
-    /// final segment's `damage`.
+    /// The in-progress stroke grew; `points` are the newly emitted Catmull-Rom
+    /// samples for this update and `damage` is the region that changed
+    /// (already inflated to cover the brush half-width).
+    Extended { points: Vec<Point>, damage: Rect },
+    /// The stroke finished; the completed [`Stroke`] is returned along with
+    /// tip-local `damage` covering only the span(s) emitted at PenUp (not the
+    /// full stroke bbox).
     Finished { stroke: Box<Stroke>, damage: Rect },
 }
 
@@ -79,11 +81,10 @@ struct StrokeBuilder {
     filter: OneEuroFilter2D,
     width_cfg: WidthConfig,
     min_sample_dist: f32,
-    /// Smoothed raw samples collected so far.
+    /// One-Euro-smoothed control points (Catmull-Rom inputs).
     points: Vec<Point>,
-    /// Union of all damage rects reported for this stroke (== stroke bbox
-    /// inflated by half-width). Handy for validation and final flush.
-    total_damage: Rect,
+    /// Incrementally built Catmull-Rom polyline (becomes [`Stroke::points`]).
+    smoothed: Vec<Point>,
     /// Timestamp of the PenDown, used to make `t_ms` stroke-relative.
     start_ms: Option<u32>,
 }
@@ -98,7 +99,7 @@ impl StrokeBuilder {
             width_cfg: cfg.width,
             min_sample_dist: cfg.min_sample_dist,
             points: Vec::new(),
-            total_damage: Rect::empty(),
+            smoothed: Vec::new(),
             start_ms: None,
         }
     }
@@ -108,13 +109,87 @@ impl StrokeBuilder {
         self.width_cfg.width_for(self.base_width, pressure) * 0.5
     }
 
-    /// Smooth and (maybe) append a sample. Returns the incremental damage rect
-    /// if a point was actually added, else `None`.
+    /// Inflate a centre-line bbox of `pts` by the local half-width + AA margin.
+    fn damage_for_points(&self, pts: &[Point]) -> Rect {
+        let mut seg = Rect::empty();
+        let mut hw = 0.0_f32;
+        for p in pts {
+            seg.union_point(p.x, p.y);
+            hw = hw.max(self.half_width(p.pressure));
+        }
+        seg.inflate(hw + 1.0)
+    }
+
+    /// Append span samples to `smoothed`, skipping a duplicate join with the
+    /// previous tip.
+    fn append_smoothed(&mut self, pts: &[Point]) {
+        for p in pts {
+            if let Some(last) = self.smoothed.last() {
+                if (last.x - p.x).abs() < 1e-6 && (last.y - p.y).abs() < 1e-6 {
+                    continue;
+                }
+            }
+            self.smoothed.push(*p);
+        }
+    }
+
+    /// Emit the Catmull-Rom span that became available when control index
+    /// `i+1` arrived: span `i-1 → i` with window `(p_{i-2}, p_{i-1}, p_i, p_{i+1})`.
+    ///
+    /// Call after a push that leaves `points.len() >= 3`. Returns the newly
+    /// emitted spline points (excluding the join at the span start).
+    fn emit_span_for_lookbehind(&mut self) -> Vec<Point> {
+        let n = self.points.len();
+        debug_assert!(n >= 3);
+        // i+1 = n-1 ⇒ i = n-2; span (i-1)→i = (n-3)→(n-2).
+        let i = n - 2;
+        let p1 = self.points[i - 1];
+        let p2 = self.points[i];
+        let p3 = self.points[i + 1];
+        let p0 = if i >= 2 {
+            self.points[i - 2]
+        } else {
+            p1 // duplicate endpoint when i-2 is missing
+        };
+        let segs = adaptive_span_segments(&p1, &p2);
+        let span = catmull_rom_span(&p0, &p1, &p2, &p3, segs);
+        self.append_smoothed(&span);
+        span
+    }
+
+    /// Emit the final open span from the penultimate control to the tip, with
+    /// the tip duplicated as the look-ahead neighbour.
+    fn emit_final_tip_span(&mut self) -> Vec<Point> {
+        let n = self.points.len();
+        if n < 2 {
+            return Vec::new();
+        }
+        let p1 = self.points[n - 2];
+        let p2 = self.points[n - 1];
+        let p3 = p2; // duplicate tip
+        let p0 = if n >= 3 {
+            self.points[n - 3]
+        } else {
+            p1 // duplicate for a 2-point stroke
+        };
+        let segs = adaptive_span_segments(&p1, &p2);
+        let span = catmull_rom_span(&p0, &p1, &p2, &p3, segs);
+        self.append_smoothed(&span);
+        span
+    }
+
+    /// Smooth and (maybe) append a sample. Returns newly emitted spline points
+    /// and their damage when a Catmull-Rom span became available.
     ///
     /// When `anchor` is set (PenDown / PenUp), the raw position is used instead
     /// of the filtered one so the stroke begins and ends exactly where the pen
     /// touched and lifted — the One-Euro filter otherwise lags the endpoints.
-    fn push_sample(&mut self, s: &PenSample, t_ms: u32, anchor: bool) -> Option<Rect> {
+    fn push_sample(
+        &mut self,
+        s: &PenSample,
+        t_ms: u32,
+        anchor: bool,
+    ) -> Option<(Vec<Point>, Rect)> {
         let start = *self.start_ms.get_or_insert(t_ms);
         let rel_ms = t_ms.saturating_sub(start);
 
@@ -142,45 +217,39 @@ impl StrokeBuilder {
             }
         }
 
-        // Incremental damage: bbox of the segment from prev -> new, inflated by
-        // the larger of the two half-widths so the brush is fully covered.
-        let mut seg = Rect::empty();
-        if let Some(prev) = self.points.last() {
-            seg.union_point(prev.x, prev.y);
-        }
-        seg.union_point(new.x, new.y);
-
-        let hw = self
-            .points
-            .last()
-            .map(|p| self.half_width(p.pressure))
-            .unwrap_or(0.0)
-            .max(self.half_width(new.pressure));
-        let damage = seg.inflate(hw + 1.0); // +1 px anti-alias margin
-
         self.points.push(new);
-        self.total_damage = self.total_damage.union(&damage);
-        Some(damage)
+
+        // Seed the smoothed polyline with the first control so live tip and
+        // Finished stroke share the same start.
+        if self.points.len() == 1 {
+            self.smoothed.push(new);
+            return None;
+        }
+
+        // A span i-1→i needs look-ahead i+1 ⇒ at least 3 controls.
+        if self.points.len() < 3 {
+            return None;
+        }
+
+        let emitted = self.emit_span_for_lookbehind();
+        if emitted.is_empty() {
+            return None;
+        }
+        let damage = self.damage_for_points(&emitted);
+        Some((emitted, damage))
     }
 
-    /// Finalise into a [`Stroke`], applying Catmull-Rom smoothing.
-    fn finish(self, spline_segments: usize) -> Stroke {
-        let smoothed = catmull_rom(&self.points, spline_segments);
+    /// Finalise into a [`Stroke`] from the already-built smoothed polyline.
+    fn finish(self) -> Stroke {
         Stroke {
             id: crate::model::StrokeId::new(),
             tool: self.tool,
             color: self.color,
             base_width: self.base_width,
-            points: smoothed,
+            points: self.smoothed,
             t0_ms: self.start_ms.map(u64::from).unwrap_or(0),
         }
     }
-}
-
-/// Damage covering a finished stroke: raw-sample union plus the smoothed
-/// centre-line bbox (Catmull-Rom can overshoot the sample polyline).
-fn finished_stroke_damage(sample_union: Rect, stroke: &Stroke) -> Rect {
-    sample_union.union(&stroke.approx_bbox())
 }
 
 /// The ink engine. Feed it [`InputEvent`]s; it emits [`InkUpdate`]s.
@@ -205,12 +274,18 @@ impl InkEngine {
         self.active.is_some()
     }
 
-    /// Last accepted (One-Euro-smoothed) point of the in-progress stroke.
+    /// Last accepted smoothed (Catmull-Rom) point of the in-progress stroke,
+    /// falling back to the last control point when no span has been emitted yet.
     ///
     /// Callers should stamp this — not the raw `PenSample` — into the live
     /// ink layer so preview damage and tip position match the engine.
     pub fn last_point(&self) -> Option<Point> {
-        self.active.as_ref().and_then(|b| b.points.last().copied())
+        self.active.as_ref().and_then(|b| {
+            b.smoothed
+                .last()
+                .copied()
+                .or_else(|| b.points.last().copied())
+        })
     }
 
     /// Read-only access to the engine's current configuration.
@@ -243,7 +318,7 @@ impl InkEngine {
             }
             InputEvent::PenMove(s) => match self.active.as_mut() {
                 Some(b) => match b.push_sample(s, t_ms, false) {
-                    Some(damage) => InkUpdate::Extended { damage },
+                    Some((points, damage)) => InkUpdate::Extended { points, damage },
                     None => InkUpdate::Idle,
                 },
                 None => InkUpdate::Idle, // move without down: ignore
@@ -261,10 +336,30 @@ impl InkEngine {
                             tip.pressure = 0.5;
                         }
                     }
-                    let _ = b.push_sample(&tip, t_ms, true);
-                    let sample_union = b.total_damage;
-                    let stroke = b.finish(self.cfg.spline_segments);
-                    let damage = finished_stroke_damage(sample_union, &stroke);
+
+                    // Push tip anchor; may emit the lookbehind span that tip unlocks.
+                    // Finished damage is the union of every span emitted at PenUp
+                    // (lookbehind + final tip) — tip-local, not the full stroke.
+                    let mut tip_damage = Rect::empty();
+                    if let Some((_pts, dmg)) = b.push_sample(&tip, t_ms, true) {
+                        tip_damage = tip_damage.union(&dmg);
+                    }
+
+                    // Emit the final open span through the tip.
+                    let final_span = b.emit_final_tip_span();
+                    if !final_span.is_empty() {
+                        tip_damage = tip_damage.union(&b.damage_for_points(&final_span));
+                    }
+
+                    // Degenerate tap: no span emitted — damage the tip itself.
+                    if tip_damage.is_empty() {
+                        if let Some(p) = b.smoothed.last().or_else(|| b.points.last()) {
+                            tip_damage = b.damage_for_points(std::slice::from_ref(p));
+                        }
+                    }
+
+                    let damage = tip_damage;
+                    let stroke = b.finish();
                     InkUpdate::Finished {
                         stroke: Box::new(stroke),
                         damage,
@@ -415,15 +510,11 @@ mod tests {
 
         // Reference bbox: the smoothed stroke centre-line inflated by the
         // maximum possible half-width plus the engine's AA margin. Every damage
-        // rect (which is derived from the raw pre-smoothing samples) must fall
-        // within this region.
+        // rect must fall within this region.
         let mut bbox = Rect::empty();
         for p in &stroke.points {
             bbox.union_point(p.x, p.y);
         }
-        // The raw samples can lie slightly outside the smoothed bbox and the
-        // spline can overshoot, so use a generous but bounded margin derived
-        // from the width config's largest width.
         let max_half = cfg.width.width_for(cfg.base_width, 1.0) * 0.5 + 2.0;
         let allowed = bbox.inflate(max_half + 4.0);
 
@@ -431,7 +522,7 @@ mod tests {
         let mut saw = false;
         for u in &updates {
             let d = match u {
-                InkUpdate::Extended { damage } => Some(*damage),
+                InkUpdate::Extended { damage, .. } => Some(*damage),
                 InkUpdate::Finished { damage, .. } => Some(*damage),
                 _ => None,
             };
@@ -459,14 +550,13 @@ mod tests {
 
     #[test]
     fn damage_union_equals_builder_total_damage() {
-        // Independent check that the running union tracked internally matches the
-        // union we recompute from the reported rects.
+        // Independent check that the union of reported rects stays bounded.
         let coords = diagonal(8);
         let (updates, _stroke) = drive(&coords, 0.5);
         let mut union = Rect::empty();
         for u in &updates {
             match u {
-                InkUpdate::Extended { damage } => union = union.union(damage),
+                InkUpdate::Extended { damage, .. } => union = union.union(damage),
                 InkUpdate::Finished { damage, .. } => union = union.union(damage),
                 _ => {}
             }
@@ -480,22 +570,88 @@ mod tests {
     }
 
     #[test]
-    fn finished_damage_covers_full_smoothed_stroke() {
-        // PenUp must damage the whole stroke, not just the tip segment — otherwise
-        // the committed Catmull-Rom raster never presents outside the tip.
+    fn finished_damage_is_last_span_only() {
+        // PenUp damage must be ≤ the last-span inflated bbox — not the whole
+        // stroke — so e-ink Fast refresh stays tip-local.
         let coords = diagonal(12);
+        let cfg = InkConfig::default();
         let (updates, stroke) = drive(&coords, 0.5);
         let InkUpdate::Finished { damage, .. } = updates.last().unwrap() else {
             panic!("expected Finished");
         };
-        let need = stroke.approx_bbox();
+
+        // Reconstruct an upper bound on the last-span bbox from the finished
+        // polyline: take a trailing window of points and inflate generously.
+        let n = stroke.points.len();
+        let take = n.clamp(2, 16);
+        let mut last_span = Rect::empty();
+        for p in &stroke.points[n.saturating_sub(take)..] {
+            last_span.union_point(p.x, p.y);
+        }
+        let max_half = cfg.width.width_for(cfg.base_width, 1.0) * 0.5 + 1.0;
+        let allowed = last_span.inflate(max_half + 4.0);
+
         assert!(
-            damage.min_x <= need.min_x + 1e-3
-                && damage.min_y <= need.min_y + 1e-3
-                && damage.max_x >= need.max_x - 1e-3
-                && damage.max_y >= need.max_y - 1e-3,
-            "Finished damage {damage:?} must cover stroke bbox {need:?}"
+            damage.width() <= allowed.width() + 1e-3 && damage.height() <= allowed.height() + 1e-3,
+            "Finished damage {damage:?} must fit last-span bound {allowed:?}"
         );
+        // And must be much smaller than the full stroke.
+        let full = stroke.approx_bbox().inflate(max_half);
+        assert!(
+            damage.width() * damage.height() < full.width() * full.height() * 0.5
+                || stroke.points.len() < 8,
+            "Finished damage {damage:?} should be << full stroke {full:?}"
+        );
+    }
+
+    #[test]
+    fn extended_points_accumulate_to_finished_stroke() {
+        // Live Extended points plus the Started seed must equal Finished.points
+        // (the spline is built once, not twice at PenUp).
+        let coords = diagonal(10);
+        let (updates, stroke) = drive(&coords, 0.5);
+
+        let mut live: Vec<Point> = Vec::new();
+        // Started seeds the first control into smoothed; recover it from the
+        // finished stroke's first point (same seed).
+        if let Some(first) = stroke.points.first() {
+            live.push(*first);
+        }
+        for u in &updates {
+            if let InkUpdate::Extended { points, .. } = u {
+                for p in points {
+                    if live
+                        .last()
+                        .is_some_and(|l| (l.x - p.x).abs() < 1e-6 && (l.y - p.y).abs() < 1e-6)
+                    {
+                        continue;
+                    }
+                    live.push(*p);
+                }
+            }
+        }
+        // Finished also emits the final tip span — those points are not in any
+        // Extended. Compare the Extended prefix against stroke.points.
+        assert!(
+            live.len() <= stroke.points.len(),
+            "live prefix {} longer than finished {}",
+            live.len(),
+            stroke.points.len()
+        );
+        for (i, (a, b)) in live.iter().zip(stroke.points.iter()).enumerate() {
+            assert!(
+                (a.x - b.x).abs() < 1e-3 && (a.y - b.y).abs() < 1e-3,
+                "mismatch at {i}: live={a:?} finished={b:?}"
+            );
+        }
+        // Finished must continue from the live prefix through the tip.
+        assert_eq!(
+            live.first().map(|p| (p.x, p.y)),
+            stroke.points.first().map(|p| (p.x, p.y))
+        );
+        let tip = stroke.points.last().unwrap();
+        let raw_last = *coords.last().unwrap();
+        assert!((tip.x - raw_last.0).abs() < 1e-4 && (tip.y - raw_last.1).abs() < 1e-4);
     }
 
     #[test]
@@ -506,11 +662,16 @@ mod tests {
             engine.update_now(&InputEvent::PenDown(sample(0.0, 0.0, 0.7))),
             InkUpdate::Started
         ));
+        // Need enough travel for a span to form before PenUp.
         assert!(matches!(
             engine.update_now(&InputEvent::PenMove(sample(20.0, 0.0, 0.7))),
-            InkUpdate::Extended { .. }
+            InkUpdate::Idle | InkUpdate::Extended { .. }
         ));
-        match engine.update_now(&InputEvent::PenUp(sample(40.0, 0.0, 0.0))) {
+        assert!(matches!(
+            engine.update_now(&InputEvent::PenMove(sample(40.0, 0.0, 0.7))),
+            InkUpdate::Idle | InkUpdate::Extended { .. }
+        ));
+        match engine.update_now(&InputEvent::PenUp(sample(60.0, 0.0, 0.0))) {
             InkUpdate::Finished { stroke, .. } => {
                 let tip = stroke.points.last().unwrap();
                 assert!(

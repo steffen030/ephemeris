@@ -5,26 +5,28 @@ use ephemeris_core::model::Tool;
 use ephemeris_core::profile_manager::ProfileManager;
 use ephemeris_core::{
     count_lane, export_raster_pages_to_pdf, filter_agenda, format_note_title, is_stale,
-    list_engage, mark_reviewed, markdown_to_blocks, markdown_to_plain, resolve_lane, review_queue,
-    search_events, search_local_notes, search_tasks, set_lane_tag, strip_inline_markdown,
-    sync_notes_to_vault, sync_tags_from_structured, to_agenda_entries, AgendaRange, CalendarEvent,
-    CascadingTranscriber, Config, EngageFilter, EventId, LineImageHtrTranscriber,
-    MarkdownTaskExtractor, PdfExportOptions, ProfileId, RasterOcrTranscriber, RasterPage,
-    SearchHit, StrokeHtrTranscriber, Task, TaskContext, TaskContextKind, TaskId, TaskPriority,
-    TaskProvider, VaultFtsIndex, VaultNoteExport,
+    list_engage, load_merged_htr_lexicon, lower_thread_nice_priority, mark_reviewed,
+    markdown_to_blocks, markdown_to_plain, recognition_model_version, resolve_lane, review_queue,
+    search_events, search_local_notes, search_tasks, set_lane_tag, spawn_user_lexicon_refresh,
+    strip_inline_markdown, sync_notes_to_vault, sync_tags_from_structured, to_agenda_entries,
+    AgendaRange, BgRecogIdle, CalendarEvent, CascadingTranscriber, Config, EngageFilter, EventId,
+    LineImageHtrTranscriber, MarkdownTaskExtractor, PageRecognitionCache, PdfExportOptions,
+    ProfileId, RasterOcrTranscriber, RasterPage, SearchHit, SharedHtrLexicon, StrokeHtrTranscriber,
+    Task, TaskContext, TaskContextKind, TaskId, TaskPriority, TaskProvider, UserLexiconSources,
+    VaultFtsIndex, VaultNoteExport, BG_RECOG_IDLE_DELAY, RECOGNITION_CACHE_FORMAT,
 };
 #[cfg(target_os = "linux")]
 use ephemeris_pal::input::{EvdevPenSource, PenTarget};
 use ephemeris_pal::input::{InputEvent, PenSample};
 use slint::{Global, Model};
 use std::cell::{Cell, RefCell};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
-    Arc, Mutex, OnceLock,
+    Arc, Mutex, OnceLock, RwLock,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Runtime;
@@ -35,6 +37,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::WindowId;
 
 use ephemeris_pal::display::{kiosk_enabled, DesktopWindow};
+use ephemeris_pal::InkLatencyTrace;
 use ephemeris_ui::EphemerisUi;
 
 /// Top-edge band (UI logical px) used to detect a swipe-down that reveals the
@@ -52,6 +55,169 @@ const VAULT_EXPORT_BATCH_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// Coalesce local page `.bin` / strokes JSON writes so rapid strokes do not
 /// stall the UI thread on flash I/O. Leave-note still flushes synchronously.
 const LOCAL_PAGE_WRITE_DEBOUNCE: Duration = Duration::from_millis(400);
+
+/// Completed background per-line recognition (drained on the UI thread).
+struct BgRecogJobResult {
+    note_id: u32,
+    doc_page: usize,
+    cache: PageRecognitionCache,
+}
+
+/// Single low-priority worker for idle per-line recognition (ephemeris-ktg.12).
+///
+/// Armed ≥ [`BG_RECOG_IDLE_DELAY`] after PenUp; cancelled on PenDown; never while
+/// drawing. Results land in [`Self::result`] for `about_to_wait` to apply.
+struct BackgroundRecogQueue {
+    idle: RefCell<BgRecogIdle>,
+    cancel: Arc<AtomicBool>,
+    active: Arc<AtomicBool>,
+    result: Arc<Mutex<Option<BgRecogJobResult>>>,
+    /// In-memory page caches; disk is source of truth across restarts.
+    caches: RefCell<HashMap<(u32, usize), PageRecognitionCache>>,
+}
+
+impl BackgroundRecogQueue {
+    fn new() -> Self {
+        Self {
+            idle: RefCell::new(BgRecogIdle::new(BG_RECOG_IDLE_DELAY)),
+            cancel: Arc::new(AtomicBool::new(false)),
+            active: Arc::new(AtomicBool::new(false)),
+            result: Arc::new(Mutex::new(None)),
+            caches: RefCell::new(HashMap::new()),
+        }
+    }
+
+    fn on_pen_down(&self) {
+        self.cancel.store(true, Ordering::Release);
+        self.idle.borrow_mut().on_pen_down();
+    }
+
+    fn on_pen_up(&self) {
+        self.cancel.store(false, Ordering::Release);
+        self.idle.borrow_mut().on_pen_up(Instant::now());
+    }
+
+    fn set_drawing(&self, drawing: bool) {
+        self.cancel.store(drawing, Ordering::Release);
+        self.idle.borrow_mut().set_drawing(drawing);
+    }
+
+    fn has_pending_work(&self) -> bool {
+        self.active.load(Ordering::Relaxed)
+            || self.result.lock().map(|g| g.is_some()).unwrap_or(false)
+            || self.idle.borrow().should_run(Instant::now())
+    }
+
+    fn get_or_load(
+        &self,
+        data_dir: &Path,
+        note_id: u32,
+        doc_page: usize,
+        model_version: &str,
+    ) -> PageRecognitionCache {
+        if let Some(c) = self.caches.borrow().get(&(note_id, doc_page)) {
+            return c.clone();
+        }
+        let loaded = PageRecognitionCache::load(data_dir, note_id, doc_page)
+            .unwrap_or_else(|| PageRecognitionCache::new(model_version));
+        self.caches
+            .borrow_mut()
+            .insert((note_id, doc_page), loaded.clone());
+        loaded
+    }
+
+    fn store(&self, note_id: u32, doc_page: usize, cache: PageRecognitionCache) {
+        self.caches.borrow_mut().insert((note_id, doc_page), cache);
+    }
+
+    fn drop_note(&self, note_id: u32, doc_page_count: usize) {
+        let mut caches = self.caches.borrow_mut();
+        for p in 0..doc_page_count.max(1) {
+            caches.remove(&(note_id, p));
+        }
+    }
+
+    /// Start recognition for a page when idle (or `force`, e.g. See-text open).
+    #[allow(clippy::too_many_arguments)]
+    fn try_spawn(
+        &self,
+        force: bool,
+        config: &Config,
+        data_dir: &Path,
+        note_id: u32,
+        doc_page: usize,
+        strokes: Vec<ephemeris_core::Stroke>,
+        ruling_pitch: Option<f32>,
+    ) -> bool {
+        // Never compete with live ink (force = See-text still waits for pen up).
+        if self.idle.borrow().is_drawing() {
+            return false;
+        }
+        if !force && !self.idle.borrow().should_run(Instant::now()) {
+            return false;
+        }
+        let version = recognition_model_version_for(config);
+        let mut cache = self.get_or_load(data_dir, note_id, doc_page, &version);
+        cache.sync_strokes(&strokes, ruling_pitch, &version);
+        if !cache.has_pending() {
+            self.store(note_id, doc_page, cache);
+            self.idle.borrow_mut().clear_arm();
+            return false;
+        }
+        if self
+            .active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return false;
+        }
+        self.idle.borrow_mut().clear_arm();
+        self.cancel.store(false, Ordering::Release);
+        let cancel = Arc::clone(&self.cancel);
+        let active = Arc::clone(&self.active);
+        let mailbox = Arc::clone(&self.result);
+        let data_dir = data_dir.to_path_buf();
+        let config = config.clone();
+        std::thread::spawn(move || {
+            lower_thread_nice_priority();
+            let cascade = build_cascading_transcriber(&config);
+            let cancel_fn = || cancel.load(Ordering::Acquire);
+            let _ = cache.recognise_pending(&strokes, ruling_pitch, &cancel_fn, |line, idx| {
+                cascade.transcribe_line(line, idx)
+            });
+            if let Err(e) = cache.save(&data_dir, note_id, doc_page) {
+                tracing::warn!("Failed to save recognition cache for note {note_id}: {e}");
+            }
+            if let Ok(mut guard) = mailbox.lock() {
+                *guard = Some(BgRecogJobResult {
+                    note_id,
+                    doc_page,
+                    cache,
+                });
+            }
+            active.store(false, Ordering::Release);
+        });
+        true
+    }
+}
+
+fn recognition_model_version_for(config: &Config) -> String {
+    recognition_model_version(
+        RECOGNITION_CACHE_FORMAT,
+        config.handwriting_language.as_str(),
+        "cascade",
+        config.ocr_enabled,
+    )
+}
+
+fn note_ruling_pitch(ui: &EphemerisUi) -> Option<f32> {
+    match ui.current_page_template() {
+        ephemeris_core::PageTemplate::Blank => None,
+        ephemeris_core::PageTemplate::Lines
+        | ephemeris_core::PageTemplate::Grid
+        | ephemeris_core::PageTemplate::Dot => Some(ephemeris_core::LINED_TEMPLATE_PITCH),
+    }
+}
 
 /// Coalesces vault OCR/PDF export so it never runs on the ink hot path.
 ///
@@ -287,17 +453,6 @@ impl LocalPageWriteQueue {
             save_note_page_strokes(&self.data_dir, job.note_id, job.doc_page, &job.strokes);
         }
     }
-}
-
-/// Completed See-text recognition job (drained on the UI thread).
-struct SeeTextJobResult {
-    /// Generation counter — ignore if the overlay was closed/re-opened.
-    gen: u64,
-    note_id: Option<u32>,
-    display: String,
-    /// `Some(text)` replaces stored transcription; `None` keeps the prior value
-    /// (empty/failed passes must not wipe a previous good result).
-    persist: Option<String>,
 }
 
 /// Wakes the event loop when the Linux evdev pen thread has samples ready.
@@ -624,6 +779,30 @@ impl App {
             .borrow_mut()
             .extend(load_local_events(&data_dir));
 
+        // User HTR lexicon from vault / tasks / calendar (background, ≤ daily).
+        {
+            let vault_paths = {
+                let indexed = vault_fts_paths.borrow().clone();
+                if !indexed.is_empty() {
+                    indexed
+                } else {
+                    config
+                        .borrow()
+                        .vault_path
+                        .clone()
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                }
+            };
+            start_user_htr_lexicon_refresh(
+                &data_dir,
+                &config.borrow(),
+                &vault_paths,
+                &tasks.borrow(),
+                &calendar_events.borrow(),
+            );
+        }
+
         let (init_notes, init_notebooks, note_seq_init, notebook_seq_init) =
             match load_notes_index(&data_dir) {
                 Some(idx) => (
@@ -679,6 +858,8 @@ impl App {
         // Debounced local page .bin / strokes JSON writes.
         let local_page_writes: Rc<LocalPageWriteQueue> =
             Rc::new(LocalPageWriteQueue::new(data_dir.clone()));
+        // Idle per-line HTR cache + low-priority background worker (ktg.12).
+        let bg_recog: Rc<BackgroundRecogQueue> = Rc::new(BackgroundRecogQueue::new());
 
         // Restore ink pixels + stroke lists for all known notes (current doc page).
         for note in notes.borrow().iter() {
@@ -722,9 +903,7 @@ impl App {
         let line_htr_download_result: Arc<Mutex<Option<Result<(), String>>>> =
             Arc::new(Mutex::new(None));
         let line_htr_download_active = Arc::new(AtomicBool::new(false));
-        // See-text OCR/HTR results drained on the UI thread (never block toggle).
-        let see_text_result: Arc<Mutex<Option<SeeTextJobResult>>> = Arc::new(Mutex::new(None));
-        let see_text_active = Arc::new(AtomicBool::new(false));
+        // See-text overlay generation — bump on open/close so stale UI updates drop.
         let see_text_gen = Arc::new(AtomicU64::new(0));
         // Completed CalDAV sync batches waiting to merge into the agenda.
         let caldav_pending: Arc<Mutex<Vec<CalendarEvent>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1398,6 +1577,7 @@ impl App {
             let data_dir2 = data_dir.clone();
             let cfg2 = config.clone();
             let vault_ex = vault_export.clone();
+            let bg_del = bg_recog.clone();
             let push_del = push_notebooks.clone();
             let ui2 = ui.clone_component();
             ui.on_note_delete_tapped(move |id| {
@@ -1413,6 +1593,7 @@ impl App {
                     .unwrap_or(1);
                 notes2.borrow_mut().retain(|n| n.id != id_u32);
                 delete_note_page_files(&data_dir2, id_u32, page_count);
+                bg_del.drop_note(id_u32, page_count);
                 if ui2.get_active_note_id().as_str() == id.as_str() {
                     ui2.set_active_note_id("".into());
                 }
@@ -1438,6 +1619,7 @@ impl App {
             let data_dir2 = data_dir.clone();
             let cfg2 = config.clone();
             let vault_ex = vault_export.clone();
+            let bg_del = bg_recog.clone();
             let active_nb2 = active_notebook_id.clone();
             let push_del = push_notebooks.clone();
             let ui2 = ui.clone_component();
@@ -1469,6 +1651,7 @@ impl App {
                     .retain(|n| !doomed_notes.contains(&n.id));
                 for (nid, count) in doomed_counts {
                     delete_note_page_files(&data_dir2, nid, count);
+                    bg_del.drop_note(nid, count);
                 }
                 notebooks2
                     .borrow_mut()
@@ -1634,87 +1817,70 @@ impl App {
             });
         }
 
-        // ── See-text toggle (OCR / transcript overlay) ───────────────────────
+        // ── See-text toggle (cached text instantly; pending lines marked) ─────
         {
             let ui_rc = ui.clone();
             let ui2 = ui.clone_component();
             let cfg2 = config.clone();
-            let mailbox = see_text_result.clone();
-            let active_flag = see_text_active.clone();
             let gen_counter = see_text_gen.clone();
             let notes_prior = notes.clone();
+            let bg = bg_recog.clone();
+            let data_dir_st = data_dir.clone();
             ui.on_note_see_text_toggled(move |show| {
                 if show {
-                    // Invalidate any in-flight job; show placeholder immediately
-                    // so the UI stays responsive while HTR/OCR run off-thread.
                     let gen = gen_counter.fetch_add(1, Ordering::AcqRel) + 1;
-                    active_flag.store(true, Ordering::Release);
-                    ui_rc.set_note_text_content("Recognising…");
-
+                    let _ = gen; // generation still bumps so close discards stale UI pushes
                     let active_id = ui2.get_active_note_id().to_string();
                     let note_id = active_id.parse::<u32>().ok();
-                    let prior_text = note_id.and_then(|id| {
+                    let doc_page = note_id.and_then(|id| {
                         notes_prior
                             .borrow()
                             .iter()
                             .find(|n| n.id == id)
-                            .and_then(|n| n.text_content.clone())
+                            .map(|n| n.doc_page)
                     });
-                    let logical = ui_rc.canvas_size();
-                    let raster = ui_rc.get_committed_pixels_arc();
+                    let version = recognition_model_version_for(&cfg2.borrow());
                     let strokes = ui_rc.get_page_strokes();
-                    let cascade = build_cascading_transcriber(&cfg2.borrow());
-                    let mailbox2 = mailbox.clone();
-                    let active2 = active_flag.clone();
-
-                    std::thread::spawn(move || {
-                        let htr_hint = cascade.htr.empty_result_hint();
-                        let ocr_hint = cascade.ocr.empty_result_hint();
-                        let htr_ready = cascade.htr.model_available();
-                        let input = transcription_raster(&raster, logical);
-                        let (display, persist) = match cascade.transcribe_page(
-                            &strokes,
-                            input.width,
-                            input.height,
-                            &input.data,
-                        ) {
-                            Ok(spans) => {
-                                let joined = RasterOcrTranscriber::spans_to_text(&spans);
-                                if joined.is_empty() {
-                                    let hint = if !strokes.is_empty() && !htr_ready {
-                                        htr_hint
-                                    } else {
-                                        ocr_hint
-                                    };
-                                    // Keep last good transcription — never wipe on empty.
-                                    match prior_text {
-                                        Some(prev) if !prev.is_empty() => (prev, None),
-                                        _ => (hint, None),
-                                    }
-                                } else {
-                                    (joined.clone(), Some(joined))
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!("See-text transcription failed: {e}");
-                                match prior_text {
-                                    Some(prev) if !prev.is_empty() => (prev, None),
-                                    _ => (format!("Transcription failed: {e}"), None),
-                                }
-                            }
-                        };
-                        if let Ok(mut guard) = mailbox2.lock() {
-                            *guard = Some(SeeTextJobResult {
-                                gen,
-                                note_id,
-                                display,
-                                persist,
-                            });
+                    let ruling = note_ruling_pitch(&ui_rc);
+                    let display = if let (Some(nid), Some(page)) = (note_id, doc_page) {
+                        let mut cache = bg.get_or_load(&data_dir_st, nid, page, &version);
+                        cache.sync_strokes(&strokes, ruling, &version);
+                        let text = cache.display_text();
+                        let pending = cache.has_pending();
+                        bg.store(nid, page, cache);
+                        if pending {
+                            // Kick low-priority worker immediately (still blocked while drawing).
+                            bg.try_spawn(
+                                true,
+                                &cfg2.borrow(),
+                                &data_dir_st,
+                                nid,
+                                page,
+                                strokes,
+                                ruling,
+                            );
                         }
-                        active2.store(false, Ordering::Release);
-                    });
+                        if text.is_empty() {
+                            if pending {
+                                "Recognising…".to_string()
+                            } else {
+                                notes_prior
+                                    .borrow()
+                                    .iter()
+                                    .find(|n| n.id == nid)
+                                    .and_then(|n| n.text_content.clone())
+                                    .filter(|t| !t.is_empty())
+                                    .unwrap_or_else(|| "No text recognised yet.".into())
+                            }
+                        } else {
+                            text
+                        }
+                    } else {
+                        "No active note.".into()
+                    };
+                    ui_rc.set_note_text_content(&display);
                 } else {
-                    // Discard late results from a cancelled overlay.
+                    // Discard late See-text overlay updates from a closed view.
                     gen_counter.fetch_add(1, Ordering::AcqRel);
                 }
                 // Force a clear refresh so ink disappears under see-text (or
@@ -2816,6 +2982,13 @@ impl App {
                 ui2.set_active_tool(tool.into());
             });
         }
+        // ── Burger Thin / Med / Thick → pen base_width ────────────────────────
+        {
+            let ui_rc = ui.clone();
+            ui.on_pen_width_selected(move |label| {
+                ui_rc.set_pen_width(&label);
+            });
+        }
 
         // ── Start-page "All Tasks" button → task view ─────────────────────────
         {
@@ -3894,6 +4067,8 @@ impl App {
                 ui2.set_whisper_model_installed(find_whisper_model().is_some());
                 ui2.set_htr_model_installed(find_htr_model_installed(&cfg));
                 ui2.set_line_htr_model_installed(find_line_htr_model_installed(&cfg));
+                ui2.set_settings_handwriting_lang(cfg.handwriting_language.as_str().into());
+                ui2.set_settings_ocr_enabled(cfg.ocr_enabled);
                 push_settings_task_lanes(&ui2, &cfg);
                 ui2.set_settings_staleness_days(cfg.task_engage.staleness_days as i32);
                 ui2.set_settings_context_presets(
@@ -4512,6 +4687,12 @@ impl App {
                 new_cfg.theme = theme.to_string();
                 new_cfg.pen_only_drawing = pen_only;
                 new_cfg.note_title_pattern = note_title_pattern;
+                new_cfg.ocr_enabled = ui2.get_settings_ocr_enabled();
+                if let Some(lang) = ephemeris_core::HandwritingLanguage::parse(
+                    ui2.get_settings_handwriting_lang().as_str(),
+                ) {
+                    new_cfg.handwriting_language = lang;
+                }
                 new_cfg.vault_path = if vault_str.is_empty() {
                     None
                 } else {
@@ -5111,6 +5292,8 @@ impl App {
             pointer_source: PointerSource::Mouse,
             is_drawing: false,
             redraw_pending: false,
+            ink_trace: InkLatencyTrace::new(),
+            pen_ink_skip_slint: false,
             last_ink_pressure: 0.5,
             data_dir,
             notes: notes.clone(),
@@ -5135,9 +5318,7 @@ impl App {
             htr_download_active,
             line_htr_download_result,
             line_htr_download_active,
-            see_text_result,
-            see_text_active,
-            see_text_gen,
+            bg_recog: bg_recog.clone(),
             caldav_pending,
             caldav_active,
             calendar_events: calendar_events.clone(),
@@ -5221,6 +5402,10 @@ struct WinitHandler {
     /// Wayland `buffer_mut` blocks until the back buffer is released; per-sample
     /// `request_redraw` wedges the UI thread on PineNote (force-quit dialog).
     redraw_pending: bool,
+    /// End-to-end sample→present timings when `EPHEMERIS_INK_TRACE=1`.
+    ink_trace: InkLatencyTrace,
+    /// Skip Slint press/release for the current pen ink stroke (canvas fast path).
+    pen_ink_skip_slint: bool,
     /// Last contact pressure while drawing — PenUp often reports 0 and would
     /// otherwise collapse stroke tip width via Catmull-Rom.
     last_ink_pressure: f32,
@@ -5264,12 +5449,8 @@ struct WinitHandler {
     line_htr_download_result: Arc<Mutex<Option<Result<(), String>>>>,
     /// True while a line-image HTR download thread is running.
     line_htr_download_active: Arc<AtomicBool>,
-    /// Completed See-text recognition waiting to apply on the UI thread.
-    see_text_result: Arc<Mutex<Option<SeeTextJobResult>>>,
-    /// True while a See-text HTR/OCR worker is running.
-    see_text_active: Arc<AtomicBool>,
-    /// Bumped on each See-text open/close so stale jobs are ignored.
-    see_text_gen: Arc<AtomicU64>,
+    /// Idle per-line recognition cache + low-priority worker (ktg.12).
+    bg_recog: Rc<BackgroundRecogQueue>,
     /// CalDAV events finished syncing off-thread.
     caldav_pending: Arc<Mutex<Vec<CalendarEvent>>>,
     /// True while a CalDAV sync thread is running.
@@ -5420,6 +5601,7 @@ impl WinitHandler {
             }
             let cy = ly - STATUS_BAR_H as f32;
             if cy >= 0.0 {
+                self.ink_trace.on_drained(t_us);
                 self.ui.feed_input(
                     &InputEvent::PenMove(PenSample {
                         x: lx,
@@ -5431,6 +5613,7 @@ impl WinitHandler {
                     }),
                     t_ms_from_us(t_us),
                 );
+                self.ink_trace.on_feed_done(t_us);
                 // Do not persist mid-stroke / mid-erase — sync disk I/O on every
                 // sample freezes PineNote. Persist on pointer release only.
             }
@@ -5467,6 +5650,7 @@ impl WinitHandler {
         self.cursor_pos = (lx, ly);
         self.chrome_pointer_held = true;
         self.page_swipe_handled.set(false);
+        self.pen_ink_skip_slint = false;
 
         if self.chrome_peeking && self.chrome_dismiss_armed {
             self.end_chrome_peek();
@@ -5484,31 +5668,32 @@ impl WinitHandler {
             self.chrome_swipe_start = None;
         }
 
-        // Bring the window forward so GNOME/Phosh dismisses the swipe-down panel.
+        // Bring the window forward only when unfocused — focus_window() every
+        // pen-down is a compositor activation stall on PineNote.
         if let Some(d) = &self.display {
-            d.focus();
+            d.focus_if_unfocused();
         }
-        // Reset canvas-touch gate before dispatching so we can detect whether
-        // the canvas TouchArea (vs. chrome) got this press.
-        self.canvas_touch_down.set(false);
-        let canvas_was_active = self.ui.is_canvas_active();
-        self.ui.dispatch_pointer_pressed(lx, ly);
-        let in_canvas = ly > STATUS_BAR_H as f32 && ly < ui_h as f32 - TOOLBAR_H as f32;
+
         let pen_only = self.config.borrow().pen_only_drawing;
         let allow_ink = match self.pointer_source {
             PointerSource::Pen | PointerSource::Mouse => true,
             PointerSource::Finger => !pen_only,
         };
-        if in_canvas
+
+        // Pen on the active ink plane: skip Slint press dispatch (dirties UI /
+        // can upgrade Fast→Partial). Geometry gate replaces canvas TouchArea.
+        let pen_fast = matches!(self.pointer_source, PointerSource::Pen)
             && allow_ink
             && !self.ctrl_held.get()
-            && canvas_was_active
-            && self.ui.is_canvas_active()
-            && self.canvas_touch_down.get()
-        {
+            && self.ui.hits_inkable_canvas(lx, ly);
+        if pen_fast {
+            self.pen_ink_skip_slint = true;
+            self.canvas_touch_down.set(true);
             self.is_drawing = true;
+            self.bg_recog.on_pen_down();
             self.last_ink_pressure = pressure.max(0.05);
             let cy = ly - STATUS_BAR_H as f32;
+            self.ink_trace.on_drained(t_us);
             self.ui.feed_input(
                 &InputEvent::PenDown(PenSample {
                     x: lx,
@@ -5520,6 +5705,41 @@ impl WinitHandler {
                 }),
                 t_ms_from_us(t_us),
             );
+            self.ink_trace.on_feed_done(t_us);
+            self.request_redraw_coalesced();
+            return;
+        }
+
+        // Reset canvas-touch gate before dispatching so we can detect whether
+        // the canvas TouchArea (vs. chrome) got this press.
+        self.canvas_touch_down.set(false);
+        let canvas_was_active = self.ui.is_canvas_active();
+        self.ui.dispatch_pointer_pressed(lx, ly);
+        let in_canvas = ly > STATUS_BAR_H as f32 && ly < ui_h as f32 - TOOLBAR_H as f32;
+        if in_canvas
+            && allow_ink
+            && !self.ctrl_held.get()
+            && canvas_was_active
+            && self.ui.is_canvas_active()
+            && self.canvas_touch_down.get()
+        {
+            self.is_drawing = true;
+            self.bg_recog.on_pen_down();
+            self.last_ink_pressure = pressure.max(0.05);
+            let cy = ly - STATUS_BAR_H as f32;
+            self.ink_trace.on_drained(t_us);
+            self.ui.feed_input(
+                &InputEvent::PenDown(PenSample {
+                    x: lx,
+                    y: cy,
+                    pressure,
+                    tilt: 0.0,
+                    in_range: true,
+                    t_us,
+                }),
+                t_ms_from_us(t_us),
+            );
+            self.ink_trace.on_feed_done(t_us);
         }
         self.request_redraw_coalesced();
     }
@@ -5555,17 +5775,38 @@ impl WinitHandler {
             width: w,
             height: h,
             pixels,
-            strokes,
+            strokes: strokes.clone(),
         });
         self.ui.ensure_committed_unique();
+
+        // Incremental recognition cache: invalidate only lines whose stroke ids
+        // changed — do not wipe the whole page's text_content.
+        let version = recognition_model_version_for(&self.config.borrow());
+        let ruling = note_ruling_pitch(&self.ui);
+        let mut cache = self
+            .bg_recog
+            .get_or_load(&self.data_dir, note_id, doc_page, &version);
+        cache.sync_strokes(&strokes, ruling, &version);
+        if let Err(e) = cache.save(&self.data_dir, note_id, doc_page) {
+            tracing::warn!("Failed to save recognition cache for note {note_id}: {e}");
+        }
+        let completed = cache.completed_text();
+        let display = cache.display_text();
+        let see_text_open = self.ui.clone_component().get_note_see_text();
+        self.bg_recog.store(note_id, doc_page, cache);
         if let Some(note) = self.notes.borrow_mut().iter_mut().find(|n| n.id == note_id) {
             note.updated_at = now_secs();
-            note.text_content = None;
+            note.text_content = if completed.is_empty() {
+                None
+            } else {
+                Some(completed)
+            };
         }
-        // Drop stale See-text so the next toggle re-OCRs instead of showing
-        // text from before this ink change. No-op when already empty (avoids
-        // Slint UI damage mid-ink present).
-        self.ui.set_note_text_content("");
+        // Update See-text overlay in place when open (pending markers); otherwise
+        // leave Slint alone mid-ink to avoid UI damage.
+        if see_text_open {
+            self.ui.set_note_text_content(&display);
+        }
         // Vault export waits for leave-note or the 10‑minute batch — never per stroke.
         self.vault_export.mark(note_id);
     }
@@ -5589,16 +5830,22 @@ impl WinitHandler {
             self.chrome_dismiss_armed = true;
         }
 
-        // Ensure Slint TouchArea.mouse-x/y reflect the release point before up.
-        // On PineNote, Touch Ended often arrives without a final Moved at the
-        // lift coords — without this, page-swipe delta stays under threshold.
-        self.ui.dispatch_pointer_moved(lx, ly);
-        // Dispatch release so Slint swipe callbacks can set `page_swipe_handled`
-        // before we decide whether to commit ink.
-        self.ui.dispatch_pointer_released(lx, ly);
-        if self.page_swipe_handled.get() {
+        let skip_slint = self.pen_ink_skip_slint;
+        self.pen_ink_skip_slint = false;
+
+        if !skip_slint {
+            // Ensure Slint TouchArea.mouse-x/y reflect the release point before up.
+            // On PineNote, Touch Ended often arrives without a final Moved at the
+            // lift coords — without this, page-swipe delta stays under threshold.
+            self.ui.dispatch_pointer_moved(lx, ly);
+            // Dispatch release so Slint swipe callbacks can set `page_swipe_handled`
+            // before we decide whether to commit ink.
+            self.ui.dispatch_pointer_released(lx, ly);
+        }
+        if !skip_slint && self.page_swipe_handled.get() {
             if self.is_drawing {
                 self.is_drawing = false;
+                self.bg_recog.set_drawing(false);
                 self.ui.discard_in_progress_stroke();
             }
             self.page_swipe_handled.set(false);
@@ -5610,6 +5857,7 @@ impl WinitHandler {
         if self.is_drawing {
             self.is_drawing = false;
             let cy = ly - STATUS_BAR_H as f32;
+            self.ink_trace.on_drained(t_us);
             let update = self.ui.feed_input(
                 &InputEvent::PenUp(PenSample {
                     x: lx,
@@ -5622,11 +5870,14 @@ impl WinitHandler {
                 }),
                 t_ms_from_us(t_us),
             );
+            self.ink_trace.on_feed_done(t_us);
             // Persist after pen commit / erase gesture end. Keep local disk
             // writes on the UI thread (fast) but never run vault OCR/PDF here.
             if matches!(update, InkUpdate::Finished { .. }) || self.ui.take_strokes_dirty() {
                 self.persist_note_page_and_schedule_export();
             }
+            // Arm idle background recognition (≥ 1.5 s after last PenUp).
+            self.bg_recog.on_pen_up();
         } else {
             // Clear / erase that finished without an active draw still needs save.
             self.persist_if_strokes_dirty();
@@ -5787,11 +6038,63 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
             &self.connections.borrow(),
         );
 
-        // --- Drain See-text recognition ---
-        if let Ok(mut guard) = self.see_text_result.lock() {
+        // --- Idle background per-line recognition (ktg.12) ---
+        {
+            let page_idx = self.ui.current_page_idx();
+            let note_info = self
+                .notes
+                .borrow()
+                .iter()
+                .find(|n| n.page_index == page_idx)
+                .map(|n| (n.id, n.doc_page));
+            if let Some((note_id, doc_page)) = note_info {
+                let strokes = self.ui.get_page_strokes();
+                let ruling = note_ruling_pitch(&self.ui);
+                self.bg_recog.try_spawn(
+                    false,
+                    &self.config.borrow(),
+                    &self.data_dir,
+                    note_id,
+                    doc_page,
+                    strokes,
+                    ruling,
+                );
+            }
+        }
+        if let Ok(mut guard) = self.bg_recog.result.lock() {
             if let Some(job) = guard.take() {
                 drop(guard);
-                let current_gen = self.see_text_gen.load(Ordering::Acquire);
+                let completed = job.cache.completed_text();
+                let display = job.cache.display_text();
+                self.bg_recog
+                    .store(job.note_id, job.doc_page, job.cache.clone());
+                let mut did_persist = false;
+                {
+                    let mut ns = self.notes.borrow_mut();
+                    if let Some(note) = ns.iter_mut().find(|n| n.id == job.note_id) {
+                        // Only update text when this job matches the note's current page.
+                        if note.doc_page == job.doc_page {
+                            note.text_content = if completed.is_empty() {
+                                None
+                            } else {
+                                Some(completed)
+                            };
+                            note.updated_at = now_secs();
+                            did_persist = true;
+                        }
+                    }
+                }
+                if did_persist {
+                    save_notes_index_and_sync_vault(
+                        &self.data_dir,
+                        &self.notes.borrow(),
+                        &self.notebooks.borrow(),
+                        self.note_id_seq.get(),
+                        self.notebook_id_seq.get(),
+                        &self.config.borrow(),
+                        &self.vault_export,
+                    );
+                }
                 let see_text_open = self.ui.clone_component().get_note_see_text();
                 let active_id = self
                     .ui
@@ -5800,45 +6103,16 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
                     .to_string()
                     .parse::<u32>()
                     .ok();
-                let still_relevant = see_text_open
-                    && job.gen == current_gen
-                    && match (job.note_id, active_id) {
-                        (Some(a), Some(b)) => a == b,
-                        (None, None) => true,
-                        _ => false,
-                    };
-                if still_relevant {
-                    self.ui.set_note_text_content(&job.display);
-                    if let Some(id) = job.note_id {
-                        let mut did_persist = false;
-                        {
-                            let mut ns = self.notes.borrow_mut();
-                            if let Some(note) = ns.iter_mut().find(|n| n.id == id) {
-                                if let Some(text) = job.persist {
-                                    note.text_content = Some(text);
-                                    note.updated_at = now_secs();
-                                    did_persist = true;
-                                }
-                            }
-                        }
-                        if did_persist {
-                            save_notes_index_and_sync_vault(
-                                &self.data_dir,
-                                &self.notes.borrow(),
-                                &self.notebooks.borrow(),
-                                self.note_id_seq.get(),
-                                self.notebook_id_seq.get(),
-                                &self.config.borrow(),
-                                &self.vault_export,
-                            );
-                        }
-                    }
+                if see_text_open && active_id == Some(job.note_id) {
+                    self.ui.set_note_text_content(&display);
                     self.ui.request_screen_change();
-                    // Softbuffer path only paints on RedrawRequested — without
-                    // this the overlay stays stuck on "Recognising…".
                     if let Some(d) = &self.display {
                         d.request_redraw();
                     }
+                }
+                // If pending lines remain and idle is armed, another spawn may follow.
+                if job.cache.has_pending() && !self.bg_recog.idle.borrow().is_drawing() {
+                    self.bg_recog.on_pen_up();
                 }
             }
         }
@@ -5913,12 +6187,13 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
             || self.download_active.load(Ordering::Relaxed)
             || self.htr_download_active.load(Ordering::Relaxed)
             || self.line_htr_download_active.load(Ordering::Relaxed)
-            || self.see_text_active.load(Ordering::Relaxed)
+            || self.bg_recog.active.load(Ordering::Relaxed)
+            || self.bg_recog.has_pending_work()
             || self.caldav_active.load(Ordering::Relaxed)
             || self.vault_export.active.load(Ordering::Relaxed)
             || self.local_page_writes.active.load(Ordering::Relaxed)
         {
-            // Keep waking while whisper / model download / See-text / CalDAV /
+            // Keep waking while whisper / model download / bg recog / CalDAV /
             // vault export / local page-write workers run.
             drop(h_opt);
             event_loop.set_control_flow(ControlFlow::WaitUntil(
@@ -6118,9 +6393,11 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
             WindowEvent::RedrawRequested => {
                 self.redraw_pending = false;
                 if let Some(display) = &mut self.display {
+                    let t0 = Instant::now();
                     if let Err(e) = self.ui.render_frame(display) {
                         tracing::error!("render_frame failed: {e}");
                     }
+                    self.ink_trace.on_present(t0.elapsed().as_micros() as u64);
                 }
             }
             _ => {}
@@ -6741,6 +7018,9 @@ fn resolve_htr_model_dir(config: &ephemeris_core::Config) -> PathBuf {
         .unwrap_or_else(default_htr_model_dir)
 }
 
+/// Process-wide lexicon shared by See-text / bg recog / vault export cascades.
+static SHARED_HTR_LEXICON: OnceLock<SharedHtrLexicon> = OnceLock::new();
+
 fn build_cascading_transcriber(config: &ephemeris_core::Config) -> CascadingTranscriber {
     let htr =
         StrokeHtrTranscriber::from_parts(config.htr_enabled, Some(resolve_htr_model_dir(config)));
@@ -6753,7 +7033,31 @@ fn build_cascading_transcriber(config: &ephemeris_core::Config) -> CascadingTran
         config.ocr_languages.clone(),
         config.ocr_tessdata.clone(),
     );
-    CascadingTranscriber::with_line_htr(htr, line_htr, ocr)
+    let mut cascade = CascadingTranscriber::with_line_htr(htr, line_htr, ocr)
+        .with_language(config.handwriting_language);
+    if let Some(shared) = SHARED_HTR_LEXICON.get() {
+        cascade = cascade.with_shared_lexicon(Arc::clone(shared));
+    }
+    cascade
+}
+
+/// Load cached merged lexicon and spawn a background vault/task/calendar refresh.
+fn start_user_htr_lexicon_refresh(
+    data_dir: &Path,
+    config: &Config,
+    vault_paths: &[PathBuf],
+    tasks: &[Task],
+    events: &[CalendarEvent],
+) {
+    let shared: SharedHtrLexicon = Arc::new(RwLock::new(load_merged_htr_lexicon(Some(data_dir))));
+    let _ = SHARED_HTR_LEXICON.set(Arc::clone(&shared));
+    let sources = UserLexiconSources {
+        vault_paths: vault_paths.to_vec(),
+        exclude_subdir: Some(config.vault_export_subdir.clone()),
+        task_titles: tasks.iter().map(|t| t.title.clone()).collect(),
+        event_titles: events.iter().map(|e| e.title.clone()).collect(),
+    };
+    spawn_user_lexicon_refresh(data_dir.to_path_buf(), sources, Some(shared));
 }
 
 fn find_htr_model_installed(config: &ephemeris_core::Config) -> bool {
@@ -6816,9 +7120,13 @@ fn download_line_htr_model(config: &ephemeris_core::Config) -> Result<(), String
         "output_name": "logits",
         "image_height": 64,
         "max_width": 1024,
+        "polarity": "dark_on_light",
+        "normalize": "[0,1]",
+        "white_value": 1.0,
+        "mean_std": false,
         "source": "naeyn/de-htr-web-v2",
         "license": "Apache-2.0",
-        "notes": "German-focused modern handwriting CTC; Latin+digits also covered. PineNote: ~0.2–1s/line on A55 typical.",
+        "notes": "German-focused modern handwriting CTC; Latin+digits also covered. PineNote: ~0.2–1s/line on A55 typical. Feed gray/255 dark-on-light; no ImageNet mean/std (v2 norms inside model).",
     });
     std::fs::write(
         dest_dir.join("meta.json"),
@@ -7643,6 +7951,7 @@ fn delete_note_page_files(data_dir: &Path, note_id: u32, doc_page_count: usize) 
     for p in 0..doc_page_count.max(1) {
         let _ = std::fs::remove_file(note_page_path(data_dir, note_id, p));
         let _ = std::fs::remove_file(note_strokes_path(data_dir, note_id, p));
+        PageRecognitionCache::delete(data_dir, note_id, p);
     }
 }
 
@@ -7837,12 +8146,16 @@ fn build_vault_note_export(
         };
         let strokes = load_note_page_strokes(data_dir, note.id, note.doc_page).unwrap_or_default();
         let cascade = build_cascading_transcriber(config);
-        let spans = cascade
-            .transcribe_page(&strokes, input.width, input.height, &input.data)
-            .unwrap_or_else(|e| {
-                tracing::debug!("Transcription for note {} skipped: {e}", note.id);
-                Vec::new()
-            });
+        // Prefer strokes → vector lines; fall back to page bin when stroke list empty.
+        let spans = if strokes.is_empty() {
+            cascade.transcribe_page(&[], input.width, input.height, &input.data)
+        } else {
+            cascade.transcribe_page(&strokes, 0, 0, &[])
+        }
+        .unwrap_or_else(|e| {
+            tracing::debug!("Transcription for note {} skipped: {e}", note.id);
+            Vec::new()
+        });
         let fresh = RasterOcrTranscriber::spans_to_text(&spans);
         if !fresh.is_empty() {
             recognised_text = Some(fresh);
