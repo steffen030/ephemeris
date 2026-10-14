@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.15](https://github.com/steffen030/ephemeris/compare/v0.1.14...v0.1.15) (2026-10-14)
+
+
+### Bug Fixes
+
+* stop PineNote Wayland tablet_seat startup panic ([#39](https://github.com/steffen030/ephemeris/issues/39)) ([e1787ad](https://github.com/steffen030/ephemeris/commit/e1787ad3ca800b394de904d0be9bf45dd752c897))
+
 ## [0.1.14](https://github.com/steffen030/ephemeris/compare/v0.1.13...v0.1.14) (2026-10-14)
 
 
