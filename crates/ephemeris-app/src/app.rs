@@ -1884,6 +1884,54 @@ impl App {
             });
         }
 
+        // ── See-text line editor: save / reset / keep / accept ───────────────
+        {
+            let ctx = SeeTextEditCtx {
+                ui: ui.clone(),
+                bg: bg_recog.clone(),
+                data_dir: data_dir.clone(),
+                notes: notes.clone(),
+                notebooks: notebooks.clone(),
+                note_id_seq: note_id_seq.clone(),
+                notebook_id_seq: notebook_id_seq.clone(),
+                config: config.clone(),
+                vault_export: vault_export.clone(),
+            };
+            let c = ctx.clone();
+            ui.on_see_text_line_save(move |idx, text, kind, number, indent, hl, ul| {
+                c.apply(idx, |cache, i| {
+                    use ephemeris_core::see_text::{
+                        apply_line_edit, block_from_kind, line_edit_state,
+                    };
+                    let checked = line_edit_state(cache, i)
+                        .is_some_and(|e| e.block == ephemeris_core::BlockKind::Checkbox(true));
+                    apply_line_edit(
+                        cache,
+                        i,
+                        &ephemeris_core::see_text::LineEdit {
+                            text,
+                            block: block_from_kind(kind, number, checked),
+                            indent: indent.clamp(0, 3) as u8,
+                            highlight: hl,
+                            underline: ul,
+                        },
+                    );
+                });
+            });
+            let c = ctx.clone();
+            ui.on_see_text_line_reset(move |idx| {
+                c.apply(idx, |cache, i| cache.clear_line_correction(i));
+            });
+            let c = ctx.clone();
+            ui.on_see_text_line_keep(move |idx| {
+                c.apply(idx, |cache, i| cache.keep_correction(i));
+            });
+            let c = ctx;
+            ui.on_see_text_line_accept(move |idx| {
+                c.apply(idx, |cache, i| cache.accept_recognised(i));
+            });
+        }
+
         // ── Note list: "+ Note" → create in active folder (0 = root) ──────────
         {
             let ui2 = ui.clone_component();
@@ -8283,6 +8331,88 @@ fn sync_notes_export_to_vault(
     }
     if total == 0 && by_vault.is_empty() {
         tracing::debug!("No notes exported (no matching profile vaults)");
+    }
+}
+
+/// Shared handles for the See-text line editor callbacks.
+#[derive(Clone)]
+struct SeeTextEditCtx {
+    ui: Rc<EphemerisUi>,
+    bg: Rc<BackgroundRecogQueue>,
+    data_dir: PathBuf,
+    notes: Rc<RefCell<Vec<AppNote>>>,
+    notebooks: Rc<RefCell<Vec<AppNotebook>>>,
+    note_id_seq: Rc<Cell<u32>>,
+    notebook_id_seq: Rc<Cell<u32>>,
+    config: Rc<RefCell<Config>>,
+    vault_export: Rc<VaultExportQueue>,
+}
+
+impl SeeTextEditCtx {
+    /// Apply `edit` to cache line `idx` of the active note page, then persist
+    /// the cache, refresh `note.text_content`, the notes index and the vault
+    /// export (same path as a finished background recognition), and re-push
+    /// the See-text rows.
+    fn apply(
+        &self,
+        idx: i32,
+        edit: impl FnOnce(&mut ephemeris_core::recognition_cache::PageRecognitionCache, usize),
+    ) {
+        let Ok(idx) = usize::try_from(idx) else {
+            return;
+        };
+        let Ok(note_id) = self
+            .ui
+            .clone_component()
+            .get_active_note_id()
+            .to_string()
+            .parse::<u32>()
+        else {
+            return;
+        };
+        let Some(doc_page) = self
+            .notes
+            .borrow()
+            .iter()
+            .find(|n| n.id == note_id)
+            .map(|n| n.doc_page)
+        else {
+            return;
+        };
+        let version = recognition_model_version_for(&self.config.borrow());
+        let mut cache = self
+            .bg
+            .get_or_load(&self.data_dir, note_id, doc_page, &version);
+        if idx >= cache.lines.len() {
+            return;
+        }
+        edit(&mut cache, idx);
+        if let Err(e) = cache.save(&self.data_dir, note_id, doc_page) {
+            tracing::warn!("Failed to save recognition cache for note {note_id}: {e}");
+        }
+        let completed = cache.completed_markdown();
+        let rows = see_text_rows(&cache, Some(&completed));
+        self.bg.store(note_id, doc_page, cache);
+        if let Some(note) = self.notes.borrow_mut().iter_mut().find(|n| n.id == note_id) {
+            note.text_content = if completed.is_empty() {
+                None
+            } else {
+                Some(completed)
+            };
+            note.updated_at = now_secs();
+        }
+        save_notes_index_and_sync_vault(
+            &self.data_dir,
+            &self.notes.borrow(),
+            &self.notebooks.borrow(),
+            self.note_id_seq.get(),
+            self.notebook_id_seq.get(),
+            &self.config.borrow(),
+            &self.vault_export,
+        );
+        self.vault_export.mark(note_id);
+        self.ui.set_see_text_rows(&rows);
+        self.ui.request_screen_change();
     }
 }
 

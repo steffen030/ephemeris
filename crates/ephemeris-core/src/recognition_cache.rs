@@ -968,6 +968,22 @@ mod tests {
     }
 
     #[test]
+    fn apply_layout_keeps_user_text_and_format() {
+        let (a1, a2, b1, b2) = two_line_strokes();
+        let strokes = vec![a1, a2, b1, b2];
+        let mut cache = PageRecognitionCache::new("v1");
+        cache.sync_strokes(&strokes, None, "v1");
+        recognise_all(&mut cache, &strokes, "r");
+        cache.set_line_correction(0, Some("- Fixed".into()), Some(heading()));
+        cache.apply_layout(&strokes, None);
+        cache.apply_layout(&strokes, None);
+        let l = &cache.lines[0];
+        assert_eq!(l.user_text.as_deref(), Some("- Fixed"));
+        assert_eq!(l.user_format, Some(heading()));
+        assert_eq!(cache.completed_markdown().lines().next(), Some("# - Fixed"));
+    }
+
+    #[test]
     fn accept_recognised_clears_correction() {
         let (a1, a2, b1, b2) = two_line_strokes();
         let mut strokes = vec![a1, a2, b1, b2];
