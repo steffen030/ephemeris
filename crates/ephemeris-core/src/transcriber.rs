@@ -8,7 +8,7 @@ use crate::config::{HandwritingLanguage, ResolvedHandwritingLanguage};
 #[cfg(feature = "htr")]
 use crate::line_htr::{decode_line_alphabet, line_logits_confidence, DE_HTR_V2_ALPHABET};
 use crate::line_htr::{prepare_line_htr_input, split_ink_line_bands};
-use crate::model::{Point, Stroke, Tool};
+use crate::model::{Point, Stroke};
 #[cfg(feature = "htr")]
 use crate::stroke_htr::{
     armrest::{self, featurize_line_armrest_pieces},
@@ -17,7 +17,8 @@ use crate::stroke_htr::{
 };
 use crate::stroke_htr::{
     bundled_htr_lexicon_text, default_line_gap, featurize_line_pieces,
-    group_strokes_into_lines_with_ruling, HtrLexicon, StrokeLine, MAX_STROKE_HTR_TIMESTEPS,
+    group_strokes_into_lines_with_ruling, is_text_ink, HtrLexicon, StrokeLine,
+    MAX_STROKE_HTR_TIMESTEPS,
 };
 use crate::stroke_render::{prepare_line_htr_from_strokes, render_stroke_line, StrokeRenderParams};
 #[cfg(feature = "ocr")]
@@ -2009,7 +2010,7 @@ pub fn rasterize_strokes(strokes: &[Stroke]) -> (u32, u32, Vec<u8>) {
     let mut max_y = f32::MIN;
     let mut any = false;
     for s in strokes {
-        if s.tool == Tool::Eraser {
+        if !is_text_ink(s) {
             continue;
         }
         for p in &s.points {
@@ -2033,7 +2034,7 @@ pub fn rasterize_strokes(strokes: &[Stroke]) -> (u32, u32, Vec<u8>) {
     let oy = if any { min_y - 24.0 } else { 0.0 };
 
     for s in strokes {
-        if s.tool == Tool::Eraser || s.points.len() < 2 {
+        if !is_text_ink(s) || s.points.len() < 2 {
             continue;
         }
         let thickness = s.base_width.max(1.5).ceil() as i32;
@@ -2091,7 +2092,7 @@ fn draw_line_thick(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Color;
+    use crate::model::{Color, Tool};
 
     #[cfg(feature = "htr")]
     #[test]

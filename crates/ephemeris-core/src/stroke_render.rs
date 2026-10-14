@@ -17,7 +17,7 @@ use crate::line_htr::{
     ImageLineBand, LineHtrInput, LINE_HTR_HEIGHT, LINE_HTR_MAX_WIDTH, LINE_HTR_WIDTH_ALIGN,
 };
 use crate::model::{Stroke, Tool};
-use crate::stroke_htr::{stroke_bounds, StrokeLine};
+use crate::stroke_htr::{is_text_ink, stroke_bounds, StrokeLine};
 
 /// Preset for DE·HTR v2-class line models.
 pub const HTR_LINE_STROKE_WIDTH_PX: f32 = 1.75;
@@ -89,10 +89,8 @@ pub fn render_strokes_page(strokes: &[Stroke], params: &StrokeRenderParams) -> (
     let mut max_x = f32::NEG_INFINITY;
     let mut max_y = f32::NEG_INFINITY;
     let mut any = false;
-    for s in strokes {
-        if s.tool == Tool::Eraser {
-            continue;
-        }
+    let strokes: Vec<Stroke> = strokes.iter().filter(|s| is_text_ink(s)).cloned().collect();
+    for s in &strokes {
         if let Some((x0, y0, x1, y1)) = stroke_bounds(s) {
             any = true;
             min_x = min_x.min(x0);
@@ -107,7 +105,7 @@ pub fn render_strokes_page(strokes: &[Stroke], params: &StrokeRenderParams) -> (
         return (w, h, vec![255u8; (w * h) as usize]);
     }
     render_strokes_in_bbox(
-        strokes,
+        &strokes,
         min_x,
         min_y,
         (max_x - min_x).max(1.0),
