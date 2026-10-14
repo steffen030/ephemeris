@@ -269,10 +269,13 @@ pub struct MdBlock {
 /// Strip common inline markdown markers for list/title display.
 ///
 /// Keeps the readable words; drops `**bold**`, `*italic*`, `` `code` ``,
-/// `~~strike~~`, wikilinks and `[label](url)` wrappers.
+/// `~~strike~~`, `==highlight==`, `<u>underline</u>`, wikilinks and
+/// `[label](url)` wrappers. A backslash before a markdown-significant char
+/// (as emitted by `lines_to_markdown`) is dropped.
 pub fn strip_inline_markdown(s: &str) -> String {
     let s = simplify_wikilinks(s);
     let s = simplify_md_links(&s);
+    let s = s.replace("<u>", "").replace("</u>", "");
     let mut out = String::with_capacity(s.len());
     let chars: Vec<char> = s.chars().collect();
     let mut i = 0;
@@ -296,6 +299,26 @@ pub fn strip_inline_markdown(s: &str) -> String {
                     out.push(c);
                 }
                 i = end + 1;
+                continue;
+            }
+        }
+        // \# escaped markdown char: keep the char, drop the backslash
+        if chars[i] == '\\'
+            && chars
+                .get(i + 1)
+                .is_some_and(|c| "\\#-*+>`_~=.1234567890".contains(*c))
+        {
+            out.push(chars[i + 1]);
+            i += 2;
+            continue;
+        }
+        // ==highlight==
+        if chars[i] == '=' && chars.get(i + 1) == Some(&'=') {
+            if let Some(end) = find_closing_pair(&chars, i + 2, '=', true) {
+                for &c in &chars[i + 2..end] {
+                    out.push(c);
+                }
+                i = end + 2;
                 continue;
             }
         }
@@ -451,9 +474,20 @@ pub fn markdown_to_blocks(md: &str) -> Vec<MdBlock> {
             .or_else(|| trim_start.strip_prefix("+ "))
         {
             flush_para(&mut para_buf, &mut blocks);
+            // Task items: `- [ ] x` / `- [x] x` keep a readable box glyph.
+            let (prefix, rest) = if let Some(r) = rest.strip_prefix("[ ] ") {
+                ("☐ ", r)
+            } else if let Some(r) = rest
+                .strip_prefix("[x] ")
+                .or_else(|| rest.strip_prefix("[X] "))
+            {
+                ("☑ ", r)
+            } else {
+                ("", rest)
+            };
             blocks.push(MdBlock {
                 kind: MdBlockKind::Bullet,
-                text: strip_inline_markdown(rest),
+                text: format!("{prefix}{}", strip_inline_markdown(rest)),
             });
             continue;
         }
