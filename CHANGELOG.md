@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.17](https://github.com/steffen030/ephemeris/compare/v0.1.16...v0.1.17) (2026-10-14)
+
+
+### Bug Fixes
+
+* make stroke HTR read PineNote ink correctly (ephemeris-ktg.19) ([#43](https://github.com/steffen030/ephemeris/issues/43)) ([52f4005](https://github.com/steffen030/ephemeris/commit/52f4005f0793e052535aa191c0212998cd29bc38))
+
 ## [0.1.16](https://github.com/steffen030/ephemeris/compare/v0.1.15...v0.1.16) (2026-10-14)
 
 
