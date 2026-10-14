@@ -1538,9 +1538,7 @@ impl EphemerisUi {
     }
 
     pub fn get_settings_handwriting_lang(&self) -> String {
-        self.component
-            .get_settings_handwriting_lang()
-            .to_string()
+        self.component.get_settings_handwriting_lang().to_string()
     }
 
     /// Settings › Handwriting printed-OCR / Tesseract last-resort toggle.

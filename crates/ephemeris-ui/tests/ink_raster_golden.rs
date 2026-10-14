@@ -118,13 +118,13 @@ fn circle_strokes() -> Vec<Stroke> {
 /// Block-capitals "Mmmm" — four humps, handwriting x-height ≈ 28 logical px.
 fn mmmm_strokes() -> Vec<Stroke> {
     let step = 2.0;
-    let mut out = Vec::new();
-    // Capital M.
-    out.push(stroke(&line((20.0, 52.0), (20.0, 20.0), step)));
-    out.push(stroke(&line((20.0, 20.0), (34.0, 40.0), step)));
-    out.push(stroke(&line((34.0, 40.0), (48.0, 20.0), step)));
-    out.push(stroke(&line((48.0, 20.0), (48.0, 52.0), step)));
-    // Three lowercase m arches (each: up-arch-down × 2).
+    // Capital M, then three lowercase m arches.
+    let mut out = vec![
+        stroke(&line((20.0, 52.0), (20.0, 20.0), step)),
+        stroke(&line((20.0, 20.0), (34.0, 40.0), step)),
+        stroke(&line((34.0, 40.0), (48.0, 20.0), step)),
+        stroke(&line((48.0, 20.0), (48.0, 52.0), step)),
+    ];
     for i in 0..3 {
         let x0 = 62.0 + i as f32 * 36.0;
         let mut pts = line((x0, 52.0), (x0, 28.0), step);
