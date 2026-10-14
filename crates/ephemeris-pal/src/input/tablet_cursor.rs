@@ -15,9 +15,7 @@ mod live {
     use wayland_client::backend::Backend;
     use wayland_client::globals::{registry_queue_init, GlobalListContents};
     use wayland_client::protocol::{wl_registry, wl_seat};
-    use wayland_client::{
-        event_created_child, Connection, Dispatch, EventQueue, QueueHandle,
-    };
+    use wayland_client::{event_created_child, Connection, Dispatch, EventQueue, QueueHandle};
     use wayland_protocols::wp::tablet::zv2::client::{
         zwp_tablet_manager_v2, zwp_tablet_pad_v2, zwp_tablet_seat_v2, zwp_tablet_tool_v2,
         zwp_tablet_v2,
