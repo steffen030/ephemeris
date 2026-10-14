@@ -211,7 +211,11 @@ fn recognition_model_version_for(config: &Config) -> String {
 }
 
 fn note_ruling_pitch(ui: &EphemerisUi) -> Option<f32> {
-    match ui.current_page_template() {
+    template_ruling_pitch(ui.current_page_template())
+}
+
+fn template_ruling_pitch(template: ephemeris_core::PageTemplate) -> Option<f32> {
+    match template {
         ephemeris_core::PageTemplate::Blank => None,
         ephemeris_core::PageTemplate::Lines
         | ephemeris_core::PageTemplate::Grid
@@ -8131,6 +8135,7 @@ fn build_vault_note_export(
     // Prefer freshly recognised text over a cached See-text snapshot so export
     // tracks newly added ink. Use the note's current document page (not always 0).
     let mut recognised_text: Option<String> = None;
+    let mut recognised_markdown: Option<String> = None;
     if let Some((w, h, gray)) = load_note_page_n(data_dir, note.id, note.doc_page) {
         let raster = ephemeris_pal::display::PixelBuf {
             width: w,
@@ -8146,16 +8151,21 @@ fn build_vault_note_export(
         };
         let strokes = load_note_page_strokes(data_dir, note.id, note.doc_page).unwrap_or_default();
         let cascade = build_cascading_transcriber(config);
-        // Prefer strokes → vector lines; fall back to page bin when stroke list empty.
+        // Ink pages go through the per-line recognition cache so the export keeps
+        // line formatting and only re-recognises changed lines; raster-only pages
+        // fall back to a fresh page transcription.
         let spans = if strokes.is_empty() {
-            cascade.transcribe_page(&[], input.width, input.height, &input.data)
+            cascade
+                .transcribe_page(&[], input.width, input.height, &input.data)
+                .unwrap_or_else(|e| {
+                    tracing::debug!("Transcription for note {} skipped: {e}", note.id);
+                    Vec::new()
+                })
         } else {
-            cascade.transcribe_page(&strokes, 0, 0, &[])
-        }
-        .unwrap_or_else(|e| {
-            tracing::debug!("Transcription for note {} skipped: {e}", note.id);
-            Vec::new()
-        });
+            let cache = recognise_page_cache(config, data_dir, note, &strokes, &cascade);
+            recognised_markdown = Some(cache.completed_markdown()).filter(|m| !m.is_empty());
+            cache.to_spans()
+        };
         let fresh = RasterOcrTranscriber::spans_to_text(&spans);
         if !fresh.is_empty() {
             recognised_text = Some(fresh);
@@ -8194,9 +8204,36 @@ fn build_vault_note_export(
         note_title: note.title.clone(),
         note_id: note.id,
         created_at: note.created_at,
-        text_content: recognised_text.or_else(|| note.text_content.clone()),
+        text_content: recognised_markdown
+            .or(recognised_text)
+            .or_else(|| note.text_content.clone()),
         pdf_vault_rel,
     }
+}
+
+/// Bring a page's recognition cache up to date with `strokes` (recognising only
+/// changed lines) and persist it.
+fn recognise_page_cache(
+    config: &Config,
+    data_dir: &Path,
+    note: &AppNote,
+    strokes: &[ephemeris_core::Stroke],
+    cascade: &CascadingTranscriber,
+) -> PageRecognitionCache {
+    let version = recognition_model_version_for(config);
+    let ruling = template_ruling_pitch(note.paper_template);
+    let mut cache = PageRecognitionCache::load(data_dir, note.id, note.doc_page)
+        .unwrap_or_else(|| PageRecognitionCache::new(&version));
+    cache.sync_strokes(strokes, ruling, &version);
+    if cache.has_pending() {
+        let _ = cache.recognise_pending(strokes, ruling, &|| false, |line, idx| {
+            cascade.transcribe_line(line, idx)
+        });
+        if let Err(e) = cache.save(data_dir, note.id, note.doc_page) {
+            tracing::warn!("Failed to save recognition cache for note {}: {e}", note.id);
+        }
+    }
+    cache
 }
 
 fn sync_notes_export_to_vault(
