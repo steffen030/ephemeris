@@ -332,8 +332,15 @@ pub(crate) fn line_time_base_ms(line: &StrokeLine) -> u64 {
 fn build_absolute_points(line: &StrokeLine) -> Vec<CarbunePoint> {
     let mut out = Vec::new();
     let base_ms = line_time_base_ms(line);
+    // Online models read ink in writing order. Segmentation sorts strokes
+    // left-to-right, which puts i-dots, t-bars and retouches in the wrong
+    // place; restore pen order whenever every stroke has a real start time.
+    let mut strokes: Vec<&Stroke> = line.strokes.iter().collect();
+    if base_ms != 0 {
+        strokes.sort_by_key(|s| s.t0_ms);
+    }
     let mut next_synth_t0_ms = 0.0f32;
-    for (stroke_nr, stroke) in line.strokes.iter().enumerate() {
+    for (stroke_nr, stroke) in strokes.into_iter().enumerate() {
         if stroke.points.is_empty() {
             continue;
         }
@@ -360,8 +367,9 @@ fn build_absolute_points(line: &StrokeLine) -> Vec<CarbunePoint> {
 
 /// Carbune2020 / OnlineHTR `featuresLinInterpol20DxDyDtN` featurization.
 ///
-/// 1. Flat table with absolute time in **seconds**
-/// 2. Normalise: `x -= x[0]`, `y -= y.min()`, `scale = y.max()`, then `/scale`
+/// 1. Flat table with absolute time in **seconds**, strokes in pen order
+/// 2. Normalise: `y = -y` (y-up), `x -= x[0]`, `y -= y.min()`,
+///    `scale = y.max()`, then `/scale`
 /// 3. Per stroke, resample by **time** at `ceil(length * points_per_unit)`
 ///    (bump 1→2); fall back to arc-length if time is constant / non-monotone
 /// 4. Emit `[0,0,0,1]` then `[dx, dy, dt, n]` (`n=1` when `stroke_nr` changes)
@@ -375,7 +383,13 @@ pub fn featurize_line(line: &StrokeLine, points_per_unit: f32) -> Vec<HtrFeature
     }
 
     // --- Normalise (Carbune2020 / OnlineHTR) ---
+    // OnlineHTR is trained on y-up ink; screen coordinates are y-down. Without
+    // the flip the model reads every line upside down (Note 19 replay:
+    // 81% → ~5% CER).
     let x0 = pts[0].x;
+    for p in &mut pts {
+        p.y = -p.y;
+    }
     let y_min = pts.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
     for p in &mut pts {
         p.x -= x0;
@@ -1615,8 +1629,8 @@ mod tests {
         let feats = featurize_line(&line, CARBUNE_POINTS_PER_UNIT);
         let expected: [[f32; 4]; 4] = [
             [0.0, 0.0, 0.0, 1.0],
-            [0.08, 0.06, 0.1, 0.0],
-            [0.12, 0.94, 0.9, 1.0],
+            [0.08, -0.06, 0.1, 0.0],
+            [0.12, -0.94, 0.9, 1.0],
             [0.08, 0.0, 0.1, 0.0],
         ];
         assert_eq!(feats.len(), expected.len());
@@ -1686,6 +1700,20 @@ mod tests {
     }
 
     #[test]
+    fn featurize_uses_pen_order_not_left_to_right() {
+        // An i-dot written last but sorted first by x must still come last.
+        let mut line = epoch_offset_line(1_000);
+        let dot = parity_stroke(1_000 + 500, &[(1.0, -10.0, 0), (1.5, -10.0, 10)]);
+        line.strokes.insert(0, dot.clone());
+        let mut pen_order = epoch_offset_line(1_000);
+        pen_order.strokes.push(dot);
+        assert_features_close(
+            &featurize_line(&line, CARBUNE_POINTS_PER_UNIT),
+            &featurize_line(&pen_order, CARBUNE_POINTS_PER_UNIT),
+        );
+    }
+
+    #[test]
     fn carbune_parity_synth_t0_matches_fixture() {
         // Hand-computed: legacy t0_ms=0 → synthetic clock with 150 ms gaps.
         // S0 abs ms 0,100; S1 starts at 100+150=250 → 250,350 → seconds 0.25,0.35.
@@ -1702,8 +1730,8 @@ mod tests {
         let feats = featurize_line(&line, CARBUNE_POINTS_PER_UNIT);
         let expected: [[f32; 4]; 4] = [
             [0.0, 0.0, 0.0, 1.0],
-            [0.08, 0.06, 0.1, 0.0],
-            [0.12, 0.94, 0.15, 1.0],
+            [0.08, -0.06, 0.1, 0.0],
+            [0.12, -0.94, 0.15, 1.0],
             [0.08, 0.0, 0.1, 0.0],
         ];
         assert_eq!(feats.len(), expected.len());
