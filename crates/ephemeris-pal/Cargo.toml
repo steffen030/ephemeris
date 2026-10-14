@@ -7,11 +7,11 @@ authors.workspace = true
 license.workspace = true
 
 [features]
-# Enables the live Wayland compositor dispatch loop in `input::wayland`.
-# The loop itself is additionally `#[cfg(target_os = "linux")]`-gated, so
-# enabling this feature on a non-Linux host (e.g. the macOS dev/CI box) still
-# compiles the crate — it simply omits the live loop. The dependencies below
-# are only pulled in on Linux via a target-scoped dependency table.
+# Enables Wayland tablet/client code: live `input::wayland` dispatch loop and
+# `TabletCursorHider` (PineNote stylus cursor hide via zwp_tablet_tool_v2).
+# Both are additionally `#[cfg(target_os = "linux")]`-gated, so enabling this
+# feature on a non-Linux host (e.g. the macOS dev/CI box) still compiles —
+# it simply omits the live paths. Deps are Linux-only via the target table.
 wayland = ["dep:wayland-client", "dep:wayland-protocols"]
 
 [dependencies]
@@ -21,13 +21,16 @@ log = { workspace = true }
 winit = { workspace = true }
 softbuffer = { workspace = true }
 
-# Wayland client + protocol bindings for the live dispatch loop. Target-gated to
-# Linux so `--features wayland` still resolves (as a no-op) on macOS/Windows;
-# `optional = true` keeps them out of the default build entirely.
+# Wayland client + protocol bindings for the live dispatch loop / tablet cursor
+# hider. Target-gated to Linux so `--features wayland` still resolves (as a
+# no-op) on macOS/Windows; `optional = true` keeps them out of the default
+# build entirely. `system` is required for `Backend::from_foreign_display`
+# (attach to winit's wl_display).
 [target.'cfg(target_os = "linux")'.dependencies]
-wayland-client = { version = "0.31", optional = true }
+wayland-client = { version = "0.31", optional = true, features = ["system"] }
 wayland-protocols = { version = "0.32", features = ["client", "unstable"], optional = true }
 evdev = { workspace = true }
+rustix = { version = "1", features = ["event"] }
 
 [dev-dependencies]
 # nothing extra needed; mock backend is in src/input/mock.rs behind #[cfg(feature="mock")]

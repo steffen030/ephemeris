@@ -24,7 +24,7 @@ use std::rc::Rc;
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Runtime;
@@ -682,8 +682,8 @@ impl App {
 
         // Restore ink pixels + stroke lists for all known notes (current doc page).
         for note in notes.borrow().iter() {
-            if let Some((_w, _h, pixels)) = load_note_page_n(&data_dir, note.id, note.doc_page) {
-                ui.restore_page_pixels(note.page_index, pixels);
+            if let Some((w, h, pixels)) = load_note_page_n(&data_dir, note.id, note.doc_page) {
+                ui.restore_page_pixels(note.page_index, w, h, pixels);
             }
             if let Some(strokes) = load_note_page_strokes(&data_dir, note.id, note.doc_page) {
                 // Prefer stroke list as source of truth: rebuild raster to match.
@@ -1660,8 +1660,8 @@ impl App {
                             .find(|n| n.id == id)
                             .and_then(|n| n.text_content.clone())
                     });
-                    let (w, h) = ui_rc.canvas_size();
-                    let pixels = ui_rc.get_committed_pixels();
+                    let logical = ui_rc.canvas_size();
+                    let raster = ui_rc.get_committed_pixels_arc();
                     let strokes = ui_rc.get_page_strokes();
                     let cascade = build_cascading_transcriber(&cfg2.borrow());
                     let mailbox2 = mailbox.clone();
@@ -1671,33 +1671,38 @@ impl App {
                         let htr_hint = cascade.htr.empty_result_hint();
                         let ocr_hint = cascade.ocr.empty_result_hint();
                         let htr_ready = cascade.htr.model_available();
-                        let (display, persist) =
-                            match cascade.transcribe_page(&strokes, w, h, &pixels) {
-                                Ok(spans) => {
-                                    let joined = RasterOcrTranscriber::spans_to_text(&spans);
-                                    if joined.is_empty() {
-                                        let hint = if !strokes.is_empty() && !htr_ready {
-                                            htr_hint
-                                        } else {
-                                            ocr_hint
-                                        };
-                                        // Keep last good transcription — never wipe on empty.
-                                        match prior_text {
-                                            Some(prev) if !prev.is_empty() => (prev, None),
-                                            _ => (hint, None),
-                                        }
+                        let input = transcription_raster(&raster, logical);
+                        let (display, persist) = match cascade.transcribe_page(
+                            &strokes,
+                            input.width,
+                            input.height,
+                            &input.data,
+                        ) {
+                            Ok(spans) => {
+                                let joined = RasterOcrTranscriber::spans_to_text(&spans);
+                                if joined.is_empty() {
+                                    let hint = if !strokes.is_empty() && !htr_ready {
+                                        htr_hint
                                     } else {
-                                        (joined.clone(), Some(joined))
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!("See-text transcription failed: {e}");
+                                        ocr_hint
+                                    };
+                                    // Keep last good transcription — never wipe on empty.
                                     match prior_text {
                                         Some(prev) if !prev.is_empty() => (prev, None),
-                                        _ => (format!("Transcription failed: {e}"), None),
+                                        _ => (hint, None),
                                     }
+                                } else {
+                                    (joined.clone(), Some(joined))
                                 }
-                            };
+                            }
+                            Err(e) => {
+                                tracing::warn!("See-text transcription failed: {e}");
+                                match prior_text {
+                                    Some(prev) if !prev.is_empty() => (prev, None),
+                                    _ => (format!("Transcription failed: {e}"), None),
+                                }
+                            }
+                        };
                         if let Ok(mut guard) = mailbox2.lock() {
                             *guard = Some(SeeTextJobResult {
                                 gen,
@@ -5090,6 +5095,8 @@ impl App {
             };
             (source, Some(target))
         };
+        #[cfg(target_os = "linux")]
+        let ink_recorder = ephemeris_pal::input::InkRecorder::from_env();
 
         let mut handler = WinitHandler {
             _rt: self.rt,
@@ -5139,6 +5146,8 @@ impl App {
             #[cfg(target_os = "linux")]
             pen_source,
             #[cfg(target_os = "linux")]
+            ink_recorder,
+            #[cfg(target_os = "linux")]
             pen_target,
             chrome_peeking: false,
             chrome_dismiss_armed: false,
@@ -5158,8 +5167,8 @@ impl App {
 /// upscales to ~1.75× on a 1404×1872 panel (icons/text readable on e-ink).
 ///
 /// Do **not** default to panel-native 1404×1872 — that makes chrome tiny.
-/// Fast ink presents use nearest-neighbour upscale (see `display.rs`) so the
-/// half-res → panel blit stays cheap enough not to force-quit on RK3566.
+/// Ink is still rasterised at panel resolution: the UI upscales chrome into a
+/// physical background cache and presents ink 1:1 (see `ephemeris-ui`).
 fn probe_window_size() -> (u32, u32) {
     if let Ok(raw) = std::env::var("EPHEMERIS_SIZE") {
         if let Some((w, h)) = raw.split_once('x').or_else(|| raw.split_once('X')) {
@@ -5273,6 +5282,9 @@ struct WinitHandler {
     /// Linux: separate digitiser (PineNote pen) via `/dev/input` — not wl_touch.
     #[cfg(target_os = "linux")]
     pen_source: Option<EvdevPenSource>,
+    /// `EPHEMERIS_INK_RECORD=/path.jsonl` — background JSONL pen capture.
+    #[cfg(target_os = "linux")]
+    ink_recorder: Option<ephemeris_pal::input::InkRecorder>,
     /// Shared with the evdev worker so resize / peek can refresh mapping.
     #[cfg(target_os = "linux")]
     pen_target: Option<Arc<PenTarget>>,
@@ -5380,7 +5392,7 @@ impl WinitHandler {
         self.sync_pen_geometry();
     }
 
-    fn handle_pointer_move(&mut self, lx: f32, ly: f32, pressure: f32) {
+    fn handle_pointer_move(&mut self, lx: f32, ly: f32, pressure: f32, t_us: u64) {
         use ephemeris_ui::STATUS_BAR_H;
         self.cursor_pos = (lx, ly);
         if self.chrome_swallow {
@@ -5415,23 +5427,19 @@ impl WinitHandler {
                         pressure,
                         tilt: 0.0,
                         in_range: true,
+                        t_us,
                     }),
-                    now_ms(),
+                    t_ms_from_us(t_us),
                 );
                 // Do not persist mid-stroke / mid-erase — sync disk I/O on every
                 // sample freezes PineNote. Persist on pointer release only.
             }
-            if let Some(d) = &self.display {
-                d.hide_cursor();
-            }
             self.request_redraw_coalesced();
-        } else if let Some(d) = &self.display {
-            // Keep OS cursor hidden over the note canvas (macOS / Wayland re-show).
-            if self.ui.is_canvas_active() {
-                d.hide_cursor();
-            }
+        } else {
             // Idle moves over a static note canvas: skip redraw wake (eink).
             // Overlays / chrome swipe / peek still need Slint frames.
+            // Stylus cursor is cleared by DesktopWindow::poll_tablet_cursor
+            // (tablet_v2); wl_pointer hide stays on focus/startup.
             let need = self.chrome_peeking
                 || self.chrome_swipe_start.is_some()
                 || !self.ui.is_canvas_active()
@@ -5453,7 +5461,7 @@ impl WinitHandler {
         }
     }
 
-    fn handle_pointer_press(&mut self, lx: f32, ly: f32, pressure: f32) {
+    fn handle_pointer_press(&mut self, lx: f32, ly: f32, pressure: f32, t_us: u64) {
         use ephemeris_ui::{STATUS_BAR_H, TOOLBAR_H};
         let (_, ui_h) = self.ui.size();
         self.cursor_pos = (lx, ly);
@@ -5500,9 +5508,6 @@ impl WinitHandler {
         {
             self.is_drawing = true;
             self.last_ink_pressure = pressure.max(0.05);
-            if let Some(d) = &self.display {
-                d.hide_cursor();
-            }
             let cy = ly - STATUS_BAR_H as f32;
             self.ui.feed_input(
                 &InputEvent::PenDown(PenSample {
@@ -5511,8 +5516,9 @@ impl WinitHandler {
                     pressure,
                     tilt: 0.0,
                     in_range: true,
+                    t_us,
                 }),
-                now_ms(),
+                t_ms_from_us(t_us),
             );
         }
         self.request_redraw_coalesced();
@@ -5541,7 +5547,7 @@ impl WinitHandler {
         // Arc snapshot for the writer; then re-unique the live layer so the next
         // stroke does not COW the full panel mid-draw.
         let pixels = self.ui.get_committed_pixels_arc();
-        let (w, h) = self.ui.canvas_size();
+        let (w, h) = (pixels.width, pixels.height);
         let strokes = self.ui.get_page_strokes();
         self.local_page_writes.queue(PendingPageWrite {
             note_id,
@@ -5564,7 +5570,7 @@ impl WinitHandler {
         self.vault_export.mark(note_id);
     }
 
-    fn handle_pointer_release(&mut self, lx: f32, ly: f32) {
+    fn handle_pointer_release(&mut self, lx: f32, ly: f32, t_us: u64) {
         use ephemeris_ui::STATUS_BAR_H;
         self.cursor_pos = (lx, ly);
         self.chrome_pointer_held = false;
@@ -5612,8 +5618,9 @@ impl WinitHandler {
                     pressure: self.last_ink_pressure,
                     tilt: 0.0,
                     in_range: true,
+                    t_us,
                 }),
-                now_ms(),
+                t_ms_from_us(t_us),
             );
             // Persist after pen commit / erase gesture end. Keep local disk
             // writes on the UI thread (fast) but never run vault OCR/PDF here.
@@ -5637,32 +5644,33 @@ impl WinitHandler {
         };
         let events: Vec<InputEvent> = src.try_iter().collect();
         for ev in events {
+            // Off-thread JSONL capture (EPHEMERIS_INK_RECORD); try_send only.
+            if let Some(rec) = &self.ink_recorder {
+                rec.record(&ev);
+            }
             match ev {
                 InputEvent::PenDown(s) => {
                     self.pointer_source = PointerSource::Pen;
                     self.page_swipe_allowed.set(false);
-                    self.handle_pointer_press(s.x, s.y, s.pressure);
+                    self.handle_pointer_press(s.x, s.y, s.pressure, s.t_us);
                 }
                 InputEvent::PenMove(s) => {
                     self.pointer_source = PointerSource::Pen;
-                    self.handle_pointer_move(s.x, s.y, s.pressure);
+                    self.handle_pointer_move(s.x, s.y, s.pressure, s.t_us);
                 }
                 InputEvent::PenUp(s) => {
                     self.pointer_source = PointerSource::Pen;
                     if s.pressure > 0.05 {
                         self.last_ink_pressure = s.pressure;
                     }
-                    self.handle_pointer_release(s.x, s.y);
+                    self.handle_pointer_release(s.x, s.y, s.t_us);
                 }
                 InputEvent::PenButton { pressed } => {
                     // Side button ≈ Ctrl (opens tool ring / modifier paths).
                     self.ctrl_held.set(pressed);
                 }
-                InputEvent::Hover { x, y } => {
+                InputEvent::Hover { x, y, .. } => {
                     self.cursor_pos = (x, y);
-                    if let Some(d) = &self.display {
-                        d.hide_cursor();
-                    }
                     self.ui.dispatch_pointer_moved(x, y);
                 }
                 _ => {}
@@ -5684,6 +5692,11 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         #[cfg(target_os = "linux")]
         self.drain_pen_events();
+        // Hide Mutter tablet-tool cursor (zwp_tablet_tool_v2.set_cursor on
+        // winit's wl_display). Must run on the same connection as the window.
+        if let Some(d) = &mut self.display {
+            d.poll_tablet_cursor();
+        }
         // Kiosk watchdog: re-cover the output unless we're peeking the panel.
         // Skip while drawing — enter_kiosk/resize resets softbuffer age→0 and
         // forces a full-panel rewrite mid-stroke (PineNote force-quit).
@@ -6025,7 +6038,7 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
 
             WindowEvent::CursorMoved { position, .. } => {
                 let (lx, ly) = self.map_to_ui(position);
-                self.handle_pointer_move(lx, ly, 0.6);
+                self.handle_pointer_move(lx, ly, 0.6, 0);
             }
 
             WindowEvent::MouseInput {
@@ -6038,10 +6051,10 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
                     winit::event::ElementState::Pressed => {
                         self.pointer_source = PointerSource::Mouse;
                         self.page_swipe_allowed.set(true);
-                        self.handle_pointer_press(lx, ly, 0.8);
+                        self.handle_pointer_press(lx, ly, 0.8, 0);
                     }
                     winit::event::ElementState::Released => {
-                        self.handle_pointer_release(lx, ly);
+                        self.handle_pointer_release(lx, ly, 0);
                     }
                 }
             }
@@ -6060,14 +6073,14 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
                     TouchPhase::Started => {
                         self.pointer_source = PointerSource::Finger;
                         self.page_swipe_allowed.set(true);
-                        self.handle_pointer_press(lx, ly, pressure);
+                        self.handle_pointer_press(lx, ly, pressure, 0);
                     }
                     TouchPhase::Moved => {
                         self.pointer_source = PointerSource::Finger;
-                        self.handle_pointer_move(lx, ly, pressure);
+                        self.handle_pointer_move(lx, ly, pressure, 0);
                     }
                     TouchPhase::Ended | TouchPhase::Cancelled => {
-                        self.handle_pointer_release(lx, ly);
+                        self.handle_pointer_release(lx, ly, 0);
                     }
                 }
             }
@@ -7535,14 +7548,58 @@ fn flush_active_note_ink(
     let Some(note) = notes.iter_mut().find(|n| n.id == id) else {
         return;
     };
-    let (w, h) = ui.canvas_size();
-    let pixels = ui.get_committed_pixels();
-    if pixels.len() < (w * h) as usize {
+    let pixels = ui.get_committed_pixels_arc();
+    let (w, h) = (pixels.width, pixels.height);
+    if pixels.data.len() < (w * h) as usize {
         return;
     }
-    save_note_page_pixels(data_dir, note.id, note.doc_page, w, h, &pixels);
+    save_note_page_pixels(data_dir, note.id, note.doc_page, w, h, &pixels.data);
     save_note_page_strokes(data_dir, note.id, note.doc_page, &ui.get_page_strokes());
     note.updated_at = now_secs();
+}
+
+/// Logical canvas size strokes are recorded in (design UI size minus chrome).
+fn design_canvas_size() -> (u32, u32) {
+    let (w, h) = probe_window_size();
+    (
+        w,
+        h.saturating_sub(ephemeris_ui::STATUS_BAR_H + ephemeris_ui::TOOLBAR_H),
+    )
+}
+
+/// Page raster at logical canvas resolution for HTR/OCR.
+///
+/// Page bins are stored at panel resolution, but recognisers are tuned on
+/// logical-size ink and stroke-HTR spans live in logical coordinates, so the
+/// cascade always sees one coordinate space.
+fn transcription_raster(
+    raster: &ephemeris_pal::display::PixelBuf,
+    logical: (u32, u32),
+) -> ephemeris_pal::display::PixelBuf {
+    if raster.width <= logical.0 || logical.0 == 0 || logical.1 == 0 {
+        return raster.clone();
+    }
+    ephemeris_ui::compose::resample_gray(raster, logical.0, logical.1)
+}
+
+/// Map transcription spans from the `from` raster size onto `to` (PDF page).
+fn scale_spans(
+    mut spans: Vec<ephemeris_core::TextSpan>,
+    from: (u32, u32),
+    to: (u32, u32),
+) -> Vec<ephemeris_core::TextSpan> {
+    if from == to || from.0 == 0 || from.1 == 0 {
+        return spans;
+    }
+    let sx = to.0 as f32 / from.0 as f32;
+    let sy = to.1 as f32 / from.1 as f32;
+    for s in &mut spans {
+        s.x *= sx;
+        s.y *= sy;
+        s.width *= sx;
+        s.height *= sy;
+    }
+    spans
 }
 
 fn read_page_bin(path: &Path) -> Option<(u32, u32, Vec<u8>)> {
@@ -7604,9 +7661,15 @@ fn switch_note_doc_page(
     target: usize,
     create_if_missing: bool,
 ) {
-    let (w, h) = ui.canvas_size();
-    let pixels = ui.get_committed_pixels();
-    save_note_page_pixels(data_dir, note.id, note.doc_page, w, h, &pixels);
+    let pixels = ui.get_committed_pixels_arc();
+    save_note_page_pixels(
+        data_dir,
+        note.id,
+        note.doc_page,
+        pixels.width,
+        pixels.height,
+        &pixels.data,
+    );
     save_note_page_strokes(data_dir, note.id, note.doc_page, &ui.get_page_strokes());
 
     let count = note.doc_page_count.max(1);
@@ -7619,8 +7682,8 @@ fn switch_note_doc_page(
     note.doc_page = target;
     note.updated_at = now_secs();
 
-    if let Some((_pw, _ph, data)) = load_note_page_n(data_dir, note.id, target) {
-        ui.restore_page_pixels(note.page_index, data);
+    if let Some((pw, ph, data)) = load_note_page_n(data_dir, note.id, target) {
+        ui.restore_page_pixels(note.page_index, pw, ph, data);
         if let Some(strokes) = load_note_page_strokes(data_dir, note.id, target) {
             ui.restore_page_strokes(note.page_index, strokes);
         } else {
@@ -7760,15 +7823,22 @@ fn build_vault_note_export(
     // tracks newly added ink. Use the note's current document page (not always 0).
     let mut recognised_text: Option<String> = None;
     if let Some((w, h, gray)) = load_note_page_n(data_dir, note.id, note.doc_page) {
+        let raster = ephemeris_pal::display::PixelBuf {
+            width: w,
+            height: h,
+            stride: w,
+            data: gray,
+        };
+        let input = transcription_raster(&raster, design_canvas_size());
         let page = RasterPage {
             width: w,
             height: h,
-            gray8: gray,
+            gray8: raster.data,
         };
         let strokes = load_note_page_strokes(data_dir, note.id, note.doc_page).unwrap_or_default();
         let cascade = build_cascading_transcriber(config);
         let spans = cascade
-            .transcribe_page(&strokes, w, h, &page.gray8)
+            .transcribe_page(&strokes, input.width, input.height, &input.data)
             .unwrap_or_else(|e| {
                 tracing::debug!("Transcription for note {} skipped: {e}", note.id);
                 Vec::new()
@@ -7786,7 +7856,7 @@ fn build_vault_note_export(
             page_spans: if spans.is_empty() {
                 vec![]
             } else {
-                vec![spans]
+                vec![scale_spans(spans, (input.width, input.height), (w, h))]
             },
         };
         match export_raster_pages_to_pdf(&[page], &pdf_abs, &opts) {
@@ -9391,6 +9461,22 @@ fn now_ms() -> u32 {
         .as_millis() as u32
 }
 
+/// Ink-engine timestamp (ms) for a pointer sample.
+///
+/// `t_us == 0` (mouse / touch / synthetic) falls back to [`now_ms`]. Otherwise
+/// the kernel timestamp is mapped onto the `now_ms` clock via a process-static
+/// epoch pinned at the first stamped sample, so real pen inter-sample spacing
+/// is preserved (burst-delivered evdev packets no longer collapse onto one
+/// drain-time `now_ms()`).
+fn t_ms_from_us(t_us: u64) -> u32 {
+    if t_us == 0 {
+        return now_ms();
+    }
+    static EPOCH: OnceLock<(u64, u32)> = OnceLock::new();
+    let (epoch_us, epoch_ms) = *EPOCH.get_or_init(|| (t_us, now_ms()));
+    epoch_ms.wrapping_add((t_us.saturating_sub(epoch_us) / 1000) as u32)
+}
+
 fn sample_tasks_split(work: ProfileId, personal: ProfileId) -> Vec<Task> {
     const DAY: u64 = 86_400;
     let now = now_secs();
@@ -9785,6 +9871,40 @@ mod tests {
         // Open tasks sort before scratched-out done
         assert_eq!(rows[0].1, "Still open");
         assert!(rows.iter().any(|r| r.1 == "Done today" && r.6));
+    }
+
+    #[test]
+    fn page_bin_round_trips_physical_size_and_legacy_logical_loads() {
+        let dir = std::env::temp_dir().join(format!("eph-ktg4-bin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (pw, ph) = ephemeris_pal::display::PINENOTE_PX;
+        let phys = vec![7u8; (pw * ph) as usize];
+        save_note_page_pixels(&dir, 9, 0, pw, ph, &phys);
+        let (w, h, data) = load_note_page_n(&dir, 9, 0).expect("physical bin loads");
+        assert_eq!((w, h), (pw, ph));
+        assert_eq!(data, phys);
+
+        // Pre-ktg.4 logical-size bin (EPH1 header) still loads with its own size.
+        save_note_page_pixels(&dir, 9, 1, 800, 1067, &vec![255u8; 800 * 1067]);
+        let (w, h, _) = load_note_page_n(&dir, 9, 1).expect("logical bin loads");
+        assert_eq!((w, h), (800, 1067));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transcription_runs_at_logical_size_and_spans_scale_to_pdf_page() {
+        let (pw, ph) = ephemeris_pal::display::PINENOTE_PX;
+        let raster = ephemeris_pal::display::PixelBuf::new(pw, ph);
+        let input = transcription_raster(&raster, (800, 1067));
+        assert_eq!((input.width, input.height), (800, 1067));
+
+        let spans = vec![ephemeris_core::TextSpan::new(
+            "ago", 100.0, 200.0, 40.0, 20.0,
+        )];
+        let scaled = scale_spans(spans, (800, 1067), (pw, ph));
+        assert!((scaled[0].x - 175.5).abs() < 0.01);
+        assert!((scaled[0].width - 70.2).abs() < 0.01);
+        assert!((scaled[0].y - 200.0 * ph as f32 / 1067.0).abs() < 0.01);
     }
 
     #[test]

@@ -100,6 +100,7 @@ impl WaylandState {
             pressure: self.pen_pressure,
             tilt: self.pen_tilt,
             in_range: self.pen_in_range,
+            t_us: 0,
         }
     }
 }
@@ -149,7 +150,11 @@ impl WaylandInput {
         };
 
         match (in_range, sample) {
-            (true, Some(s)) => self.emit(InputEvent::Hover { x: s.x, y: s.y }),
+            (true, Some(s)) => self.emit(InputEvent::Hover {
+                x: s.x,
+                y: s.y,
+                t_us: 0,
+            }),
             (false, Some(s)) => self.emit(InputEvent::PenUp(s)),
             _ => {}
         }
@@ -169,7 +174,7 @@ impl WaylandInput {
         if down {
             self.emit(InputEvent::PenMove(sample));
         } else {
-            self.emit(InputEvent::Hover { x, y });
+            self.emit(InputEvent::Hover { x, y, t_us: 0 });
         }
     }
 

@@ -41,6 +41,22 @@
 //! Compositing is restricted to the canvas region (rows `status_bar_h` to
 //! `height - toolbar_h`), so chrome pixels are never overwritten by ink.
 //!
+//! ## Resolution model (ephemeris-ktg.4)
+//!
+//! Slint chrome renders at the logical design size (≈ half the PineNote
+//! panel) while ink is rasterised at the **physical** panel resolution:
+//!
+//! * strokes stay in logical canvas coordinates; [`raster::InkScale`] maps them
+//!   onto the physical ink planes (`committed_layer`, `in_progress_layer`);
+//! * the logical UI gray is bilinear-upscaled into a physical background cache
+//!   only inside UI-damage rects;
+//! * every present writes `min(background, ink)` 1:1 into a physical buffer
+//!   and hands it to [`Display::present_physical`] with physical damage.
+//!
+//! The physical size is taken from [`Display::physical_size`] on each
+//! [`EphemerisUi::render_frame`]; when it changes, the visible page is
+//! re-rasterised from its strokes and other pages are refit lazily on load.
+//!
 //! ## Page navigation model (bead 6iy.3)
 //!
 //! [`EphemerisUi`] owns a [`PageBook`] which stores one [`PageState`] per page.
@@ -98,7 +114,11 @@ use ephemeris_core::refresh::{DamageSource, RefreshConfig, RefreshScheduler};
 use ephemeris_pal::display::{Display, PixelBuf, Rect};
 use ephemeris_pal::input::InputEvent;
 
+pub mod compose;
 pub mod raster;
+
+use compose::{FrameGeom, InkPlanes};
+use raster::InkScale;
 
 // ── Per-page ink state ────────────────────────────────────────────────────────
 
@@ -112,10 +132,13 @@ pub mod raster;
 /// (edge case) can be recovered without re-borrowing the engine.
 #[derive(Clone)]
 struct PageState {
-    /// Rasterized committed strokes layer for this page (canvas-sized, 8 bpp).
-    /// Shared via [`Arc`] so stroke-end / navigate snapshots are refcount bumps
-    /// instead of full-canvas memcpy.
+    /// Rasterized committed strokes layer for this page (ink-plane sized,
+    /// 8 bpp). Shared via [`Arc`] so stroke-end / navigate snapshots are
+    /// refcount bumps instead of full-canvas memcpy. May have a stale size for
+    /// pages that are not displayed; refit on load.
     committed: Arc<PixelBuf>,
+    /// `committed` must be regenerated from `strokes` before display.
+    raster_stale: bool,
     /// Surviving vector strokes for this page (pen/highlighter only; eraser
     /// removes entries). Used by stroke HTR and must match visible ink.
     strokes: Vec<Stroke>,
@@ -133,6 +156,7 @@ impl PageState {
     fn blank(canvas_w: u32, canvas_h: u32, default_base_width: f32) -> Self {
         PageState {
             committed: Arc::new(PixelBuf::new(canvas_w, canvas_h)),
+            raster_stale: false,
             strokes: Vec::new(),
             in_progress: Vec::new(),
             in_progress_base_width: default_base_width,
@@ -298,55 +322,39 @@ const PAGE_INDICATOR_H: u32 = 28;
 const PAGE_INDICATOR_RIGHT_PAD: u32 = 10; // parent.width - 100
 const PAGE_INDICATOR_BOTTOM_PAD: u32 = 12; // parent.height - 40
 
-/// Copy pre-ink Slint luma back over opaque chrome so `min()` ink blend does
-/// not bleed through the nav rail, drawing menu, or burger button.
-fn restore_chrome_rects(buf: &mut PixelBuf, pre_ink: &[u8], width: u32, height: u32) {
-    let stride = width as usize;
+/// Opaque chrome rects (logical) that must hide ink while the drawing menu is
+/// open, so the `min()` blend does not bleed through the nav rail, drawing
+/// menu, burger button or page indicator.
+fn chrome_rects(width: u32, height: u32) -> [Rect; 4] {
     let menu_x = width.saturating_sub(DRAWING_MENU_W + DRAWING_MENU_RIGHT_PAD);
     let burger_x = width.saturating_sub(BURGER_W + BURGER_RIGHT_PAD);
     let page_x = width.saturating_sub(PAGE_INDICATOR_W + PAGE_INDICATOR_RIGHT_PAD);
     let page_y = height.saturating_sub(PAGE_INDICATOR_H + PAGE_INDICATOR_BOTTOM_PAD);
-
-    let rects = [
+    [
         // Nav rail (full height).
-        (0u32, 0u32, NAV_W.min(width), height),
+        Rect::new(0, 0, NAV_W.min(width), height),
         // Floating drawing menu panel.
-        (
+        Rect::new(
             menu_x,
             DRAWING_MENU_Y.min(height),
             DRAWING_MENU_W.min(width.saturating_sub(menu_x)),
             DRAWING_MENU_H.min(height.saturating_sub(DRAWING_MENU_Y)),
         ),
         // Burger / close button.
-        (
+        Rect::new(
             burger_x,
             BURGER_Y.min(height),
             BURGER_W.min(width.saturating_sub(burger_x)),
             BURGER_H.min(height.saturating_sub(BURGER_Y)),
         ),
         // Page X/Y indicator (menu-open only; harmless when absent).
-        (
+        Rect::new(
             page_x,
             page_y,
             PAGE_INDICATOR_W.min(width.saturating_sub(page_x)),
             PAGE_INDICATOR_H.min(height.saturating_sub(page_y)),
         ),
-    ];
-
-    for (x0, y0, w, h) in rects {
-        if w == 0 || h == 0 {
-            continue;
-        }
-        for y in y0..y0.saturating_add(h).min(height) {
-            let row = y as usize * stride;
-            for x in x0..x0.saturating_add(w).min(width) {
-                let idx = row + x as usize;
-                if idx < pre_ink.len() && idx < buf.data.len() {
-                    buf.data[idx] = pre_ink[idx];
-                }
-            }
-        }
-    }
+    ]
 }
 
 // ── Headless platform ─────────────────────────────────────────────────────────
@@ -405,25 +413,40 @@ pub struct EphemerisUi {
     /// `RepaintBufferType::ReusedBuffer`: Slint only repaints dirty regions,
     /// so we must preserve the full frame buffer between calls).
     rgb565_buf: RefCell<Vec<slint::platform::software_renderer::Rgb565Pixel>>,
-    /// Persistent grayscale present buffer.  Updated only inside damage rects
-    /// so ink frames do not rebuild the whole panel every pen sample.
-    present_buf: RefCell<PixelBuf>,
+    /// Logical grayscale UI frame (Slint luma + page template, no ink).
+    /// Updated only inside UI-damage rects.
+    ui_gray: RefCell<PixelBuf>,
+    /// Physical background cache: `ui_gray` bilinear-upscaled. Refreshed only
+    /// where the UI changed — never per pen sample.
+    bg_phys: RefCell<PixelBuf>,
+    /// Physical present buffer: `min(bg_phys, ink)`, written 1:1 to the display.
+    present_phys: RefCell<PixelBuf>,
+    /// Physical frame size (panel pixels). Logical until a display reports
+    /// otherwise via [`Display::physical_size`].
+    phys_size: Cell<(u32, u32)>,
+    /// Logical rects whose background must be rebuilt (template change).
+    bg_dirty: RefCell<Vec<Rect>>,
+    /// `(composite_ink, drawing_menu_open, template)` the background cache was
+    /// built with; a change invalidates the canvas background.
+    bg_key: Cell<Option<(bool, bool, ephemeris_core::PageTemplate)>>,
     // ── Ink state (interior-mutable so the callbacks can borrow independently) ─
     /// The ink engine: tracks the active stroke builder.
     engine: RefCell<InkEngine>,
     /// Whole-stroke eraser (active when tool is [`Tool::Eraser`]).
     eraser: RefCell<EraserEngine>,
-    /// Rasterized committed strokes layer for the *current page* (canvas-sized,
-    /// 8 bpp).  Shared with `pages.current_page().committed` via [`Arc`] so
-    /// PageBook snapshots do not memcpy the full canvas on every stroke end.
+    /// Rasterized committed strokes layer for the *current page* (physical
+    /// ink-plane size, 8 bpp).  Shared with `pages.current_page().committed`
+    /// via [`Arc`] so PageBook snapshots do not memcpy the full canvas on every
+    /// stroke end.
     committed_layer: RefCell<Arc<PixelBuf>>,
     /// Surviving vector strokes for the *current page* (mirrors
     /// `pages.current_page().strokes`).
     strokes: RefCell<Vec<Stroke>>,
     /// Points of the currently in-progress stroke (canvas-relative).
     in_progress: RefCell<Vec<Point>>,
-    /// Incremental raster of the live stroke (canvas-sized).  New segments are
-    /// stamped in on each `Extended` instead of re-rasterizing all points.
+    /// Incremental raster of the live stroke (physical ink-plane size).  New
+    /// segments are stamped in on each `Extended` instead of re-rasterizing
+    /// all points.
     in_progress_layer: RefCell<PixelBuf>,
     /// `base_width` of the in-progress stroke (copied from `InkConfig` at
     /// `PenDown` time so we can re-rasterize without re-borrowing the engine).
@@ -497,7 +520,12 @@ impl EphemerisUi {
                 slint::platform::software_renderer::Rgb565Pixel(0xFFFF);
                 pixel_count
             ]),
-            present_buf: RefCell::new(PixelBuf::new(width, height)),
+            ui_gray: RefCell::new(PixelBuf::new(width, height)),
+            bg_phys: RefCell::new(PixelBuf::new(width, height)),
+            present_phys: RefCell::new(PixelBuf::new(width, height)),
+            phys_size: Cell::new((width, height)),
+            bg_dirty: RefCell::new(Vec::new()),
+            bg_key: Cell::new(None),
             engine: RefCell::new(InkEngine::new(ink_cfg.clone())),
             eraser: RefCell::new(EraserEngine::new(EraserConfig {
                 radius: ink_cfg.base_width.max(10.0),
@@ -2127,12 +2155,14 @@ impl EphemerisUi {
         self.pages.borrow().current_index()
     }
 
-    /// Raw grayscale pixel bytes of the committed ink layer for the current page.
+    /// Raw grayscale pixel bytes of the committed ink layer for the current page
+    /// (physical ink-plane size — see [`ink_canvas_size`](Self::ink_canvas_size)).
     pub fn get_committed_pixels(&self) -> Vec<u8> {
         self.committed_layer.borrow().data.clone()
     }
 
     /// Shared handle to the committed ink layer (cheap `Arc` clone — no memcpy).
+    /// Its `width`/`height` are the ink-plane size to persist alongside.
     pub fn get_committed_pixels_arc(&self) -> Arc<PixelBuf> {
         Arc::clone(&self.committed_layer.borrow())
     }
@@ -2161,24 +2191,29 @@ impl EphemerisUi {
     /// Used when loading persisted strokes from disk. Does not clear
     /// `strokes_dirty` — callers that load from disk should call
     /// [`clear_strokes_dirty`] afterward if needed.
+    ///
+    /// Pages that are not displayed are only marked stale; their raster is
+    /// regenerated at the current ink-plane size when navigated to.
     pub fn restore_page_strokes(&self, page_idx: usize, strokes: Vec<Stroke>) {
-        let canvas_h = self.canvas_height();
-        {
+        let (iw, ih) = self.ink_canvas_size();
+        let is_current = {
             let mut book = self.pages.borrow_mut();
             while book.pages.len() <= page_idx {
-                book.pages.push(PageState::blank(
-                    self.width,
-                    canvas_h,
-                    self.default_base_width,
-                ));
+                book.pages
+                    .push(PageState::blank(iw, ih, self.default_base_width));
             }
-            book.pages[page_idx].strokes = strokes;
-            let stroke_list = book.pages[page_idx].strokes.clone();
-            let mut rebuilt = PixelBuf::new(self.width, canvas_h);
-            Self::rebuild_committed_from_strokes(&mut rebuilt, &stroke_list, self.width, canvas_h);
-            book.pages[page_idx].committed = Arc::new(rebuilt);
-        }
-        if self.pages.borrow().current_index() == page_idx {
+            let is_current = book.current_index() == page_idx;
+            let page = &mut book.pages[page_idx];
+            page.strokes = strokes;
+            if is_current {
+                page.committed = Arc::new(self.rasterize_strokes(&page.strokes));
+                page.raster_stale = false;
+            } else {
+                page.raster_stale = true;
+            }
+            is_current
+        };
+        if is_current {
             let book = self.pages.borrow();
             let ps = book.current_page();
             *self.committed_layer.borrow_mut() = Arc::clone(&ps.committed);
@@ -2198,19 +2233,36 @@ impl EphemerisUi {
         self.strokes_dirty.set(false);
     }
 
-    fn rebuild_committed_from_strokes(
-        committed: &mut PixelBuf,
-        strokes: &[Stroke],
-        width: u32,
-        canvas_h: u32,
-    ) {
-        *committed = PixelBuf::new(width, canvas_h);
+    /// Rasterize `strokes` into a fresh ink plane at the current physical size.
+    fn rasterize_strokes(&self, strokes: &[Stroke]) -> PixelBuf {
+        let (iw, ih) = self.ink_canvas_size();
+        let scale = self.ink_scale();
+        let mut buf = PixelBuf::new(iw, ih);
         for stroke in strokes {
             if stroke.tool == Tool::Eraser || stroke.points.len() < 2 {
                 continue;
             }
-            raster::rasterize_stroke(committed, stroke, 0, 0, width, canvas_h);
+            raster::rasterize_stroke(&mut buf, stroke, scale);
         }
+        buf
+    }
+
+    /// Bring `page.committed` to the current ink-plane size.
+    ///
+    /// Stale pages and pages with vector strokes are re-rasterized (strokes are
+    /// the source of truth); raster-only legacy pages are resampled.
+    fn fit_page_raster(&self, page: &mut PageState) {
+        let (iw, ih) = self.ink_canvas_size();
+        let sized = page.committed.width == iw && page.committed.height == ih;
+        if sized && !page.raster_stale {
+            return;
+        }
+        page.committed = if page.raster_stale || !page.strokes.is_empty() {
+            Arc::new(self.rasterize_strokes(&page.strokes))
+        } else {
+            Arc::new(compose::resample_gray(&page.committed, iw, ih))
+        };
+        page.raster_stale = false;
     }
 
     fn remove_strokes_by_id(&self, ids: &[StrokeId]) -> bool {
@@ -2229,18 +2281,18 @@ impl EphemerisUi {
             return false;
         }
         self.strokes.borrow_mut().retain(|s| !ids.contains(&s.id));
-        let canvas_h = self.canvas_height();
         let remaining = self.strokes.borrow().clone();
         let mut damage = ephemeris_core::geom::Rect::empty();
         for s in &removed_strokes {
             damage = damage.union(&s.approx_bbox());
         }
-        {
+        if damage.is_empty() {
+            *self.committed_layer.borrow_mut() = Arc::new(self.rasterize_strokes(&remaining));
+        } else {
+            let scale = self.ink_scale();
             let mut arc = self.committed_layer.borrow_mut();
             let committed = Arc::make_mut(&mut arc);
-            Self::erase_region_redraw_survivors(
-                committed, &damage, &remaining, self.width, canvas_h,
-            );
+            Self::erase_region_redraw_survivors(committed, &damage, &remaining, scale);
         }
         {
             let mut book = self.pages.borrow_mut();
@@ -2256,24 +2308,20 @@ impl EphemerisUi {
 
     /// White-fill `damage` in the committed layer, then re-raster survivors that
     /// intersect it (incremental erase — avoids full-page rebuild).
+    ///
+    /// `damage` is in logical canvas coordinates; the cleared region is its
+    /// ink-plane footprint under `scale`.
     fn erase_region_redraw_survivors(
         committed: &mut PixelBuf,
         damage: &ephemeris_core::geom::Rect,
         survivors: &[Stroke],
-        width: u32,
-        canvas_h: u32,
+        scale: InkScale,
     ) {
-        if damage.is_empty() {
-            Self::rebuild_committed_from_strokes(committed, survivors, width, canvas_h);
+        let Some((x0, y0, x1, y1)) =
+            raster::ink_pixel_bounds(damage, scale, committed.width, committed.height)
+        else {
             return;
-        }
-        let x0 = damage.min_x.max(0.0).floor() as u32;
-        let y0 = damage.min_y.max(0.0).floor() as u32;
-        let x1 = (damage.max_x.ceil() as i64).clamp(0, width as i64) as u32;
-        let y1 = (damage.max_y.ceil() as i64).clamp(0, canvas_h as i64) as u32;
-        if x1 <= x0 || y1 <= y0 {
-            return;
-        }
+        };
         let stride = committed.stride as usize;
         for y in y0..y1 {
             let row = y as usize * stride;
@@ -2297,7 +2345,7 @@ impl EphemerisUi {
             {
                 continue;
             }
-            raster::rasterize_stroke(committed, stroke, 0, 0, width, canvas_h);
+            raster::rasterize_stroke(committed, stroke, scale);
         }
     }
 
@@ -2306,9 +2354,68 @@ impl EphemerisUi {
         (self.width, self.height)
     }
 
-    /// Canvas size for the committed ink layer `(width, height)`.
+    /// Logical canvas size `(width, height)` — the coordinate space of strokes.
     pub fn canvas_size(&self) -> (u32, u32) {
         (self.width, self.canvas_height())
+    }
+
+    /// Physical frame size the ink planes and present buffer are built for.
+    pub fn physical_size(&self) -> (u32, u32) {
+        self.phys_size.get()
+    }
+
+    /// Committed / in-progress ink-plane size in physical pixels.
+    pub fn ink_canvas_size(&self) -> (u32, u32) {
+        let (y0, y1) = self.ink_canvas_rows();
+        (self.phys_size.get().0, y1 - y0)
+    }
+
+    /// Logical canvas → ink-plane scale (`phys / logical` per axis).
+    pub fn ink_scale(&self) -> InkScale {
+        InkScale::from_sizes(self.canvas_size(), self.ink_canvas_size())
+    }
+
+    /// Resize the ink planes, background cache and present buffer to the
+    /// physical frame `pw × ph`. Returns `false` when nothing changed.
+    ///
+    /// The visible page is re-rasterized from its strokes at the new scale;
+    /// other pages are refit lazily when navigated to. Called automatically by
+    /// [`render_frame`](Self::render_frame) from [`Display::physical_size`].
+    pub fn set_physical_size(&self, pw: u32, ph: u32) -> bool {
+        if pw == 0 || ph == 0 || self.phys_size.get() == (pw, ph) {
+            return false;
+        }
+        self.phys_size.set((pw, ph));
+        *self.bg_phys.borrow_mut() = PixelBuf::new(pw, ph);
+        *self.present_phys.borrow_mut() = PixelBuf::new(pw, ph);
+        self.bg_key.set(None);
+
+        {
+            let mut book = self.pages.borrow_mut();
+            let page = book.current_page_mut();
+            page.committed = Arc::clone(&self.committed_layer.borrow());
+            page.strokes = self.strokes.borrow().clone();
+            self.fit_page_raster(page);
+            *self.committed_layer.borrow_mut() = Arc::clone(&page.committed);
+        }
+
+        let (iw, ih) = self.ink_canvas_size();
+        *self.in_progress_layer.borrow_mut() = PixelBuf::new(iw, ih);
+        self.rebuild_in_progress_layer();
+        self.screen_change.set(true);
+        true
+    }
+
+    /// Physical row span `[y0, y1)` of the canvas inside the frame.
+    fn ink_canvas_rows(&self) -> (u32, u32) {
+        let g = self.frame_geom();
+        let y0 = g.phys_y(STATUS_BAR_H);
+        let y1 = g.phys_y(self.height.saturating_sub(TOOLBAR_H)).max(y0);
+        (y0, y1)
+    }
+
+    fn frame_geom(&self) -> FrameGeom {
+        FrameGeom::new((self.width, self.height), self.phys_size.get())
     }
 
     /// Restore saved pixel data into a specific PageBook slot.
@@ -2319,32 +2426,43 @@ impl EphemerisUi {
     /// Does not clear the stroke list — call [`restore_page_strokes`] when
     /// vector ink is available, or leave strokes empty for legacy raster-only
     /// pages (See-text falls back to OCR).
-    pub fn restore_page_pixels(&self, page_idx: usize, data: Vec<u8>) {
-        let canvas_h = self.canvas_height();
-        let expected = (self.width * canvas_h) as usize;
-        if data.len() != expected {
+    ///
+    /// `width × height` is the size the raster was saved at: any size is
+    /// accepted (old logical-size bins included). The visible page is refit to
+    /// the ink plane immediately; other pages are refit when navigated to.
+    pub fn restore_page_pixels(&self, page_idx: usize, width: u32, height: u32, data: Vec<u8>) {
+        let expected = width as usize * height as usize;
+        if expected == 0 || data.len() != expected {
             eprintln!(
-                "restore_page_pixels: size mismatch (expected {expected}, got {})",
+                "restore_page_pixels: size mismatch ({width}×{height} expects {expected}, got {})",
                 data.len()
             );
             return;
         }
-        let mut new_committed = PixelBuf::new(self.width, canvas_h);
-        new_committed.data = data;
-        let shared = Arc::new(new_committed);
-        {
+        let mut raster = PixelBuf::new(width, height);
+        raster.data = data;
+        let (iw, ih) = self.ink_canvas_size();
+        let is_current = {
             let mut book = self.pages.borrow_mut();
             while book.pages.len() <= page_idx {
-                book.pages.push(PageState::blank(
-                    self.width,
-                    canvas_h,
-                    self.default_base_width,
-                ));
+                book.pages
+                    .push(PageState::blank(iw, ih, self.default_base_width));
             }
-            book.pages[page_idx].committed = Arc::clone(&shared);
-        }
-        if self.pages.borrow().current_index() == page_idx {
-            *self.committed_layer.borrow_mut() = shared;
+            let is_current = book.current_index() == page_idx;
+            let page = &mut book.pages[page_idx];
+            page.committed = Arc::new(raster);
+            page.raster_stale = false;
+            if is_current {
+                // Strokes may belong to a previous occupant of this slot; the
+                // caller follows up with `restore_page_strokes` when it has them.
+                let strokes = std::mem::take(&mut page.strokes);
+                self.fit_page_raster(page);
+                page.strokes = strokes;
+                *self.committed_layer.borrow_mut() = Arc::clone(&page.committed);
+            }
+            is_current
+        };
+        if is_current {
             self.screen_change.set(true);
         }
     }
@@ -2407,7 +2525,8 @@ impl EphemerisUi {
             let count = book.page_count();
             if cur + 1 >= count {
                 // Auto-create a new blank page.
-                book.push_blank_page(live_state, self.width, canvas_h, self.default_base_width)
+                let (iw, ih) = self.ink_canvas_size();
+                book.push_blank_page(live_state, iw, ih, self.default_base_width)
             } else {
                 book.navigate_to(live_state, cur + 1);
                 cur + 1
@@ -2461,8 +2580,9 @@ impl EphemerisUi {
         let live_state = self.snapshot_live_state(canvas_h);
 
         let new_idx = {
+            let (iw, ih) = self.ink_canvas_size();
             let mut book = self.pages.borrow_mut();
-            book.push_blank_page(live_state, self.width, canvas_h, self.default_base_width)
+            book.push_blank_page(live_state, iw, ih, self.default_base_width)
         };
 
         self.load_page_state(new_idx);
@@ -2529,7 +2649,7 @@ impl EphemerisUi {
 
         let update = self.engine.borrow_mut().update(event, t_ms);
         let tool = self.engine.borrow().config().tool;
-        let canvas_h = self.canvas_height();
+        let scale = self.ink_scale();
 
         match &update {
             InkUpdate::Started => {
@@ -2546,11 +2666,8 @@ impl EphemerisUi {
                         &mut self.in_progress_layer.borrow_mut(),
                         std::slice::from_ref(&pt),
                         bw,
-                        0,
-                        0,
-                        self.width,
-                        canvas_h,
                         tool,
+                        scale,
                     );
                     let pad = bw + 1.0;
                     self.push_ink_damage(
@@ -2580,11 +2697,8 @@ impl EphemerisUi {
                             &mut self.in_progress_layer.borrow_mut(),
                             &seg,
                             bw,
-                            0,
-                            0,
-                            self.width,
-                            canvas_h,
                             tool,
+                            scale,
                         );
                     }
                 }
@@ -2595,14 +2709,7 @@ impl EphemerisUi {
                 if stroke.tool != Tool::Eraser && stroke.points.len() >= 2 {
                     {
                         let mut arc = self.committed_layer.borrow_mut();
-                        raster::rasterize_stroke(
-                            Arc::make_mut(&mut arc),
-                            stroke,
-                            0,
-                            0,
-                            self.width,
-                            canvas_h,
-                        );
+                        raster::rasterize_stroke(Arc::make_mut(&mut arc), stroke, scale);
                     }
                     self.strokes.borrow_mut().push((**stroke).clone());
                     {
@@ -2656,6 +2763,24 @@ impl EphemerisUi {
         InkUpdate::Idle
     }
 
+    /// Re-stamp the live layer from the stored in-progress points (page load,
+    /// ink-plane resize).
+    fn rebuild_in_progress_layer(&self) {
+        let tool = self.engine.borrow().config().tool;
+        self.clear_in_progress_layer(tool);
+        let pts = self.in_progress.borrow();
+        if !pts.is_empty() {
+            let bw = *self.in_progress_base_width.borrow();
+            raster::rasterize_points(
+                &mut self.in_progress_layer.borrow_mut(),
+                &pts,
+                bw,
+                tool,
+                self.ink_scale(),
+            );
+        }
+    }
+
     /// Reset the live stroke raster to the blend identity for `tool`.
     fn clear_in_progress_layer(&self, tool: Tool) {
         let mut layer = self.in_progress_layer.borrow_mut();
@@ -2669,16 +2794,27 @@ impl EphemerisUi {
     /// Push externally-rasterized canvas pixels into the committed ink layer,
     /// replacing it entirely.
     ///
-    /// `pixels` must be a `width × canvas_height` grayscale buffer where
-    /// `canvas_height = height - STATUS_BAR_H - TOOLBAR_H`.  If the dimensions
-    /// do not match the UI's canvas dimensions, the push is silently ignored.
+    /// `pixels` must be either ink-plane sized ([`ink_canvas_size`]) or
+    /// logical-canvas sized ([`canvas_size`], resampled to the ink plane).
+    /// Any other size is silently ignored.
     ///
     /// This is the explicit seam documented in the `lib.rs` module doc — useful
     /// for callers that maintain their own stroke rasterizer outside this crate.
+    ///
+    /// [`ink_canvas_size`]: Self::ink_canvas_size
+    /// [`canvas_size`]: Self::canvas_size
     pub fn push_canvas_pixels(&self, pixels: &PixelBuf) {
         let canvas_h = self.canvas_height();
-        if pixels.width == self.width && pixels.height == canvas_h {
-            let shared = Arc::new(pixels.clone());
+        let (iw, ih) = self.ink_canvas_size();
+        let fitted = if (pixels.width, pixels.height) == (iw, ih) {
+            Some(pixels.clone())
+        } else if (pixels.width, pixels.height) == (self.width, canvas_h) {
+            Some(compose::resample_gray(pixels, iw, ih))
+        } else {
+            None
+        };
+        if let Some(fitted) = fitted {
+            let shared = Arc::new(fitted);
             *self.committed_layer.borrow_mut() = Arc::clone(&shared);
             self.pages.borrow_mut().current_page_mut().committed = shared;
             // The whole canvas may have changed; mark it dirty so the next
@@ -2717,7 +2853,8 @@ impl EphemerisUi {
     /// returns to a blank page.
     pub fn clear_ink(&self) {
         let canvas_h = self.canvas_height();
-        let blank = Arc::new(PixelBuf::new(self.width, canvas_h));
+        let (iw, ih) = self.ink_canvas_size();
+        let blank = Arc::new(PixelBuf::new(iw, ih));
         *self.committed_layer.borrow_mut() = Arc::clone(&blank);
         self.strokes.borrow_mut().clear();
         self.in_progress.borrow_mut().clear();
@@ -2728,6 +2865,7 @@ impl EphemerisUi {
             let mut book = self.pages.borrow_mut();
             let page = book.current_page_mut();
             page.committed = blank;
+            page.raster_stale = false;
             page.strokes.clear();
             page.in_progress.clear();
         }
@@ -2751,7 +2889,7 @@ impl EphemerisUi {
     pub fn set_current_page_template(&self, template: ephemeris_core::PageTemplate) {
         self.pages.borrow_mut().current_page_mut().template = template;
         let canvas_h = self.canvas_height();
-        self.ink_damage
+        self.bg_dirty
             .borrow_mut()
             .push(Rect::new(0, STATUS_BAR_H, self.width, canvas_h));
     }
@@ -2808,6 +2946,10 @@ impl EphemerisUi {
         &self,
         display: &mut D,
     ) -> Result<Vec<Rect>, Box<dyn std::error::Error>> {
+        // 0. Track the display's physical size (re-rasterizes ink on change).
+        let (pw, ph) = display.physical_size();
+        self.set_physical_size(pw, ph);
+
         // 1. Pump Slint's event loop one tick (process pending events / layout).
         slint::platform::update_timers_and_animations();
 
@@ -2847,8 +2989,33 @@ impl EphemerisUi {
         // Did a page switch / clear / first paint invalidate the whole screen?
         let screen_change = self.screen_change.replace(false);
 
+        // Background (Slint + template) rects to rebuild this frame. A change of
+        // template or ink-compositing state invalidates the whole canvas.
+        let composite_ink = self.should_composite_ink();
+        let drawing_menu_open = self.component.get_drawing_menu_open();
+        let template = self.current_page_template();
+        let bg_key = Some((composite_ink, drawing_menu_open, template));
+        let mut bg_damage = std::mem::take(&mut *self.bg_dirty.borrow_mut());
+        match self.bg_key.replace(bg_key) {
+            _ if screen_change => {}
+            prev if prev == bg_key => {}
+            // Menu toggle only changes the template under opaque chrome.
+            Some((c, _, t)) if (c, t) == (composite_ink, template) => {
+                bg_damage.extend(
+                    chrome_rects(self.width, self.height)
+                        .into_iter()
+                        .filter(|r| r.width > 0 && r.height > 0),
+                );
+            }
+            _ => bg_damage.push(Rect::new(0, STATUS_BAR_H, self.width, self.canvas_height())),
+        }
+
         // eink render loop: only present when something actually changed.
-        if slint_damage.is_empty() && ink_damage.is_empty() && !screen_change {
+        if slint_damage.is_empty()
+            && ink_damage.is_empty()
+            && bg_damage.is_empty()
+            && !screen_change
+        {
             return Ok(vec![]);
         }
 
@@ -2861,7 +3028,7 @@ impl EphemerisUi {
                 DamageSource::ScreenChange,
             );
         }
-        for rect in &slint_damage {
+        for rect in slint_damage.iter().chain(&bg_damage) {
             scheduler.submit(*rect, DamageSource::Ui);
         }
         for rect in &ink_damage {
@@ -2872,79 +3039,99 @@ impl EphemerisUi {
             .expect("damage was submitted, so flush must yield a present");
         drop(scheduler);
 
-        let canvas_h = self.canvas_height();
-        let drawing_menu_open = self.component.get_drawing_menu_open();
-        let composite_ink = self.should_composite_ink();
         let current_tool = self.engine.borrow().config().tool;
         let has_in_progress = !self.in_progress.borrow().is_empty();
-        let template = self.current_page_template();
+        let geom = self.frame_geom();
+        // Bilinear taps reach one logical pixel past a changed rect.
+        const BG_MARGIN: u32 = 1;
 
-        // 5. Update the persistent present buffer only inside damage rects.
-        {
+        // 5. Refresh the background cache where the UI changed (never for
+        //    ink-only frames): Slint luma + template at logical size, then a
+        //    bilinear upscale into the physical cache.
+        let mut bg_rects: Vec<Rect> = Vec::new();
+        if screen_change {
+            bg_rects.push(Rect::new(0, 0, self.width, self.height));
+        } else {
+            bg_rects.extend(
+                slint_damage
+                    .iter()
+                    .chain(&bg_damage)
+                    .filter_map(|r| geom.grow_logical(r, BG_MARGIN)),
+            );
+        }
+        if !bg_rects.is_empty() {
             let pixels = self.rgb565_buf.borrow();
-            let mut pal_buf = self.present_buf.borrow_mut();
-            let committed = self.committed_layer.borrow();
-            let ip_layer = self.in_progress_layer.borrow();
+            let mut ui_gray = self.ui_gray.borrow_mut();
+            let mut bg_phys = self.bg_phys.borrow_mut();
             let stride = self.width as usize;
-
-            // When the drawing menu is open we must restore chrome after ink
-            // composite; snapshot Slint luma for those rects only when needed.
-            let pre_ink = if composite_ink && drawing_menu_open {
-                let mut snap = vec![255u8; pal_buf.data.len()];
-                for rect in &present.damage {
-                    convert_rgb565_rect_to_gray(&pixels, &mut snap, stride, rect, self.height);
-                }
-                Some(snap)
-            } else {
-                None
-            };
-
-            for rect in &present.damage {
-                convert_rgb565_rect_to_gray(&pixels, &mut pal_buf.data, stride, rect, self.height);
-
-                if !composite_ink {
-                    continue;
-                }
-
-                render_background_in_rect(&mut pal_buf, template, self.width, self.height, rect);
-
-                // Canvas intersection of this damage rect.
-                let canvas_y0 = STATUS_BAR_H;
-                let canvas_y1 = STATUS_BAR_H + canvas_h;
-                let x0 = rect.x;
-                let y0 = rect.y.max(canvas_y0);
-                let x1 = rect.x.saturating_add(rect.width).min(self.width);
-                let y1 = rect.y.saturating_add(rect.height).min(canvas_y1);
-                if x1 <= x0 || y1 <= y0 {
-                    continue;
-                }
-
-                for y in y0..y1 {
-                    let canvas_row = (y - STATUS_BAR_H) as usize;
-                    let buf_row = y as usize * stride;
-                    let layer_row = canvas_row * stride;
-                    for x in x0..x1 {
-                        let col = x as usize;
-                        let mut ink_px = committed.data[layer_row + col];
-                        if has_in_progress {
-                            ink_px = if current_tool == Tool::Eraser {
-                                ink_px.max(ip_layer.data[layer_row + col])
-                            } else {
-                                ink_px.min(ip_layer.data[layer_row + col])
-                            };
+            let chrome = chrome_rects(self.width, self.height);
+            for rect in &bg_rects {
+                convert_rgb565_rect_to_gray(&pixels, &mut ui_gray.data, stride, rect, self.height);
+                if composite_ink {
+                    render_background_in_rect(
+                        &mut ui_gray,
+                        template,
+                        self.width,
+                        self.height,
+                        rect,
+                    );
+                    if drawing_menu_open {
+                        // Opaque chrome shows pure Slint luma (no template).
+                        for c in chrome.iter().filter_map(|c| compose::intersect(c, rect)) {
+                            convert_rgb565_rect_to_gray(
+                                &pixels,
+                                &mut ui_gray.data,
+                                stride,
+                                &c,
+                                self.height,
+                            );
                         }
-                        let buf_idx = buf_row + col;
-                        pal_buf.data[buf_idx] = pal_buf.data[buf_idx].min(ink_px);
                     }
                 }
             }
-
-            if let Some(pre) = pre_ink {
-                restore_chrome_rects(&mut pal_buf, &pre, self.width, self.height);
+            for rect in &bg_rects {
+                if let Some(pr) = geom.to_phys(rect, 0) {
+                    compose::upscale_bilinear_rect(&ui_gray, &mut bg_phys, pr);
+                }
             }
         }
 
-        display.present(&self.present_buf.borrow(), &present.damage, present.mode)?;
+        // 6. Compose `min(bg, ink)` 1:1 into the physical present buffer for
+        //    the physical footprint of every damage rect.
+        let phys_damage: Vec<Rect> = present
+            .damage
+            .iter()
+            .filter_map(|r| geom.to_phys(r, BG_MARGIN))
+            .collect();
+        {
+            let bg_phys = self.bg_phys.borrow();
+            let mut out = self.present_phys.borrow_mut();
+            let committed = self.committed_layer.borrow();
+            let ip_layer = self.in_progress_layer.borrow();
+            let planes = InkPlanes {
+                committed: &committed,
+                live: has_in_progress.then_some(&*ip_layer),
+                live_is_eraser: current_tool == Tool::Eraser,
+                canvas_y0: self.ink_canvas_rows().0,
+            };
+            let ink = composite_ink.then_some(&planes);
+            let chrome: Vec<Rect> = if composite_ink && drawing_menu_open {
+                chrome_rects(self.width, self.height)
+                    .iter()
+                    .filter_map(|c| geom.to_phys(c, 0))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            for pr in &phys_damage {
+                compose::compose_rect(&mut out, &bg_phys, ink, *pr);
+                for c in chrome.iter().filter_map(|c| compose::intersect(c, pr)) {
+                    compose::copy_rect(&mut out, &bg_phys, c);
+                }
+            }
+        }
+
+        display.present_physical(&self.present_phys.borrow(), &phys_damage, present.mode)?;
 
         Ok(present.damage)
     }
@@ -2989,6 +3176,7 @@ impl EphemerisUi {
         drop(book);
         PageState {
             committed: Arc::clone(&self.committed_layer.borrow()),
+            raster_stale: false,
             strokes: self.strokes.borrow().clone(),
             in_progress: self.in_progress.borrow().clone(),
             in_progress_base_width: *self.in_progress_base_width.borrow(),
@@ -3003,7 +3191,8 @@ impl EphemerisUi {
     /// that `book.current_index()` already reflects the target.
     fn load_page_state(&self, _page_index: usize) {
         let (new_committed, new_strokes, new_ip, new_bw, new_cur, new_count) = {
-            let book = self.pages.borrow();
+            let mut book = self.pages.borrow_mut();
+            self.fit_page_raster(book.current_page_mut());
             let ps = book.current_page();
             (
                 Arc::clone(&ps.committed),
@@ -3028,26 +3217,7 @@ impl EphemerisUi {
         });
         *self.eraser.borrow_mut() = EraserEngine::new(EraserConfig::default());
 
-        // Rebuild the incremental live layer from restored in-progress points.
-        let tool = self.engine.borrow().config().tool;
-        self.clear_in_progress_layer(tool);
-        {
-            let pts = self.in_progress.borrow();
-            if !pts.is_empty() {
-                let bw = *self.in_progress_base_width.borrow();
-                let canvas_h = self.canvas_height();
-                raster::rasterize_points(
-                    &mut self.in_progress_layer.borrow_mut(),
-                    &pts,
-                    bw,
-                    0,
-                    0,
-                    self.width,
-                    canvas_h,
-                    tool,
-                );
-            }
-        }
+        self.rebuild_in_progress_layer();
 
         // Update the Slint status bar (1-based display index).
         self.component.set_page_index((new_cur + 1) as i32);
@@ -3307,6 +3477,7 @@ mod tests {
             pressure: 0.5,
             tilt: 0.0,
             in_range: true,
+            t_us: 0,
         }
     }
 
@@ -4369,5 +4540,213 @@ mod tests {
             nav_avg > 100,
             "nav rail must restore Slint chrome (avg luma {nav_avg} too dark — ink bleed)"
         );
+    }
+
+    // ── Panel-resolution ink plane (ephemeris-ktg.4) ──────────────────────
+
+    const PN_LOGICAL: (u32, u32) = (800, 1067);
+    const PN_PHYS: (u32, u32) = ephemeris_pal::display::PINENOTE_PX;
+
+    /// HiDPI display double: logical 800×1067 UI on a 1404×1872 panel.
+    struct PanelDisplay {
+        last: Option<PixelBuf>,
+        last_damage: Vec<Rect>,
+        last_mode: Option<RefreshMode>,
+        logical_presents: usize,
+    }
+    impl PanelDisplay {
+        fn new() -> Self {
+            PanelDisplay {
+                last: None,
+                last_damage: Vec::new(),
+                last_mode: None,
+                logical_presents: 0,
+            }
+        }
+    }
+    impl Display for PanelDisplay {
+        fn size(&self) -> (u32, u32) {
+            PN_LOGICAL
+        }
+        fn physical_size(&self) -> (u32, u32) {
+            PN_PHYS
+        }
+        fn present(
+            &mut self,
+            _: &PixelBuf,
+            _: &[Rect],
+            _: RefreshMode,
+        ) -> Result<(), ephemeris_pal::DisplayError> {
+            self.logical_presents += 1;
+            Ok(())
+        }
+        fn present_physical(
+            &mut self,
+            buf: &PixelBuf,
+            damage: &[Rect],
+            mode: RefreshMode,
+        ) -> Result<(), ephemeris_pal::DisplayError> {
+            self.last = Some(buf.clone());
+            self.last_damage = damage.to_vec();
+            self.last_mode = Some(mode);
+            Ok(())
+        }
+    }
+
+    fn draw_line(ui: &EphemerisUi, from: (f32, f32), to: (f32, f32), t0: u32) {
+        ui.feed_input(&InputEvent::PenDown(pen_sample(from.0, from.1)), t0);
+        for i in 1..=20 {
+            let t = i as f32 / 20.0;
+            let p = (from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t);
+            ui.feed_input(&InputEvent::PenMove(pen_sample(p.0, p.1)), t0 + i * 8);
+        }
+        ui.feed_input(&InputEvent::PenUp(pen_sample(to.0, to.1)), t0 + 200);
+    }
+
+    #[test]
+    fn panel_display_gets_physical_ink_presents() {
+        let ui = EphemerisUi::new(PN_LOGICAL.0, PN_LOGICAL.1).expect("UI construction failed");
+        let mut disp = PanelDisplay::new();
+        ui.render_frame(&mut disp).expect("first render failed");
+
+        assert_eq!(ui.physical_size(), PN_PHYS);
+        assert_eq!(ui.ink_canvas_size(), PN_PHYS);
+        let s = ui.ink_scale();
+        assert!((s.sx - 1.755).abs() < 1e-3 && (s.sy - 1.7544).abs() < 1e-3);
+        let first = disp.last.as_ref().expect("first frame presented");
+        assert_eq!((first.width, first.height), PN_PHYS);
+
+        draw_line(&ui, (200.0, 300.0), (400.0, 300.0), 0);
+        ui.render_frame(&mut disp).expect("ink render failed");
+        assert_eq!(disp.last_mode, Some(RefreshMode::Fast));
+        assert_eq!(disp.logical_presents, 0, "UI must use the physical path");
+
+        // Damage is physical, bounded to the stroke — no full-panel rewrite.
+        let area: u64 = disp
+            .last_damage
+            .iter()
+            .map(|r| u64::from(r.width) * u64::from(r.height))
+            .sum();
+        assert!(area > 0 && area < u64::from(PN_PHYS.0 * PN_PHYS.1) / 20);
+        for r in &disp.last_damage {
+            assert!(r.x + r.width <= PN_PHYS.0 && r.y + r.height <= PN_PHYS.1);
+        }
+
+        // Ink lands at the physical position of logical (300, 300).
+        let buf = disp.last.as_ref().unwrap();
+        let (px, py) = ((300.0 * s.sx) as usize, (300.0 * s.sy) as usize);
+        let dark = (py - 4..py + 4).any(|y| buf.data[y * buf.stride as usize + px] < 80);
+        assert!(dark, "stroke must be visible at physical ({px}, {py})");
+        assert_eq!(ui.committed_layer.borrow().width, PN_PHYS.0);
+    }
+
+    #[test]
+    fn ink_only_frames_reuse_background_cache() {
+        let ui = EphemerisUi::new(PN_LOGICAL.0, PN_LOGICAL.1).expect("UI construction failed");
+        let mut disp = PanelDisplay::new();
+        ui.render_frame(&mut disp).expect("first render failed");
+        assert!(ui.render_frame(&mut disp).unwrap().is_empty());
+
+        // Sentinel background: a rebuilt background would put white paper
+        // back inside the damage rect.
+        ui.bg_phys.borrow_mut().fill(77);
+        draw_line(&ui, (200.0, 300.0), (300.0, 300.0), 0);
+        ui.render_frame(&mut disp).expect("ink render failed");
+        assert_eq!(disp.last_mode, Some(RefreshMode::Fast));
+        let buf = disp.last.as_ref().unwrap();
+        assert!(!disp.last_damage.is_empty());
+        for r in &disp.last_damage {
+            for y in r.y..r.y + r.height {
+                for x in r.x..r.x + r.width {
+                    assert!(
+                        buf.data[(y * buf.stride + x) as usize] <= 77,
+                        "ink-only present must compose over the cached background ({x}, {y})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn logical_page_bin_loads_at_physical_size() {
+        let ui = EphemerisUi::new(PN_LOGICAL.0, PN_LOGICAL.1).expect("UI construction failed");
+        ui.set_physical_size(PN_PHYS.0, PN_PHYS.1);
+
+        // Old bin: logical 800×1067 with a black bar at row 500.
+        let (lw, lh) = PN_LOGICAL;
+        let mut data = vec![255u8; (lw * lh) as usize];
+        for x in 100..700 {
+            for y in 499..502 {
+                data[(y * lw + x) as usize] = 0;
+            }
+        }
+        ui.restore_page_pixels(0, lw, lh, data);
+        let committed = ui.get_committed_pixels_arc();
+        assert_eq!((committed.width, committed.height), PN_PHYS);
+        let py = (500.0 * ui.ink_scale().sy) as usize;
+        assert!(committed.data[py * PN_PHYS.0 as usize + 700] < 100);
+
+        // Physical-size bins load unchanged.
+        let phys = vec![200u8; (PN_PHYS.0 * PN_PHYS.1) as usize];
+        ui.restore_page_pixels(0, PN_PHYS.0, PN_PHYS.1, phys.clone());
+        assert_eq!(ui.get_committed_pixels(), phys);
+    }
+
+    #[test]
+    fn hidden_page_strokes_regenerate_at_physical_size_on_load() {
+        let ui = EphemerisUi::new(PN_LOGICAL.0, PN_LOGICAL.1).expect("UI construction failed");
+        ui.push_new_page();
+        ui.navigate_to_page(0);
+
+        // Page 1 gets a logical-size raster plus strokes (an old save).
+        let mut s = Stroke::new(Tool::Pen, ephemeris_core::model::Color::BLACK, 3.0);
+        for i in 0..40 {
+            s.points.push(Point {
+                x: 100.0 + i as f32 * 5.0,
+                y: 400.0,
+                pressure: 0.5,
+                tilt: 0.0,
+                t_ms: i * 8,
+            });
+        }
+        let (lw, lh) = PN_LOGICAL;
+        ui.restore_page_pixels(1, lw, lh, vec![255u8; (lw * lh) as usize]);
+        ui.restore_page_strokes(1, vec![s]);
+
+        ui.set_physical_size(PN_PHYS.0, PN_PHYS.1);
+        ui.navigate_to_page(1);
+        let committed = ui.get_committed_pixels_arc();
+        assert_eq!((committed.width, committed.height), PN_PHYS);
+        let sc = ui.ink_scale();
+        let (px, py) = ((200.0 * sc.sx) as usize, (400.0 * sc.sy) as usize);
+        assert!(
+            committed.data[py * PN_PHYS.0 as usize + px] < 50,
+            "strokes must be re-rasterized at panel resolution"
+        );
+    }
+
+    #[test]
+    fn resize_rerasterizes_visible_page_and_eraser_still_hits() {
+        let ui = EphemerisUi::new(800, 600).expect("UI construction failed");
+        draw_line(&ui, (100.0, 100.0), (300.0, 100.0), 0);
+        assert_eq!(ui.committed_layer.borrow().width, 800);
+
+        assert!(ui.set_physical_size(1600, 1200));
+        assert!(!ui.set_physical_size(1600, 1200), "same size is a no-op");
+        {
+            let committed = ui.committed_layer.borrow();
+            assert_eq!((committed.width, committed.height), (1600, 1200));
+            assert!(
+                committed.data[200 * 1600 + 400] < 50,
+                "stroke at 2× position"
+            );
+        }
+
+        // Eraser works in logical coordinates and clears the physical raster.
+        ui.set_tool(Tool::Eraser);
+        ui.feed_input(&InputEvent::PenDown(pen_sample(200.0, 100.0)), 1000);
+        ui.feed_input(&InputEvent::PenUp(pen_sample(200.0, 100.0)), 1008);
+        assert!(ui.get_page_strokes().is_empty());
+        assert!(ui.committed_layer.borrow().data.iter().all(|&v| v == 255));
     }
 }

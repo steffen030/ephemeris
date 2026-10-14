@@ -247,6 +247,7 @@ mod tests {
             pressure: 0.5,
             tilt: 0.0,
             in_range: true,
+            t_us: 0,
         }
     }
 

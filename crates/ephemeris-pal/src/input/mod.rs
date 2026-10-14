@@ -22,16 +22,20 @@
 //!   blocks on.  This avoids forcing async onto consumers while still
 //!   supporting background threads.
 
+pub mod ink_record;
 pub mod mock;
 pub mod palm;
 pub mod stylus_map;
+pub mod tablet_cursor;
 pub mod wayland;
 
 #[cfg(target_os = "linux")]
 pub mod evdev_pen;
 
+pub use ink_record::InkRecorder;
 pub use palm::{PalmRejector, PalmRejectorConfig};
 pub use stylus_map::{digitizer_to_window, orient_axes, window_to_ui};
+pub use tablet_cursor::TabletCursorHider;
 pub use wayland::WaylandInput;
 
 #[cfg(target_os = "linux")]
@@ -70,7 +74,12 @@ pub enum InputEvent {
 
     /// The pen is hovering above (in proximity of) the surface but not
     /// touching.  Used for cursor preview and palm rejection.
-    Hover { x: f32, y: f32 },
+    Hover {
+        x: f32,
+        y: f32,
+        /// Kernel timestamp in microseconds; `0` = unknown.
+        t_us: u64,
+    },
 
     // ── Finger touch ─────────────────────────────────────────────────────────
     /// A new finger contact began.
@@ -99,6 +108,10 @@ pub struct PenSample {
     /// `true` while the pen is in the digitiser's detection range (includes
     /// hover), `false` when it has left the proximity zone entirely.
     pub in_range: bool,
+    /// Event timestamp in microseconds since the Unix epoch, as stamped by the
+    /// kernel on the evdev event (`input_event.time`). Only differences are
+    /// meaningful to consumers. `0` means unknown (mouse/touch / synthetic).
+    pub t_us: u64,
 }
 
 /// One sample from a finger touch contact.
