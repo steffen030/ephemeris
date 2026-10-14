@@ -317,20 +317,27 @@ const BURGER_H: u32 = 44;
 const BURGER_RIGHT_PAD: u32 = 8; // parent.width - 52
 const BURGER_Y: u32 = 8;
 
-/// Bottom-right page X/Y chip (`note-page-indicator` in `main.slint`).
-const PAGE_INDICATOR_W: u32 = 90;
+/// Bottom-right page X/Y + prev/next chip (`note-page-indicator` in `main.slint`).
+const PAGE_INDICATOR_W: u32 = 158;
 const PAGE_INDICATOR_H: u32 = 28;
-const PAGE_INDICATOR_RIGHT_PAD: u32 = 10; // parent.width - 100
+const PAGE_INDICATOR_RIGHT_PAD: u32 = 10; // parent.width - 168
 const PAGE_INDICATOR_BOTTOM_PAD: u32 = 12; // parent.height - 40
+
+/// Note title bar (`note-title-bar` in `main.slint`): right of nav, top strip.
+const TITLE_BAR_X: u32 = NAV_W + 8;
+const TITLE_BAR_Y: u32 = 8;
+const TITLE_BAR_H: u32 = 44;
+const TITLE_BAR_RIGHT_PAD: u32 = 60; // parent.width - nav-w - 60
 
 /// Opaque chrome rects (logical) that must hide ink while the drawing menu is
 /// open, so the `min()` blend does not bleed through the nav rail, drawing
-/// menu, burger button or page indicator.
-fn chrome_rects(width: u32, height: u32) -> [Rect; 4] {
+/// menu, burger button, title bar or page indicator.
+fn chrome_rects(width: u32, height: u32) -> [Rect; 5] {
     let menu_x = width.saturating_sub(DRAWING_MENU_W + DRAWING_MENU_RIGHT_PAD);
     let burger_x = width.saturating_sub(BURGER_W + BURGER_RIGHT_PAD);
     let page_x = width.saturating_sub(PAGE_INDICATOR_W + PAGE_INDICATOR_RIGHT_PAD);
     let page_y = height.saturating_sub(PAGE_INDICATOR_H + PAGE_INDICATOR_BOTTOM_PAD);
+    let title_w = width.saturating_sub(TITLE_BAR_X + TITLE_BAR_RIGHT_PAD);
     [
         // Nav rail (full height).
         Rect::new(0, 0, NAV_W.min(width), height),
@@ -347,6 +354,13 @@ fn chrome_rects(width: u32, height: u32) -> [Rect; 4] {
             BURGER_Y.min(height),
             BURGER_W.min(width.saturating_sub(burger_x)),
             BURGER_H.min(height.saturating_sub(BURGER_Y)),
+        ),
+        // Note title bar (menu-open only; harmless when absent).
+        Rect::new(
+            TITLE_BAR_X.min(width),
+            TITLE_BAR_Y.min(height),
+            title_w.min(width.saturating_sub(TITLE_BAR_X)),
+            TITLE_BAR_H.min(height.saturating_sub(TITLE_BAR_Y)),
         ),
         // Page X/Y indicator (menu-open only; harmless when absent).
         Rect::new(
@@ -401,8 +415,18 @@ impl Platform for HeadlessPlatform {
 /// callbacks to these methods automatically.
 ///
 /// Task list row for [`EphemerisUi::set_full_task_list`]:
-/// `(id, title, priority_label, priority_int, due, overdue, done, lane)`.
-pub type FullTaskRow = (String, String, String, i32, String, bool, bool, String);
+/// `(id, title, priority_label, priority_int, due, overdue, done, lane, has_source_note)`.
+pub type FullTaskRow = (
+    String,
+    String,
+    String,
+    i32,
+    String,
+    bool,
+    bool,
+    String,
+    bool,
+);
 
 pub struct EphemerisUi {
     window: Rc<MinimalSoftwareWindow>,
@@ -979,12 +1003,22 @@ impl EphemerisUi {
 
     /// Push the full task list to the CRUD view.
     ///
-    /// Each tuple is `(id, title, priority_label, priority_int, due, overdue, done, lane)`.
+    /// Each tuple is `(id, title, priority_label, priority_int, due, overdue, done, lane, has_source_note)`.
     pub fn set_full_task_list(&self, tasks: &[FullTaskRow]) {
         let entries: Vec<TaskViewEntry> = tasks
             .iter()
             .map(
-                |(id, title, priority_label, priority_int, due_label, overdue, done, lane)| {
+                |(
+                    id,
+                    title,
+                    priority_label,
+                    priority_int,
+                    due_label,
+                    overdue,
+                    done,
+                    lane,
+                    has_source_note,
+                )| {
                     TaskViewEntry {
                         id: slint::SharedString::from(id.as_str()),
                         title: slint::SharedString::from(title.as_str()),
@@ -994,6 +1028,7 @@ impl EphemerisUi {
                         overdue: *overdue,
                         done: *done,
                         lane_label: slint::SharedString::from(lane.as_str()),
+                        has_source_note: *has_source_note,
                         show_profile: false,
                         profile_icon_char: slint::SharedString::new(),
                         has_custom_profile_icon: false,
@@ -1036,6 +1071,7 @@ impl EphemerisUi {
             .set_task_dialog_contexts(slint::SharedString::from(contexts));
         self.component
             .set_task_dialog_waiting(slint::SharedString::from(waiting));
+        self.component.set_task_dialog_has_source_note(false);
         self.component.set_task_dialog_visible(true);
     }
 
@@ -1080,6 +1116,25 @@ impl EphemerisUi {
     {
         self.component
             .on_task_edit_requested(move |id| handler(id.to_string()));
+    }
+
+    /// Register a closure called when "View associated note" is tapped for a task.
+    pub fn on_task_view_source_note<F>(&self, mut handler: F)
+    where
+        F: FnMut(String) + 'static,
+    {
+        self.component
+            .on_task_view_source_note(move |id| handler(id.to_string()));
+    }
+
+    /// Register a closure for the page-indicator previous button.
+    pub fn on_page_prev_tapped<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_page_prev_tapped(handler);
+    }
+
+    /// Register a closure for the page-indicator next button.
+    pub fn on_page_next_tapped<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_page_next_tapped(handler);
     }
 
     /// Register a closure called when "Save" is tapped in the add dialog.
