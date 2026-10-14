@@ -7519,7 +7519,7 @@ fn build_note_list(
             let text_hit = n
                 .text_content
                 .as_deref()
-                .map(|t| t.to_lowercase().contains(&q))
+                .map(|t| strip_inline_markdown(t).to_lowercase().contains(&q))
                 .unwrap_or(false);
             title_hit || text_hit
         })
@@ -8162,7 +8162,7 @@ fn build_vault_note_export(
         }
         let searchable_text = recognised_text
             .clone()
-            .or_else(|| note.text_content.clone());
+            .or_else(|| note.text_content.as_ref().map(|t| strip_inline_markdown(t)));
         let opts = PdfExportOptions {
             title: note.title.clone(),
             searchable_text,
