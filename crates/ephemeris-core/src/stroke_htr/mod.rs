@@ -299,7 +299,8 @@ struct CarbunePoint {
 
 /// Build the flat `(x, y, t_seconds, stroke_nr)` table with absolute time.
 ///
-/// Absolute time is `stroke.t0_ms + point.t_ms`, converted to seconds. When
+/// Time is `stroke.t0_ms + point.t_ms` relative to the line's earliest
+/// `t0_ms` (see [`line_time_base_ms`]), converted to seconds. When
 /// `t0_ms == 0` (legacy), a synthetic clock is used and advanced by
 /// [`LEGACY_INTER_STROKE_GAP_MS`] after each stroke so inter-stroke `dt` is
 /// not zero.
@@ -310,8 +311,27 @@ pub fn absolute_points_seconds(line: &StrokeLine) -> Vec<(f32, f32, f32, u32)> {
         .collect()
 }
 
+/// Earliest `t0_ms` in the line, or 0 if any stroke is legacy (`t0_ms == 0`).
+///
+/// `t0_ms` is wall-clock epoch ms (~4e9); as `f32` that has a 256 ms ULP and
+/// collapses every in-stroke timestamp. Featurisers subtract this base in
+/// integer arithmetic first — features only use `dt`, so the offset is free.
+/// Lines mixing legacy and timed strokes keep the old absolute behaviour.
+pub(crate) fn line_time_base_ms(line: &StrokeLine) -> u64 {
+    let mut t0s = line
+        .strokes
+        .iter()
+        .filter(|s| !s.points.is_empty())
+        .map(|s| s.t0_ms);
+    let first = t0s.next().unwrap_or(0);
+    t0s.try_fold(first, |acc, t0| (t0 != 0).then(|| acc.min(t0)))
+        .filter(|&b| b != 0)
+        .unwrap_or(0)
+}
+
 fn build_absolute_points(line: &StrokeLine) -> Vec<CarbunePoint> {
     let mut out = Vec::new();
+    let base_ms = line_time_base_ms(line);
     let mut next_synth_t0_ms = 0.0f32;
     for (stroke_nr, stroke) in line.strokes.iter().enumerate() {
         if stroke.points.is_empty() {
@@ -320,7 +340,7 @@ fn build_absolute_points(line: &StrokeLine) -> Vec<CarbunePoint> {
         let t0_ms = if stroke.t0_ms == 0 {
             next_synth_t0_ms
         } else {
-            stroke.t0_ms as f32
+            stroke.t0_ms.saturating_sub(base_ms) as f32
         };
         let mut last_abs_ms = t0_ms;
         for p in &stroke.points {
@@ -1610,6 +1630,59 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Two-stroke line with uneven in-stroke timing, starting at `t0_ms`.
+    pub(crate) fn epoch_offset_line(t0_ms: u64) -> StrokeLine {
+        StrokeLine {
+            strokes: vec![
+                parity_stroke(
+                    t0_ms,
+                    &[
+                        (0.0, 0.0, 0),
+                        (6.0, 10.0, 8),
+                        (10.0, 30.0, 40),
+                        (12.0, 60.0, 90),
+                    ],
+                ),
+                parity_stroke(
+                    t0_ms + 230,
+                    &[(20.0, 20.0, 0), (30.0, 25.0, 16), (45.0, 22.0, 70)],
+                ),
+            ],
+            x: 0.0,
+            y: 0.0,
+            width: 45.0,
+            height: 60.0,
+        }
+    }
+
+    pub(crate) fn assert_features_close(a: &[HtrFeature], b: &[HtrFeature]) {
+        assert_eq!(a.len(), b.len());
+        for (fa, fb) in a.iter().zip(b) {
+            for i in 0..4 {
+                assert!(
+                    (fa[i] - fb[i]).abs() < 1e-5,
+                    "channel {i}: {fa:?} vs {fb:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn featurize_is_invariant_to_epoch_ms_t0() {
+        // Live strokes carry wall-clock epoch ms truncated to u32 (~4.29e9),
+        // where f32 has a 256 ms ULP. Features must match a small-t0 line.
+        let small = featurize_line(&epoch_offset_line(1_000), CARBUNE_POINTS_PER_UNIT);
+        let epoch = featurize_line(&epoch_offset_line(4_293_604_864), CARBUNE_POINTS_PER_UNIT);
+        assert_features_close(&small, &epoch);
+        // Inter-stroke dt survives: 230 ms start gap − 90 ms first-stroke span.
+        let pen_up = epoch.iter().skip(1).find(|f| f[3] == 1.0).unwrap();
+        assert!(
+            (pen_up[2] - 0.140).abs() < 1e-4,
+            "inter-stroke dt {}",
+            pen_up[2]
+        );
     }
 
     #[test]
