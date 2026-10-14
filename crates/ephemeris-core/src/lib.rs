@@ -59,6 +59,7 @@ pub fn init_tracing() {
 pub mod caldav;
 pub mod calendar_cache;
 pub mod htr_eval;
+pub mod layout_detect;
 pub mod line_htr;
 pub mod markdown_tasks;
 pub mod note_search;
@@ -84,6 +85,7 @@ pub use aggregation::AggregationService;
 pub use caldav::{default_sync_window, CalDavCalendar, CalDavClient, CalDavConfig};
 pub use calendar_cache::CalendarCache;
 pub use ink_layout::{classify_mark_strokes, split_page_ink, MarkKind, MarkStroke, PageInk};
+pub use layout_detect::{detect_line_formats, DetectedLine, LayoutLine};
 pub use line_htr::{
     prepare_line_htr_input, split_ink_line_bands, ImageLineBand, LineHtrInput, DE_HTR_V2_ALPHABET,
     LINE_HTR_HEIGHT, LINE_HTR_MAX_WIDTH,

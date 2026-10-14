@@ -443,7 +443,7 @@ impl CascadingTranscriber {
                 Vec::new(),
             ));
         }
-        let PageInk { lines, marks } = split_page_ink(strokes, self.ruling_pitch());
+        let PageInk { lines, marks, .. } = split_page_ink(strokes, self.ruling_pitch());
         let mut out = Vec::with_capacity(lines.len());
         for (i, line) in lines.iter().enumerate() {
             if let Some(span) = self.transcribe_line(line, i as i32)? {

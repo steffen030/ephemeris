@@ -29,7 +29,8 @@
 //! # Heuristics (all relative to `H`)
 //!
 //! * [`MarkKind::Underline`]: one stroke, bbox `h/w < 0.12`, `w >= 1.5H`,
-//!   at least half of its x-extent spanned by the text strokes above it, whose
+//!   at least half of its x-extent spanned by the text strokes just above it
+//!   (centre above, bottom within `1.5H`), whose
 //!   median bottom is `0.12H..=0.6H` above the underline (a baseline cursive
 //!   connector sits at ~0 and stays text).
 //! * [`MarkKind::BulletDot`]: bbox <= `0.25H` on both axes, nothing to its
@@ -41,9 +42,12 @@
 //! * [`MarkKind::Checkbox`]: single closed stroke (endpoints within `0.2H`),
 //!   bbox `0.6H..=1.2H` and roughly square, with >= 3 sharp bbox corners (a
 //!   round 'o' has none), leftmost, >= `0.4H` gap. Multi-stroke checkboxes
-//!   are not recognised.
+//!   are not recognised. Strokes inside the box (tolerance `0.3H`) are
+//!   ignored for the gap test and become [`MarkKind::CheckMark`].
+//! * [`MarkKind::CheckMark`]: the tick / cross inside a checkbox, so a checked
+//!   box is still detected and the tick never reaches HTR.
 
-use crate::model::Stroke;
+use crate::model::{Stroke, Tool};
 use crate::stroke_htr::{
     default_line_gap, group_strokes_into_lines_with_ruling, is_text_ink, stroke_bounds, StrokeLine,
 };
@@ -55,6 +59,8 @@ pub enum MarkKind {
     BulletDot,
     BulletDash,
     Checkbox,
+    /// Pen stroke inside a [`MarkKind::Checkbox`] (the box is checked).
+    CheckMark,
 }
 
 /// A classified mark stroke.
@@ -67,6 +73,8 @@ pub struct PageInk {
     pub lines: Vec<StrokeLine>,
     /// Classified mark strokes, in input order.
     pub marks: Vec<MarkStroke>,
+    /// Highlighter strokes (never text, never marks), in input order.
+    pub highlights: Vec<Stroke>,
 }
 
 /// Classify marks, then group the remaining text strokes into lines.
@@ -77,7 +85,16 @@ pub fn split_page_ink(strokes: &[Stroke], ruling_pitch: Option<f32>) -> PageInk 
     let (text, marks) = classify_mark_strokes(strokes, 0.0);
     let gap = default_line_gap(&text);
     let lines = group_strokes_into_lines_with_ruling(&text, gap, ruling_pitch);
-    PageInk { lines, marks }
+    let highlights = strokes
+        .iter()
+        .filter(|s| s.tool == Tool::Highlighter && !s.points.is_empty())
+        .cloned()
+        .collect();
+    PageInk {
+        lines,
+        marks,
+        highlights,
+    }
 }
 
 /// Median height of the non-tiny pen strokes (i-dots, bullets, bars excluded).
@@ -170,6 +187,17 @@ pub fn classify_mark_strokes(
                 kinds[i] = classify_leading(i, &strokes[i], &b, &ctx, h);
             }
         }
+        // Pass 3: ticks / crosses inside a checkbox.
+        for i in 0..strokes.len() {
+            let (Some(MarkKind::Checkbox), Some(b)) = (kinds[i], ctx[i]) else {
+                continue;
+            };
+            for j in 0..strokes.len() {
+                if kinds[j].is_none() && ctx[j].is_some_and(|o| inside_box(&o, &b, h)) {
+                    kinds[j] = Some(MarkKind::CheckMark);
+                }
+            }
+        }
     }
     let mut text = Vec::with_capacity(strokes.len());
     let mut marks = Vec::new();
@@ -180,6 +208,15 @@ pub fn classify_mark_strokes(
         }
     }
     (text, marks)
+}
+
+/// `o` lies within checkbox `b` (with `0.3H` slack for ticks poking out).
+fn inside_box(o: &Bb, b: &Bb, h: f32) -> bool {
+    let t = 0.3 * h;
+    o.min_x >= b.min_x - t
+        && o.max_x <= b.max_x + t
+        && o.min_y >= b.min_y - t
+        && o.max_y <= b.max_y + t
 }
 
 fn x_overlap(a: &Bb, b: &Bb) -> f32 {
@@ -196,6 +233,11 @@ fn is_underline(i: usize, b: &Bb, boxes: &[Option<Bb>], h: f32) -> bool {
     for (j, o) in boxes.iter().enumerate() {
         let Some(o) = o else { continue };
         if j == i || o.h() < 0.3 * h || (o.w() > 1.5 * h && o.h() / o.w() < 0.12) {
+            continue;
+        }
+        // Only the text just above counts; other lines in the same column
+        // (above or below) must not drag the median bottom around.
+        if o.cy() >= b.cy() || o.max_y < b.cy() - 1.5 * h {
             continue;
         }
         if x_overlap(b, o) > 0.0 {
@@ -233,7 +275,7 @@ fn classify_leading(i: usize, s: &Stroke, b: &Bb, ctx: &[Option<Bb>], h: f32) ->
     let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
     for (j, o) in ctx.iter().enumerate() {
         let Some(o) = o else { continue };
-        if j == i {
+        if j == i || (kind == MarkKind::Checkbox && inside_box(o, b, h)) {
             continue;
         }
         // Anything left of the candidate on its line: not a line-leading mark.
@@ -341,6 +383,40 @@ mod tests {
         assert_eq!(marks.len(), 1);
         assert_eq!(marks[0].0, MarkKind::Underline);
         assert_eq!(text.len(), 6);
+    }
+
+    #[test]
+    fn underline_below_first_of_several_lines() {
+        // Lines below in the same column must not hide the underline.
+        let mut s = word(0.0, 6);
+        s.push(poly(&[(0.0, 27.0), (20.0, 27.5), (45.0, 27.0)]));
+        for row in 1..4 {
+            s.extend(word(0.0, 6).into_iter().map(|mut st| {
+                st.points.iter_mut().for_each(|p| p.y += 40.0 * row as f32);
+                st
+            }));
+        }
+        let (_, marks) = classify(&s);
+        assert_eq!(marks.len(), 1);
+        assert_eq!(marks[0].0, MarkKind::Underline);
+    }
+
+    #[test]
+    fn checked_checkbox_keeps_box_and_tick_out_of_text() {
+        let sq = poly(&[
+            (0.0, 2.0),
+            (16.0, 2.0),
+            (16.0, 18.0),
+            (0.0, 18.0),
+            (0.0, 2.5),
+        ]);
+        let tick = poly(&[(3.0, 10.0), (6.0, 15.0), (13.0, 5.0)]);
+        let mut s = vec![sq, tick];
+        s.extend(word(30.0, 4));
+        let (text, marks) = classify(&s);
+        let kinds: Vec<MarkKind> = marks.iter().map(|(k, _)| *k).collect();
+        assert_eq!(kinds, vec![MarkKind::Checkbox, MarkKind::CheckMark]);
+        assert_eq!(text.len(), 4);
     }
 
     #[test]
