@@ -254,6 +254,23 @@ mod tests {
         assert_eq!(reloaded.load_all().unwrap(), vec![s]);
     }
 
+    #[test]
+    fn stroke_page_json_keeps_t0_ms() {
+        // The app persists note pages as `StrokePage` JSON; stroke HTR needs
+        // the epoch-ms start time back after reload. Old files lack the field.
+        let mut s = sample_stroke();
+        s.t0_ms = 4_293_604_864;
+        let page = StrokePage { strokes: vec![s] };
+        let json = serde_json::to_string(&page).unwrap();
+        let back: StrokePage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.strokes[0].t0_ms, 4_293_604_864);
+
+        let legacy = json.replace(",\"t0_ms\":4293604864", "");
+        assert_ne!(legacy, json);
+        let back: StrokePage = serde_json::from_str(&legacy).unwrap();
+        assert_eq!(back.strokes[0].t0_ms, 0);
+    }
+
     #[cfg(feature = "fs")]
     #[test]
     fn json_file_store_persists_and_reloads() {
