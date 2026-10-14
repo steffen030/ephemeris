@@ -111,6 +111,7 @@ fn render_markdown(note: &VaultNoteExport) -> String {
     ));
     out.push_str(&format!("created: {}\n", note.created_at));
     out.push_str("source: ephemeris\n");
+    out.push_str("ephemeris_format: 1\n");
     out.push_str("---\n\n");
     out.push_str(&format!("# {}\n\n", note.note_title));
 
@@ -129,8 +130,8 @@ fn render_markdown(note: &VaultNoteExport) -> String {
         .filter(|s| !s.is_empty())
     {
         Some(text) => {
-            out.push_str("## Text\n\n");
-            out.push_str(text);
+            let demoted = demote_h1_to_h2(text);
+            out.push_str(&demoted);
             out.push('\n');
         }
         None => {
@@ -138,6 +139,21 @@ fn render_markdown(note: &VaultNoteExport) -> String {
         }
     }
     out
+}
+
+/// Demote recognized H1 lines (`# x` at line start) to H2.
+fn demote_h1_to_h2(text: &str) -> String {
+    let mut out = String::new();
+    for line in text.lines() {
+        if line.starts_with("# ") {
+            out.push('#');
+            out.push_str(line);
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out.trim_end().to_string()
 }
 
 /// Sanitize a single path component for cross-platform vault folders.
@@ -198,8 +214,10 @@ mod tests {
         assert!(path.ends_with("Ephemeris/Notes/Work/Ideas/Meeting Notes.md"));
         let body = fs::read_to_string(&path).unwrap();
         assert!(body.contains("ephemeris_note_id: 7"));
+        assert!(body.contains("ephemeris_format: 1"));
         assert!(body.contains("Hello from OCR"));
         assert!(body.contains("notebook: \"Work / Ideas\""));
+        assert!(!body.contains("## Text"));
     }
 
     #[test]
@@ -297,5 +315,101 @@ mod tests {
             Path::new("/vault/Other/n.md"),
             ex
         ));
+    }
+
+    #[test]
+    fn markdown_h1_demoted_to_h2() {
+        let tmp = TempDir::new().unwrap();
+        let note = VaultNoteExport {
+            notebook_title: "Test".into(),
+            notebook_segments: vec![],
+            note_title: "MyNote".into(),
+            note_id: 1,
+            created_at: 0,
+            text_content: Some("# Heading 1\n## Heading 2\nRegular text".into()),
+            pdf_vault_rel: None,
+        };
+        let path = export_note_markdown(tmp.path(), Path::new("Ephemeris"), &note).unwrap();
+        let body = fs::read_to_string(path).unwrap();
+        assert!(body.contains("# MyNote"));
+        assert!(body.contains("## Heading 1"));
+        assert!(body.contains("## Heading 2"));
+        assert!(body.contains("Regular text"));
+    }
+
+    #[test]
+    fn markdown_highlight_and_underline_survive() {
+        let tmp = TempDir::new().unwrap();
+        let note = VaultNoteExport {
+            notebook_title: "Test".into(),
+            notebook_segments: vec![],
+            note_title: "Note".into(),
+            note_id: 1,
+            created_at: 0,
+            text_content: Some("Some ==highlighted== and <u>underlined</u> text".into()),
+            pdf_vault_rel: None,
+        };
+        let path = export_note_markdown(tmp.path(), Path::new("Ephemeris"), &note).unwrap();
+        let body = fs::read_to_string(path).unwrap();
+        assert!(body.contains("==highlighted=="));
+        assert!(body.contains("<u>underlined</u>"));
+    }
+
+    #[test]
+    fn markdown_lists_survive() {
+        let tmp = TempDir::new().unwrap();
+        let note = VaultNoteExport {
+            notebook_title: "Test".into(),
+            notebook_segments: vec![],
+            note_title: "Note".into(),
+            note_id: 1,
+            created_at: 0,
+            text_content: Some("- item 1\n- item 2\n  - nested\n1. ordered\n2. second".into()),
+            pdf_vault_rel: None,
+        };
+        let path = export_note_markdown(tmp.path(), Path::new("Ephemeris"), &note).unwrap();
+        let body = fs::read_to_string(path).unwrap();
+        assert!(body.contains("- item 1"));
+        assert!(body.contains("- item 2"));
+        assert!(body.contains("  - nested"));
+        assert!(body.contains("1. ordered"));
+        assert!(body.contains("2. second"));
+    }
+
+    #[test]
+    fn markdown_escaped_paragraph_survives() {
+        let tmp = TempDir::new().unwrap();
+        let note = VaultNoteExport {
+            notebook_title: "Test".into(),
+            notebook_segments: vec![],
+            note_title: "Note".into(),
+            note_id: 1,
+            created_at: 0,
+            text_content: Some("\\# not a heading\nRegular paragraph".into()),
+            pdf_vault_rel: None,
+        };
+        let path = export_note_markdown(tmp.path(), Path::new("Ephemeris"), &note).unwrap();
+        let body = fs::read_to_string(path).unwrap();
+        assert!(body.contains("\\# not a heading"));
+        assert!(body.contains("Regular paragraph"));
+    }
+
+    #[test]
+    fn frontmatter_includes_ephemeris_format() {
+        let tmp = TempDir::new().unwrap();
+        let note = VaultNoteExport {
+            notebook_title: "Test".into(),
+            notebook_segments: vec![],
+            note_title: "Note".into(),
+            note_id: 42,
+            created_at: 1_700_000_000,
+            text_content: Some("Body text".into()),
+            pdf_vault_rel: None,
+        };
+        let path = export_note_markdown(tmp.path(), Path::new("Ephemeris"), &note).unwrap();
+        let body = fs::read_to_string(path).unwrap();
+        assert!(body.contains("ephemeris_format: 1"));
+        assert!(body.contains("title: \"Note\""));
+        assert!(body.contains("ephemeris_note_id: 42"));
     }
 }
