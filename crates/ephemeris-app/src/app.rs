@@ -8055,6 +8055,23 @@ fn scale_spans(
     spans
 }
 
+/// Scale stroke geometry from logical ink space onto the page-bin raster.
+fn scale_strokes_to_page(strokes: &mut [ephemeris_core::Stroke], from: (u32, u32), to: (u32, u32)) {
+    if from == to || from.0 == 0 || from.1 == 0 {
+        return;
+    }
+    let sx = to.0 as f32 / from.0 as f32;
+    let sy = to.1 as f32 / from.1 as f32;
+    let s_avg = (sx + sy) * 0.5;
+    for stroke in strokes {
+        stroke.base_width *= s_avg;
+        for p in &mut stroke.points {
+            p.x *= sx;
+            p.y *= sy;
+        }
+    }
+}
+
 fn read_page_bin(path: &Path) -> Option<(u32, u32, Vec<u8>)> {
     let data = std::fs::read(path).ok()?;
     if data.len() >= 12 && &data[0..4] == PAGE_BIN_MAGIC {
@@ -8308,6 +8325,16 @@ fn build_vault_note_export(
         let searchable_text = recognised_text
             .clone()
             .or_else(|| note.text_content.clone());
+        // Yellow highlighter in PDF: pass Highlighter strokes so export can
+        // multiply-blend classic marker yellow over the gray8 canvas (mono
+        // e-ink UI stays gray; colour PDF / colour e-ink viewers show yellow).
+        // Strokes live in logical ink space; scale onto the page-bin raster.
+        let mut highlight_strokes: Vec<_> = strokes
+            .iter()
+            .filter(|s| s.tool == Tool::Highlighter)
+            .cloned()
+            .collect();
+        scale_strokes_to_page(&mut highlight_strokes, (input.width, input.height), (w, h));
         let opts = PdfExportOptions {
             title: note.title.clone(),
             searchable_text,
@@ -8315,6 +8342,11 @@ fn build_vault_note_export(
                 vec![]
             } else {
                 vec![scale_spans(spans, (input.width, input.height), (w, h))]
+            },
+            page_highlight_strokes: if highlight_strokes.is_empty() {
+                vec![]
+            } else {
+                vec![highlight_strokes]
             },
         };
         match export_raster_pages_to_pdf(&[page], &pdf_abs, &opts) {

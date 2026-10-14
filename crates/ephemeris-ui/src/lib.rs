@@ -305,9 +305,9 @@ pub const TOOLBAR_H: u32 = 0;
 pub const NAV_W: u32 = 80;
 
 /// Burger dropdown panel (`drawing-dropdown` in `main.slint`):
-/// `x = parent.width - 192`, `y = 60`, `width = 184`, `height = 200`.
+/// `x = parent.width - 192`, `y = 60`, `width = 184`, `height = 268`.
 const DRAWING_MENU_W: u32 = 184;
-const DRAWING_MENU_H: u32 = 236;
+const DRAWING_MENU_H: u32 = 268;
 const DRAWING_MENU_RIGHT_PAD: u32 = 8; // 192 - 184
 const DRAWING_MENU_Y: u32 = 60;
 

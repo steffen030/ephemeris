@@ -89,6 +89,17 @@ export global Icons {
     out property <string> grid-view:      "\u{E2EA}";  // grid_view_baseline
     out property <string> sort:           "\u{E5D2}";  // sort_baseline
     out property <string> note-add:       "\u{E44A}";  // note_add_baseline
+    // Note drawing tools / paper (Flutter MaterialIcons cmap; ephemeris-cev).
+    out property <string> tool-pen:       "\u{E19D}";  // create_baseline (pencil)
+    out property <string> tool-highlight: "\u{E310}";  // highlight_baseline (marker)
+    out property <string> tool-eraser:    "\u{E0BD}";  // auto_fix_off_baseline
+    out property <string> tool-clear:     "\u{E1B9}";  // delete_baseline
+    out property <string> line-weight:    "\u{E37E}";  // line_weight_baseline
+    out property <string> paper-blank:    "\u{E0F9}";  // border_clear_baseline
+    out property <string> paper-lined:    "\u{E0FB}";  // border_horizontal_baseline
+    out property <string> paper-dotted:   "\u{E653}";  // texture_baseline
+    out property <string> paper-squared:  "\u{E2E9}";  // grid_on_baseline
+    out property <string> see-text:       "\u{E0A2}";  // article_baseline
 }
 
 /// A calendar day cell for the month grid.
@@ -2993,76 +3004,126 @@ export component EphemerisPage inherits Window {
     }
 
     // ── Burger dropdown (tool & paper selector) ──────────────────────────
+    // Icon-primary + micro-label (e-ink UX): glyphs carry the action, short
+    // labels keep first-use discoverability without crowding the palette.
     drawing-dropdown := Rectangle {
         visible: root.drawing-menu-open && root.is-canvas-context;
         x: parent.width - 192px; y: 60px;
-        width: 184px; height: 236px;
+        width: 184px; height: 268px;
         background: EinkTheme.chrome-bg;
         border-width: 2px; border-color: EinkTheme.chrome-border;
         border-radius: 6px;
         clip: true;
 
-        // -- Tool row 1: Pen / Hi-lite / Eraser --
+        // -- Tool row 1: Pen / Highlight / Eraser --
         Rectangle {
-            x: 6px; y: 6px; width: 54px; height: 32px;
+            x: 6px; y: 6px; width: 54px; height: 42px;
             background: root.active-tool == "pen" ? EinkTheme.btn-active-bg : transparent;
             border-radius: 3px;
-            Text { text: "Pen"; font-size: 12px;
-                   color: root.active-tool == "pen" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
-                   horizontal-alignment: center; vertical-alignment: center;
-                   width: parent.width; height: parent.height; }
+            Text {
+                y: 2px; width: parent.width; height: 24px;
+                text: Icons.tool-pen; font-family: "Material Icons"; font-size: 20px;
+                color: root.active-tool == "pen" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
+            Text {
+                y: 26px; width: parent.width; height: 14px;
+                text: "Pen"; font-size: 9px;
+                color: root.active-tool == "pen" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
             TouchArea { clicked => { root.active-tool = "pen"; root.tool-selected("pen"); root.drawing-menu-open = false; } }
         }
         Rectangle {
-            x: 64px; y: 6px; width: 54px; height: 32px;
+            x: 64px; y: 6px; width: 54px; height: 42px;
             background: root.active-tool == "highlighter" ? EinkTheme.btn-active-bg : transparent;
             border-radius: 3px;
-            Text { text: "Highlight"; font-size: 11px;
-                   color: root.active-tool == "highlighter" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
-                   horizontal-alignment: center; vertical-alignment: center;
-                   width: parent.width; height: parent.height; }
+            Text {
+                y: 2px; width: parent.width; height: 24px;
+                text: Icons.tool-highlight; font-family: "Material Icons"; font-size: 20px;
+                color: root.active-tool == "highlighter" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
+            Text {
+                y: 26px; width: parent.width; height: 14px;
+                text: "Mark"; font-size: 9px;
+                color: root.active-tool == "highlighter" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
             TouchArea { clicked => { root.active-tool = "highlighter"; root.tool-selected("highlighter"); root.drawing-menu-open = false; } }
         }
         Rectangle {
-            x: 122px; y: 6px; width: 56px; height: 32px;
+            x: 122px; y: 6px; width: 56px; height: 42px;
             background: root.active-tool == "eraser" ? EinkTheme.btn-active-bg : transparent;
             border-radius: 3px;
-            Text { text: "Eraser"; font-size: 11px;
-                   color: root.active-tool == "eraser" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
-                   horizontal-alignment: center; vertical-alignment: center;
-                   width: parent.width; height: parent.height; }
+            Text {
+                y: 2px; width: parent.width; height: 24px;
+                text: Icons.tool-eraser; font-family: "Material Icons"; font-size: 20px;
+                color: root.active-tool == "eraser" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
+            Text {
+                y: 26px; width: parent.width; height: 14px;
+                text: "Eraser"; font-size: 9px;
+                color: root.active-tool == "eraser" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
             TouchArea { clicked => { root.active-tool = "eraser"; root.tool-selected("eraser"); root.drawing-menu-open = false; } }
         }
 
         // -- Tool row 2: Move / Clear --
         Rectangle {
-            x: 6px; y: 42px; width: 84px; height: 32px;
+            x: 6px; y: 52px; width: 84px; height: 42px;
             background: root.active-tool == "move" ? EinkTheme.btn-active-bg : transparent;
             border-radius: 3px;
-            Text { text: "Move"; font-size: 12px;
-                   color: root.active-tool == "move" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
-                   horizontal-alignment: center; vertical-alignment: center;
-                   width: parent.width; height: parent.height; }
+            Text {
+                y: 2px; width: parent.width; height: 24px;
+                text: Icons.move; font-family: "Material Icons"; font-size: 20px;
+                color: root.active-tool == "move" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
+            Text {
+                y: 26px; width: parent.width; height: 14px;
+                text: "Move"; font-size: 9px;
+                color: root.active-tool == "move" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
             TouchArea { clicked => { root.active-tool = "move"; root.tool-selected("move"); root.drawing-menu-open = false; } }
         }
         Rectangle {
-            x: 94px; y: 42px; width: 84px; height: 32px;
+            x: 94px; y: 52px; width: 84px; height: 42px;
             border-radius: 3px;
-            Text { text: "Clear"; font-size: 12px; color: EinkTheme.danger-fg;
-                   horizontal-alignment: center; vertical-alignment: center;
-                   width: parent.width; height: parent.height; }
+            Text {
+                y: 2px; width: parent.width; height: 24px;
+                text: Icons.tool-clear; font-family: "Material Icons"; font-size: 20px;
+                color: EinkTheme.danger-fg;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
+            Text {
+                y: 26px; width: parent.width; height: 14px;
+                text: "Clear"; font-size: 9px; color: EinkTheme.danger-fg;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
             TouchArea { clicked => { root.clear-page(); root.drawing-menu-open = false; } }
         }
 
-        // -- Pen width: Thin / Med / Thick --
+        // -- Pen width: Thin / Med / Thick (same glyph, scaled weight cue)
         Rectangle {
-            x: 6px; y: 78px; width: 54px; height: 28px;
+            x: 6px; y: 98px; width: 54px; height: 36px;
             background: root.active-pen-width == "thin" ? EinkTheme.btn-active-bg : transparent;
             border-radius: 3px;
-            Text { text: "Thin"; font-size: 11px;
-                   color: root.active-pen-width == "thin" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
-                   horizontal-alignment: center; vertical-alignment: center;
-                   width: parent.width; height: parent.height; }
+            Text {
+                y: 1px; width: parent.width; height: 20px;
+                text: Icons.line-weight; font-family: "Material Icons"; font-size: 14px;
+                color: root.active-pen-width == "thin" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
+            Text {
+                y: 20px; width: parent.width; height: 14px;
+                text: "Thin"; font-size: 9px;
+                color: root.active-pen-width == "thin" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
             TouchArea { clicked => {
                 root.active-pen-width = "thin";
                 root.pen-width-selected("thin");
@@ -3072,13 +3133,21 @@ export component EphemerisPage inherits Window {
             } }
         }
         Rectangle {
-            x: 64px; y: 78px; width: 54px; height: 28px;
+            x: 64px; y: 98px; width: 54px; height: 36px;
             background: root.active-pen-width == "medium" ? EinkTheme.btn-active-bg : transparent;
             border-radius: 3px;
-            Text { text: "Med"; font-size: 11px;
-                   color: root.active-pen-width == "medium" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
-                   horizontal-alignment: center; vertical-alignment: center;
-                   width: parent.width; height: parent.height; }
+            Text {
+                y: 1px; width: parent.width; height: 20px;
+                text: Icons.line-weight; font-family: "Material Icons"; font-size: 18px;
+                color: root.active-pen-width == "medium" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
+            Text {
+                y: 20px; width: parent.width; height: 14px;
+                text: "Med"; font-size: 9px;
+                color: root.active-pen-width == "medium" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
             TouchArea { clicked => {
                 root.active-pen-width = "medium";
                 root.pen-width-selected("medium");
@@ -3088,13 +3157,21 @@ export component EphemerisPage inherits Window {
             } }
         }
         Rectangle {
-            x: 122px; y: 78px; width: 56px; height: 28px;
+            x: 122px; y: 98px; width: 56px; height: 36px;
             background: root.active-pen-width == "thick" ? EinkTheme.btn-active-bg : transparent;
             border-radius: 3px;
-            Text { text: "Thick"; font-size: 11px;
-                   color: root.active-pen-width == "thick" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
-                   horizontal-alignment: center; vertical-alignment: center;
-                   width: parent.width; height: parent.height; }
+            Text {
+                y: 1px; width: parent.width; height: 20px;
+                text: Icons.line-weight; font-family: "Material Icons"; font-size: 22px;
+                color: root.active-pen-width == "thick" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
+            Text {
+                y: 20px; width: parent.width; height: 14px;
+                text: "Thick"; font-size: 9px;
+                color: root.active-pen-width == "thick" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
             TouchArea { clicked => {
                 root.active-pen-width = "thick";
                 root.pen-width-selected("thick");
@@ -3105,66 +3182,104 @@ export component EphemerisPage inherits Window {
         }
 
         // Separator
-        Rectangle { x: 6px; y: 112px; width: 172px; height: 1px; background: EinkTheme.chrome-border; }
+        Rectangle { x: 6px; y: 138px; width: 172px; height: 1px; background: EinkTheme.chrome-border; }
 
         // -- Paper row 1: Blank / Lined --
         Rectangle {
-            x: 6px; y: 117px; width: 84px; height: 32px;
+            x: 6px; y: 143px; width: 84px; height: 42px;
             background: root.active-paper == "blank" ? EinkTheme.btn-active-bg : transparent;
             border-radius: 3px;
-            Text { text: "Blank"; font-size: 12px;
-                   color: root.active-paper == "blank" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
-                   horizontal-alignment: center; vertical-alignment: center;
-                   width: parent.width; height: parent.height; }
+            Text {
+                y: 2px; width: parent.width; height: 24px;
+                text: Icons.paper-blank; font-family: "Material Icons"; font-size: 20px;
+                color: root.active-paper == "blank" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
+            Text {
+                y: 26px; width: parent.width; height: 14px;
+                text: "Blank"; font-size: 9px;
+                color: root.active-paper == "blank" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
             TouchArea { clicked => { root.active-paper = "blank"; root.paper-type-tapped("blank"); root.drawing-menu-open = false; } }
         }
         Rectangle {
-            x: 94px; y: 117px; width: 84px; height: 32px;
+            x: 94px; y: 143px; width: 84px; height: 42px;
             background: root.active-paper == "lined" ? EinkTheme.btn-active-bg : transparent;
             border-radius: 3px;
-            Text { text: "Lined"; font-size: 12px;
-                   color: root.active-paper == "lined" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
-                   horizontal-alignment: center; vertical-alignment: center;
-                   width: parent.width; height: parent.height; }
+            Text {
+                y: 2px; width: parent.width; height: 24px;
+                text: Icons.paper-lined; font-family: "Material Icons"; font-size: 20px;
+                color: root.active-paper == "lined" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
+            Text {
+                y: 26px; width: parent.width; height: 14px;
+                text: "Lined"; font-size: 9px;
+                color: root.active-paper == "lined" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
             TouchArea { clicked => { root.active-paper = "lined"; root.paper-type-tapped("lined"); root.drawing-menu-open = false; } }
         }
 
         // -- Paper row 2: Dotted / Squared --
         Rectangle {
-            x: 6px; y: 153px; width: 84px; height: 32px;
+            x: 6px; y: 189px; width: 84px; height: 42px;
             background: root.active-paper == "dotted" ? EinkTheme.btn-active-bg : transparent;
             border-radius: 3px;
-            Text { text: "Dotted"; font-size: 12px;
-                   color: root.active-paper == "dotted" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
-                   horizontal-alignment: center; vertical-alignment: center;
-                   width: parent.width; height: parent.height; }
+            Text {
+                y: 2px; width: parent.width; height: 24px;
+                text: Icons.paper-dotted; font-family: "Material Icons"; font-size: 20px;
+                color: root.active-paper == "dotted" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
+            Text {
+                y: 26px; width: parent.width; height: 14px;
+                text: "Dotted"; font-size: 9px;
+                color: root.active-paper == "dotted" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
             TouchArea { clicked => { root.active-paper = "dotted"; root.paper-type-tapped("dotted"); root.drawing-menu-open = false; } }
         }
         Rectangle {
-            x: 94px; y: 153px; width: 84px; height: 32px;
+            x: 94px; y: 189px; width: 84px; height: 42px;
             background: root.active-paper == "squared" ? EinkTheme.btn-active-bg : transparent;
             border-radius: 3px;
-            Text { text: "Squared"; font-size: 11px;
-                   color: root.active-paper == "squared" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
-                   horizontal-alignment: center; vertical-alignment: center;
-                   width: parent.width; height: parent.height; }
+            Text {
+                y: 2px; width: parent.width; height: 24px;
+                text: Icons.paper-squared; font-family: "Material Icons"; font-size: 20px;
+                color: root.active-paper == "squared" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
+            Text {
+                y: 26px; width: parent.width; height: 14px;
+                text: "Grid"; font-size: 9px;
+                color: root.active-paper == "squared" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
             TouchArea { clicked => { root.active-paper = "squared"; root.paper-type-tapped("squared"); root.drawing-menu-open = false; } }
         }
 
         // Separator
-        Rectangle { x: 6px; y: 189px; width: 172px; height: 1px; background: EinkTheme.chrome-border; }
+        Rectangle { x: 6px; y: 235px; width: 172px; height: 1px; background: EinkTheme.chrome-border; }
 
         // -- See text toggle (OCR / transcribed layer)
         Rectangle {
-            x: 6px; y: 194px; width: 172px; height: 32px;
+            x: 6px; y: 240px; width: 172px; height: 42px;
             background: root.note-see-text ? EinkTheme.btn-active-bg : transparent;
             border-radius: 3px;
             Text {
+                x: 10px; y: 2px; width: 28px; height: 38px;
+                text: Icons.see-text; font-family: "Material Icons"; font-size: 20px;
+                color: root.note-see-text ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
+            Text {
+                x: 40px; width: parent.width - 50px; height: parent.height;
                 text: root.note-see-text ? "See text ✓" : "See text";
                 font-size: 12px;
                 color: root.note-see-text ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
-                horizontal-alignment: center; vertical-alignment: center;
-                width: parent.width; height: parent.height;
+                horizontal-alignment: left; vertical-alignment: center;
             }
             TouchArea {
                 clicked => {

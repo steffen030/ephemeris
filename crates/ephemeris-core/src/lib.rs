@@ -90,8 +90,9 @@ pub use note_search::{
     search_tasks, strip_inline_markdown, MdBlock, MdBlockKind, SearchHit, VaultFtsIndex,
 };
 pub use pdf_export::{
-    export_raster_pages_to_pdf, export_stroke_pages_to_pdf, pdf_export_is_current,
-    raster_export_hash, PdfExportOptions, RasterPage,
+    export_raster_pages_to_pdf, export_stroke_pages_to_pdf, gray8_to_rgb_with_yellow_highlights,
+    pdf_export_is_current, raster_export_hash, raster_export_hash_with_highlights,
+    PdfExportOptions, RasterPage, HIGHLIGHTER_YELLOW,
 };
 pub use prioritizer::{rank_tasks, task_score};
 pub use recognition_cache::{
