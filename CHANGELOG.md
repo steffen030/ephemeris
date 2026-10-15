@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.20](https://github.com/steffen030/ephemeris/compare/v0.1.19...v0.1.20) (2026-10-15)
+
+
+### Features
+
+* **canvas:** polish board UX, pinch zoom, and macOS cursor ([#52](https://github.com/steffen030/ephemeris/issues/52)) ([d2bc1d0](https://github.com/steffen030/ephemeris/commit/d2bc1d0fadc493e0d3f1570e0a49619b967a0724))
+
 ## [0.1.19](https://github.com/steffen030/ephemeris/compare/v0.1.18...v0.1.19) (2026-10-15)
 
 
