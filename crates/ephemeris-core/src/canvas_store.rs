@@ -89,7 +89,7 @@ impl Default for CanvasView {
 }
 
 /// On-disk body for one canvas (nodes/edges + Ephemeris view).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CanvasDoc {
     #[serde(default)]
     pub nodes: Vec<CanvasNode>,
@@ -97,16 +97,6 @@ pub struct CanvasDoc {
     pub edges: Vec<CanvasEdge>,
     #[serde(default)]
     pub view: CanvasView,
-}
-
-impl Default for CanvasDoc {
-    fn default() -> Self {
-        Self {
-            nodes: Vec::new(),
-            edges: Vec::new(),
-            view: CanvasView::default(),
-        }
-    }
 }
 
 impl CanvasDoc {
@@ -376,8 +366,10 @@ mod tests {
     fn index_and_doc_round_trip() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
-        let mut index = CanvasIndex::default();
-        index.canvas_id_seq = 1;
+        let mut index = CanvasIndex {
+            canvas_id_seq: 1,
+            ..Default::default()
+        };
         index.canvases.push(AppCanvasMeta {
             id: 1,
             title: "Map".into(),

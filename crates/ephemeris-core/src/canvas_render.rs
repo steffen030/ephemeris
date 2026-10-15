@@ -241,11 +241,7 @@ fn draw_node(
     let x0 = sx as i32;
     let y0 = sy as i32;
     let selected = selected_id == Some(n.id()) || connect_from == Some(n.id());
-    let fill = if matches!(n, CanvasNode::Group(_)) {
-        WHITE
-    } else {
-        WHITE
-    };
+    let fill = WHITE;
     let border = if selected { SELECT } else { BLACK };
     let border_w = if selected { 3 } else { 2 };
 
@@ -282,6 +278,7 @@ fn draw_node(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn fill_rect(buf: &mut [u8], w: u32, h: u32, x0: i32, y0: i32, rw: i32, rh: i32, color: u8) {
     for y in y0.max(0)..(y0 + rh).min(h as i32) {
         for x in x0.max(0)..(x0 + rw).min(w as i32) {
@@ -290,6 +287,7 @@ fn fill_rect(buf: &mut [u8], w: u32, h: u32, x0: i32, y0: i32, rw: i32, rh: i32,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_rect_outline(
     buf: &mut [u8],
     w: u32,
@@ -310,6 +308,7 @@ fn draw_rect_outline(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn hline(buf: &mut [u8], w: u32, h: u32, x0: i32, y: i32, len: i32, color: u8, dashed: bool) {
     if y < 0 || y >= h as i32 {
         return;
@@ -325,6 +324,7 @@ fn hline(buf: &mut [u8], w: u32, h: u32, x0: i32, y: i32, len: i32, color: u8, d
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn vline(buf: &mut [u8], w: u32, h: u32, x: i32, y0: i32, len: i32, color: u8, dashed: bool) {
     if x < 0 || x >= w as i32 {
         return;
@@ -340,6 +340,7 @@ fn vline(buf: &mut [u8], w: u32, h: u32, x: i32, y0: i32, len: i32, color: u8, d
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_line(
     buf: &mut [u8],
     w: u32,
@@ -409,8 +410,7 @@ fn blit_label(buf: &mut [u8], w: u32, h: u32, x0: i32, y0: i32, text: &str) {
 
 fn blit_glyph(buf: &mut [u8], w: u32, h: u32, x0: i32, y0: i32, ch: char) {
     let bits = glyph5x7(ch);
-    for row in 0..7 {
-        let row_bits = bits[row];
+    for (row, &row_bits) in bits.iter().enumerate() {
         for col in 0..5 {
             if row_bits & (1 << (4 - col)) != 0 {
                 let x = x0 + col;

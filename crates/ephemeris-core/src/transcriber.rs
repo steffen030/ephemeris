@@ -11,6 +11,7 @@ use crate::ink_layout::{split_page_ink, MarkStroke, PageInk};
 use crate::line_htr::{decode_line_alphabet, line_logits_confidence, DE_HTR_V2_ALPHABET};
 use crate::line_htr::{prepare_line_htr_input, split_ink_line_bands};
 use crate::model::{Point, Stroke};
+#[cfg(feature = "htr")]
 use crate::stroke_htr::{
     armrest::{self, featurize_line_armrest_pieces},
     ctc_decode_with_lm, ctc_softmax_confidence, decode_charset_with_blank,
