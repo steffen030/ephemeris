@@ -57,6 +57,40 @@ const VAULT_EXPORT_BATCH_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const LOCAL_PAGE_WRITE_DEBOUNCE: Duration = Duration::from_millis(400);
 
 /// Completed background per-line recognition (drained on the UI thread).
+/// Main-thread handlers slower than this log a warning (ephemeris-ktg.22).
+const MAIN_THREAD_STALL: Duration = Duration::from_millis(100);
+
+/// Logs a warning on drop when the guarded main-thread section was slow.
+///
+/// Mutter shows "not responding" after ~5 s without a ping reply; this names
+/// the section that blocked so device logs point at the culprit.
+struct StallWatch {
+    label: &'static str,
+    start: Instant,
+}
+
+impl StallWatch {
+    fn new(label: &'static str) -> Self {
+        Self {
+            label,
+            start: Instant::now(),
+        }
+    }
+}
+
+impl Drop for StallWatch {
+    fn drop(&mut self) {
+        let elapsed = self.start.elapsed();
+        if elapsed >= MAIN_THREAD_STALL {
+            tracing::warn!(
+                "main-thread stall: {} took {} ms",
+                self.label,
+                elapsed.as_millis()
+            );
+        }
+    }
+}
+
 struct BgRecogJobResult {
     note_id: u32,
     doc_page: usize,
@@ -140,6 +174,15 @@ impl BackgroundRecogQueue {
         for p in 0..doc_page_count.max(1) {
             caches.remove(&(note_id, p));
         }
+    }
+
+    /// Cheap pre-check for [`Self::try_spawn`], so callers can skip cloning the
+    /// page's strokes on every event-loop pass (pen samples wake it ~100×/s).
+    fn may_spawn(&self, force: bool) -> bool {
+        let idle = self.idle.borrow();
+        !idle.is_drawing()
+            && (force || idle.should_run(Instant::now()))
+            && !self.active.load(Ordering::Acquire)
     }
 
     /// Start recognition for a page when idle (or `force`, e.g. See-text open).
@@ -6053,6 +6096,7 @@ impl WinitHandler {
 
     /// Queue debounced local page files; mark the note for deferred vault OCR/PDF.
     fn persist_note_page_and_schedule_export(&mut self) {
+        let _stall = StallWatch::new("persist_note_page");
         let page_idx = self.ui.current_page_idx();
         let note_info = self
             .notes
@@ -6232,6 +6276,7 @@ impl WinitHandler {
 
 impl ApplicationHandler<AppUserEvent> for WinitHandler {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: AppUserEvent) {
+        let _stall = StallWatch::new("user_event");
         match event {
             AppUserEvent::PenReady => {
                 #[cfg(target_os = "linux")]
@@ -6241,6 +6286,7 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let _stall = StallWatch::new("about_to_wait");
         #[cfg(target_os = "linux")]
         self.drain_pen_events();
         // Hide Mutter tablet-tool cursor (zwp_tablet_tool_v2.set_cursor on
@@ -6339,7 +6385,7 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
         );
 
         // --- Idle background per-line recognition (ktg.12) ---
-        {
+        if self.bg_recog.may_spawn(false) {
             let page_idx = self.ui.current_page_idx();
             let note_info = self
                 .notes
@@ -6583,6 +6629,7 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        let _stall = StallWatch::new("window_event");
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
 

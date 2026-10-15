@@ -10,6 +10,7 @@
 //! show yellow would see this only if the device path rendered colour (PDF
 //! viewers and colour e-ink always show the yellow export).
 
+use crate::ink::WidthConfig;
 use crate::model::{Color, Stroke, Tool};
 use crate::transcriber::TextSpan;
 use printpdf::{
@@ -28,6 +29,13 @@ pub const HIGHLIGHTER_YELLOW: Color = Color {
     b: 80,
     a: 255,
 };
+
+/// Gray the canvas bakes highlighter strokes into (ephemeris-ui raster).
+const CANVAS_HIGHLIGHT_GRAY: f32 = 160.0;
+
+/// Extra half-width (px) for the PDF yellow so it fully covers the anti-aliased
+/// gray rim of the canvas stroke.
+const HIGHLIGHT_RIM_PX: f32 = 1.5;
 
 /// One page of raster ink (8-bpp grayscale, 0 = black, 255 = white).
 #[derive(Debug, Clone)]
@@ -322,22 +330,27 @@ pub fn gray8_to_rgb_with_yellow_highlights(
         stamp_highlighter_coverage(&mut coverage, width, height, stroke);
     }
 
-    let yr = HIGHLIGHTER_YELLOW.r as f32;
-    let yg = HIGHLIGHTER_YELLOW.g as f32;
-    let yb = HIGHLIGHTER_YELLOW.b as f32;
+    let yellow = [
+        HIGHLIGHTER_YELLOW.r as f32 / 255.0,
+        HIGHLIGHTER_YELLOW.g as f32 / 255.0,
+        HIGHLIGHTER_YELLOW.b as f32 / 255.0,
+    ];
     for (i, cov) in coverage.iter().copied().enumerate() {
         if cov <= 0.0 {
             continue;
         }
         let c = cov.clamp(0.0, 1.0);
         let o = i * 3;
-        // Multiply blend: base * lerp(1, yellow/255, coverage).
-        let fr = 1.0 - c + c * (yr / 255.0);
-        let fg = 1.0 - c + c * (yg / 255.0);
-        let fb = 1.0 - c + c * (yb / 255.0);
-        rgb[o] = (rgb[o] as f32 * fr).round().clamp(0.0, 255.0) as u8;
-        rgb[o + 1] = (rgb[o + 1] as f32 * fg).round().clamp(0.0, 255.0) as u8;
-        rgb[o + 2] = (rgb[o + 2] as f32 * fb).round().clamp(0.0, 255.0) as u8;
+        // The canvas already holds the highlighter as gray 160; multiplying
+        // yellow over it gives a muddy olive with a gray rim. Lift that gray
+        // back to paper white first (black ink stays black), then multiply.
+        let g = gray8[i] as f32;
+        let lifted = (g * 255.0 / CANVAS_HIGHLIGHT_GRAY).min(255.0);
+        let base = g + (lifted - g) * c;
+        for (ch, y) in yellow.iter().enumerate() {
+            let f = 1.0 - c + c * y;
+            rgb[o + ch] = (base * f).round().clamp(0.0, 255.0) as u8;
+        }
     }
     rgb
 }
@@ -378,11 +391,10 @@ fn stamp_highlighter_coverage(coverage: &mut [f32], width: u32, height: u32, str
     }
 }
 
+/// Same width curve as the canvas raster, widened to cover its AA rim.
 #[inline]
 fn half_width(base_width: f32, pressure: f32) -> f32 {
-    // Match default WidthConfig loosely: width ≈ base * (0.5 + 0.5*pressure).
-    let w = base_width.max(0.5) * (0.5 + 0.5 * pressure.clamp(0.0, 1.0));
-    w * 0.5
+    WidthConfig::default().width_for(base_width, pressure) * 0.5 + HIGHLIGHT_RIM_PX
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -686,6 +698,15 @@ mod tests {
         let yi = ((10 * 40 + 10) * 3) as usize;
         assert!(rgb[yi] > rgb[yi + 2], "yellow: R should exceed B");
         assert!(rgb[yi + 1] > rgb[yi + 2], "yellow: G should exceed B");
+        // Baked canvas gray is lifted: marker yellow, not olive.
+        assert_eq!(
+            &rgb[yi..yi + 3],
+            &[
+                HIGHLIGHTER_YELLOW.r,
+                HIGHLIGHTER_YELLOW.g,
+                HIGHLIGHTER_YELLOW.b
+            ]
+        );
     }
 
     #[test]

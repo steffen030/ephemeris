@@ -113,6 +113,8 @@ pub use pdf_export::{
     PdfExportOptions, RasterPage, HIGHLIGHTER_YELLOW,
 };
 pub use prioritizer::{rank_tasks, task_score};
+#[cfg(feature = "htr")]
+pub use recognition_cache::init_background_inference_pool;
 pub use recognition_cache::{
     line_stroke_ids_hash, lower_thread_nice_priority, recognition_model_version,
     stroke_line_ids_hash, BgRecogIdle, CachedLine, PageRecognitionCache, RecogCacheStats,
