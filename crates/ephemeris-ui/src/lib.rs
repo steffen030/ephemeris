@@ -280,6 +280,23 @@ pub struct FolderListItem {
     pub custom_profile_icon: slint::Image,
 }
 
+/// One folder row for the Canvas browser.
+#[derive(Clone)]
+pub struct CanvasFolderListItem {
+    pub id: String,
+    pub title: String,
+    pub canvas_count: i32,
+    pub folder_count: i32,
+}
+
+/// One canvas document row for the Canvas browser.
+#[derive(Clone)]
+pub struct CanvasListItem {
+    pub id: String,
+    pub title: String,
+    pub date_label: String,
+}
+
 fn folder_list_item_to_entry(e: &FolderListItem) -> NotebookEntry {
     NotebookEntry {
         id: slint::SharedString::from(e.id.as_str()),
@@ -845,6 +862,9 @@ impl EphemerisUi {
             && !c.get_show_filebrowser()
             && !c.get_show_note_list()
             && !c.get_show_notebook_list()
+            && !c.get_show_canvas_folder_list()
+            && !c.get_show_canvas_list()
+            && !c.get_show_canvas_board()
             && !c.get_show_calendar()
             && !c.get_show_recording_list()
             && !c.get_show_search()
@@ -1919,6 +1939,130 @@ impl EphemerisUi {
     /// Register a closure called when "+ New Note" is tapped.
     pub fn on_note_new_tapped<F: FnMut() + 'static>(&self, handler: F) {
         self.component.on_note_new_tapped(handler);
+    }
+
+    // ── Obsidian Canvas browser / board API ───────────────────────────────
+
+    pub fn set_canvas_folder_list(&self, folders: &[CanvasFolderListItem]) {
+        let items: Vec<CanvasFolderEntry> = folders
+            .iter()
+            .map(|e| CanvasFolderEntry {
+                id: slint::SharedString::from(e.id.as_str()),
+                title: slint::SharedString::from(e.title.as_str()),
+                canvas_count: e.canvas_count,
+                folder_count: e.folder_count,
+            })
+            .collect();
+        self.component
+            .set_canvas_folder_list(std::rc::Rc::new(slint::VecModel::from(items)).into());
+    }
+
+    pub fn set_canvas_list(&self, entries: &[CanvasListItem]) {
+        let items: Vec<CanvasEntry> = entries
+            .iter()
+            .map(|e| CanvasEntry {
+                id: slint::SharedString::from(e.id.as_str()),
+                title: slint::SharedString::from(e.title.as_str()),
+                date_label: slint::SharedString::from(e.date_label.as_str()),
+            })
+            .collect();
+        self.component
+            .set_canvas_list(std::rc::Rc::new(slint::VecModel::from(items)).into());
+    }
+
+    pub fn set_canvas_browser_title(&self, title: &str) {
+        self.component
+            .set_canvas_browser_title(slint::SharedString::from(title));
+    }
+
+    pub fn set_canvas_at_root(&self, at_root: bool) {
+        self.component.set_canvas_at_root(at_root);
+    }
+
+    pub fn set_canvas_board_gray8(&self, width: u32, height: u32, gray: &[u8]) {
+        let mut rgba = vec![255u8; (width * height * 4) as usize];
+        let n = (width * height) as usize;
+        for i in 0..n.min(gray.len()) {
+            let g = gray[i];
+            rgba[i * 4] = g;
+            rgba[i * 4 + 1] = g;
+            rgba[i * 4 + 2] = g;
+            rgba[i * 4 + 3] = 255;
+        }
+        let buf =
+            slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&rgba, width, height);
+        self.component
+            .set_canvas_board_image(slint::Image::from_rgba8(buf));
+    }
+
+    pub fn on_nav_canvas_tapped<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_nav_canvas_tapped(handler);
+    }
+
+    pub fn on_start_page_canvas_tapped<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_start_page_canvas_tapped(handler);
+    }
+
+    pub fn on_canvas_folder_tapped<F: FnMut(String) + 'static>(&self, mut handler: F) {
+        self.component
+            .on_canvas_folder_tapped(move |id| handler(id.to_string()));
+    }
+
+    pub fn on_canvas_browser_back_tapped<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_canvas_browser_back_tapped(handler);
+    }
+
+    pub fn on_canvas_folder_new_tapped<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_canvas_folder_new_tapped(handler);
+    }
+
+    pub fn on_canvas_new_tapped<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_canvas_new_tapped(handler);
+    }
+
+    pub fn on_canvas_tapped<F: FnMut(String) + 'static>(&self, mut handler: F) {
+        self.component
+            .on_canvas_tapped(move |id| handler(id.to_string()));
+    }
+
+    pub fn on_canvas_board_pointer<F>(&self, mut handler: F)
+    where
+        F: FnMut(f32, f32, String, String) + 'static,
+    {
+        self.component
+            .on_canvas_board_pointer(move |x, y, kind, pointer| {
+                handler(x, y, kind.to_string(), pointer.to_string())
+            });
+    }
+
+    pub fn on_canvas_zoom_preset<F: FnMut(String) + 'static>(&self, mut handler: F) {
+        self.component
+            .on_canvas_zoom_preset(move |p| handler(p.to_string()));
+    }
+
+    pub fn on_canvas_add_confirm<F: FnMut(String) + 'static>(&self, mut handler: F) {
+        self.component
+            .on_canvas_add_confirm(move |k| handler(k.to_string()));
+    }
+
+    pub fn on_canvas_file_confirm<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_canvas_file_confirm(handler);
+    }
+
+    pub fn on_canvas_link_confirm<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_canvas_link_confirm(handler);
+    }
+
+    pub fn on_canvas_focus_done<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_canvas_focus_done(handler);
+    }
+
+    pub fn on_canvas_delete_selected<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_canvas_delete_selected(handler);
+    }
+
+    pub fn on_canvas_leave_board<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_canvas_leave_board(handler);
     }
 
     /// Register a closure called when the user confirms a note rename.

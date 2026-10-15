@@ -1,0 +1,415 @@
+//! Filesystem persistence for Ephemeris Canvas (parallel to Notes).
+//!
+//! Layout under `~/.local/share/ephemeris/canvas/`:
+//! ```text
+//! canvas_index.json
+//! c_{id}.json                 # nodes, edges, viewport
+//! cards/c_{id}/{node_id}/
+//!   strokes.json
+//!   page.bin
+//!   text.json
+//! ```
+
+use crate::json_canvas::{
+    new_canvas_id, CanvasEdge, CanvasNode, FileNode, GroupNode, JsonCanvas, LinkNode, TextNode,
+};
+use crate::recognition_cache::PageRecognitionCache;
+use crate::store::StrokePage;
+use crate::AppError;
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+/// Nested folder (like a notebook).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppCanvasFolder {
+    pub id: u32,
+    pub title: String,
+    #[serde(default)]
+    pub profile_id: String,
+    #[serde(default)]
+    pub parent_id: Option<u32>,
+}
+
+/// Canvas metadata row in the index.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppCanvasMeta {
+    pub id: u32,
+    pub title: String,
+    #[serde(default)]
+    pub folder_id: Option<u32>,
+    #[serde(default)]
+    pub profile_id: String,
+    pub created_at: u64,
+    #[serde(default)]
+    pub updated_at: u64,
+}
+
+/// Persisted index of all canvases and folders.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CanvasIndex {
+    #[serde(default)]
+    pub canvas_id_seq: u32,
+    #[serde(default)]
+    pub folder_id_seq: u32,
+    #[serde(default)]
+    pub folders: Vec<AppCanvasFolder>,
+    #[serde(default)]
+    pub canvases: Vec<AppCanvasMeta>,
+}
+
+/// Zoom presets for e-ink (no continuous pinch).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CanvasZoomPreset {
+    Fit,
+    #[default]
+    OneHundred,
+    FocusSelected,
+}
+
+/// Saved board viewport.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanvasView {
+    /// World-space top-left of the viewport (board coords).
+    pub x: f32,
+    pub y: f32,
+    #[serde(default)]
+    pub zoom: CanvasZoomPreset,
+}
+
+impl Default for CanvasView {
+    fn default() -> Self {
+        Self {
+            x: -40.0,
+            y: -40.0,
+            zoom: CanvasZoomPreset::OneHundred,
+        }
+    }
+}
+
+/// On-disk body for one canvas (nodes/edges + Ephemeris view).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanvasDoc {
+    #[serde(default)]
+    pub nodes: Vec<CanvasNode>,
+    #[serde(default)]
+    pub edges: Vec<CanvasEdge>,
+    #[serde(default)]
+    pub view: CanvasView,
+}
+
+impl Default for CanvasDoc {
+    fn default() -> Self {
+        Self {
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            view: CanvasView::default(),
+        }
+    }
+}
+
+impl CanvasDoc {
+    /// Strip Ephemeris-only view for Obsidian export.
+    pub fn to_json_canvas(&self) -> JsonCanvas {
+        JsonCanvas {
+            nodes: self.nodes.clone(),
+            edges: self.edges.clone(),
+        }
+    }
+
+    pub fn from_json_canvas(jc: JsonCanvas) -> Self {
+        Self {
+            nodes: jc.nodes,
+            edges: jc.edges,
+            view: CanvasView::default(),
+        }
+    }
+
+    pub fn find_node(&self, id: &str) -> Option<&CanvasNode> {
+        self.nodes.iter().find(|n| n.id() == id)
+    }
+
+    pub fn find_node_mut(&mut self, id: &str) -> Option<&mut CanvasNode> {
+        self.nodes.iter_mut().find(|n| n.id() == id)
+    }
+
+    pub fn remove_node(&mut self, id: &str) {
+        self.nodes.retain(|n| n.id() != id);
+        self.edges.retain(|e| e.from_node != id && e.to_node != id);
+    }
+
+    pub fn add_text_card(&mut self, x: i32, y: i32) -> String {
+        let id = new_canvas_id();
+        self.nodes.push(CanvasNode::Text(TextNode {
+            id: id.clone(),
+            x,
+            y,
+            width: 280,
+            height: 160,
+            text: String::new(),
+            color: None,
+        }));
+        id
+    }
+
+    pub fn add_file_card(&mut self, x: i32, y: i32, file: impl Into<String>) -> String {
+        let id = new_canvas_id();
+        self.nodes.push(CanvasNode::File(FileNode {
+            id: id.clone(),
+            x,
+            y,
+            width: 260,
+            height: 100,
+            file: file.into(),
+            subpath: None,
+            color: None,
+        }));
+        id
+    }
+
+    pub fn add_link_card(&mut self, x: i32, y: i32, url: impl Into<String>) -> String {
+        let id = new_canvas_id();
+        self.nodes.push(CanvasNode::Link(LinkNode {
+            id: id.clone(),
+            x,
+            y,
+            width: 260,
+            height: 80,
+            url: url.into(),
+            color: None,
+        }));
+        id
+    }
+
+    pub fn add_group(&mut self, x: i32, y: i32, label: impl Into<String>) -> String {
+        let id = new_canvas_id();
+        self.nodes.push(CanvasNode::Group(GroupNode {
+            id: id.clone(),
+            x,
+            y,
+            width: 480,
+            height: 320,
+            label: Some(label.into()),
+            background: None,
+            background_style: None,
+            color: None,
+        }));
+        id
+    }
+}
+
+/// `~/.local/share/ephemeris/canvas/` (respects `XDG_DATA_HOME`).
+pub fn canvas_data_dir() -> PathBuf {
+    let base = std::env::var("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            PathBuf::from(home).join(".local").join("share")
+        });
+    base.join("ephemeris").join("canvas")
+}
+
+pub fn canvas_index_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("canvas_index.json")
+}
+
+pub fn canvas_doc_path(data_dir: &Path, canvas_id: u32) -> PathBuf {
+    data_dir.join(format!("c_{canvas_id}.json"))
+}
+
+pub fn card_dir(data_dir: &Path, canvas_id: u32, node_id: &str) -> PathBuf {
+    data_dir
+        .join("cards")
+        .join(format!("c_{canvas_id}"))
+        .join(node_id)
+}
+
+pub fn card_strokes_path(data_dir: &Path, canvas_id: u32, node_id: &str) -> PathBuf {
+    card_dir(data_dir, canvas_id, node_id).join("strokes.json")
+}
+
+pub fn card_page_path(data_dir: &Path, canvas_id: u32, node_id: &str) -> PathBuf {
+    card_dir(data_dir, canvas_id, node_id).join("page.bin")
+}
+
+pub fn card_text_path(data_dir: &Path, canvas_id: u32, node_id: &str) -> PathBuf {
+    card_dir(data_dir, canvas_id, node_id).join("text.json")
+}
+
+pub fn load_canvas_index(data_dir: &Path) -> Option<CanvasIndex> {
+    let json = fs::read_to_string(canvas_index_path(data_dir)).ok()?;
+    serde_json::from_str(&json).ok()
+}
+
+pub fn save_canvas_index(data_dir: &Path, index: &CanvasIndex) -> crate::Result<()> {
+    fs::create_dir_all(data_dir).map_err(AppError::Io)?;
+    let json = serde_json::to_string_pretty(index)
+        .map_err(|e| AppError::Storage(format!("serialize canvas index: {e}")))?;
+    let path = canvas_index_path(data_dir);
+    atomic_write_bytes(&path, json.as_bytes())?;
+    Ok(())
+}
+
+pub fn load_canvas_doc(data_dir: &Path, canvas_id: u32) -> CanvasDoc {
+    let path = canvas_doc_path(data_dir, canvas_id);
+    fs::read_to_string(&path)
+        .ok()
+        .and_then(|j| serde_json::from_str(&j).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_canvas_doc(data_dir: &Path, canvas_id: u32, doc: &CanvasDoc) -> crate::Result<()> {
+    fs::create_dir_all(data_dir).map_err(AppError::Io)?;
+    let json = serde_json::to_string_pretty(doc)
+        .map_err(|e| AppError::Storage(format!("serialize canvas doc: {e}")))?;
+    atomic_write_bytes(&canvas_doc_path(data_dir, canvas_id), json.as_bytes())?;
+    Ok(())
+}
+
+pub fn delete_canvas_files(data_dir: &Path, canvas_id: u32) {
+    let _ = fs::remove_file(canvas_doc_path(data_dir, canvas_id));
+    let cards = data_dir.join("cards").join(format!("c_{canvas_id}"));
+    let _ = fs::remove_dir_all(cards);
+}
+
+pub fn load_card_strokes(data_dir: &Path, canvas_id: u32, node_id: &str) -> StrokePage {
+    let path = card_strokes_path(data_dir, canvas_id, node_id);
+    fs::read_to_string(&path)
+        .ok()
+        .and_then(|j| serde_json::from_str(&j).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_card_strokes(
+    data_dir: &Path,
+    canvas_id: u32,
+    node_id: &str,
+    page: &StrokePage,
+) -> crate::Result<()> {
+    let dir = card_dir(data_dir, canvas_id, node_id);
+    fs::create_dir_all(&dir).map_err(AppError::Io)?;
+    let json = serde_json::to_string_pretty(page)
+        .map_err(|e| AppError::Storage(format!("serialize card strokes: {e}")))?;
+    atomic_write_bytes(
+        &card_strokes_path(data_dir, canvas_id, node_id),
+        json.as_bytes(),
+    )?;
+    Ok(())
+}
+
+pub fn load_card_text(
+    data_dir: &Path,
+    canvas_id: u32,
+    node_id: &str,
+) -> Option<PageRecognitionCache> {
+    let path = card_text_path(data_dir, canvas_id, node_id);
+    let json = fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&json).ok()
+}
+
+pub fn save_card_text(
+    data_dir: &Path,
+    canvas_id: u32,
+    node_id: &str,
+    cache: &PageRecognitionCache,
+) -> crate::Result<()> {
+    let dir = card_dir(data_dir, canvas_id, node_id);
+    fs::create_dir_all(&dir).map_err(AppError::Io)?;
+    let json = serde_json::to_string_pretty(cache)
+        .map_err(|e| AppError::Storage(format!("serialize card text: {e}")))?;
+    atomic_write_bytes(
+        &card_text_path(data_dir, canvas_id, node_id),
+        json.as_bytes(),
+    )?;
+    Ok(())
+}
+
+const PAGE_BIN_MAGIC: &[u8; 4] = b"EPH1";
+
+pub fn save_card_page_pixels(
+    data_dir: &Path,
+    canvas_id: u32,
+    node_id: &str,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+) -> crate::Result<()> {
+    let dir = card_dir(data_dir, canvas_id, node_id);
+    fs::create_dir_all(&dir).map_err(AppError::Io)?;
+    let mut buf = Vec::with_capacity(12 + pixels.len());
+    buf.extend_from_slice(PAGE_BIN_MAGIC);
+    buf.extend_from_slice(&width.to_le_bytes());
+    buf.extend_from_slice(&height.to_le_bytes());
+    buf.extend_from_slice(pixels);
+    atomic_write_bytes(&card_page_path(data_dir, canvas_id, node_id), &buf)?;
+    Ok(())
+}
+
+pub fn load_card_page_pixels(
+    data_dir: &Path,
+    canvas_id: u32,
+    node_id: &str,
+) -> Option<(u32, u32, Vec<u8>)> {
+    let buf = fs::read(card_page_path(data_dir, canvas_id, node_id)).ok()?;
+    if buf.len() < 12 || &buf[0..4] != PAGE_BIN_MAGIC {
+        return None;
+    }
+    let width = u32::from_le_bytes(buf[4..8].try_into().ok()?);
+    let height = u32::from_le_bytes(buf[8..12].try_into().ok()?);
+    Some((width, height, buf[12..].to_vec()))
+}
+
+fn atomic_write_bytes(path: &Path, content: &[u8]) -> crate::Result<()> {
+    let tmp = path.with_extension("ephemeris-tmp");
+    fs::write(&tmp, content).map_err(AppError::Io)?;
+    fs::rename(&tmp, path).map_err(AppError::Io)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn index_and_doc_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut index = CanvasIndex::default();
+        index.canvas_id_seq = 1;
+        index.canvases.push(AppCanvasMeta {
+            id: 1,
+            title: "Map".into(),
+            folder_id: None,
+            profile_id: "p1".into(),
+            created_at: 1,
+            updated_at: 2,
+        });
+        save_canvas_index(dir, &index).unwrap();
+        let loaded = load_canvas_index(dir).unwrap();
+        assert_eq!(loaded.canvases[0].title, "Map");
+
+        let mut doc = CanvasDoc::default();
+        let nid = doc.add_text_card(10, 20);
+        save_canvas_doc(dir, 1, &doc).unwrap();
+        let again = load_canvas_doc(dir, 1);
+        assert_eq!(again.nodes.len(), 1);
+        assert_eq!(again.nodes[0].id(), nid);
+    }
+
+    #[test]
+    fn card_sidecars() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let page = StrokePage::default();
+        save_card_strokes(dir, 1, "abc", &page).unwrap();
+        assert!(card_strokes_path(dir, 1, "abc").exists());
+        let cache = PageRecognitionCache::new("test");
+        save_card_text(dir, 1, "abc", &cache).unwrap();
+        assert!(load_card_text(dir, 1, "abc").is_some());
+        save_card_page_pixels(dir, 1, "abc", 2, 2, &[255, 255, 255, 255]).unwrap();
+        let (w, h, px) = load_card_page_pixels(dir, 1, "abc").unwrap();
+        assert_eq!((w, h, px.len()), (2, 2, 4));
+    }
+}

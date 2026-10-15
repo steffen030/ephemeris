@@ -6,6 +6,7 @@
 //! beside it. Optional PDF sibling `{Note}.pdf` is linked from the markdown
 //! when present.
 
+use crate::json_canvas::{new_canvas_id, CanvasNode, FileNode, JsonCanvas, TextNode};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -14,6 +15,9 @@ pub const DEFAULT_EXPORT_SUBDIR: &str = "Ephemeris";
 
 /// Folder under the export root that holds all note markdown/PDF exports.
 pub const NOTES_EXPORT_FOLDER: &str = "Notes";
+
+/// Folder under the export root that holds Obsidian JSON Canvas exports.
+pub const CANVAS_EXPORT_FOLDER: &str = "Canvas";
 
 /// Payload for writing one note into the vault.
 #[derive(Debug, Clone)]
@@ -156,6 +160,126 @@ fn demote_h1_to_h2(text: &str) -> String {
     out.trim_end().to_string()
 }
 
+/// Payload for writing one canvas into the vault as `.canvas` (+ optional PNGs).
+#[derive(Debug, Clone)]
+pub struct VaultCanvasExport {
+    /// Display path for logging (e.g. `"Work / Ideas"`).
+    pub folder_title: String,
+    /// Sanitized folder segments under `{export_subdir}/Canvas/`.
+    pub folder_segments: Vec<String>,
+    pub canvas_title: String,
+    pub canvas_id: u32,
+    /// JSON Canvas document (may be augmented with PNG file nodes).
+    pub doc: JsonCanvas,
+    /// Optional ink PNG bytes keyed by text-node id → written under `_assets/`.
+    pub ink_pngs: Vec<(String, Vec<u8>)>,
+    /// When true, append a `file` node sibling for each ink PNG.
+    pub include_ink_file_nodes: bool,
+}
+
+/// Absolute directory for a canvas under `{export_subdir}/Canvas/{segments…}`.
+pub fn canvas_export_dir(vault_path: &Path, export_subdir: &Path, segments: &[String]) -> PathBuf {
+    let mut dir = vault_path.join(export_subdir).join(CANVAS_EXPORT_FOLDER);
+    for seg in segments {
+        dir.push(seg);
+    }
+    dir
+}
+
+/// Vault-relative path for a file under the Canvas tree.
+pub fn canvas_export_rel(export_subdir: &Path, segments: &[String], file_name: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for c in export_subdir.components() {
+        parts.push(c.as_os_str().to_string_lossy().into_owned());
+    }
+    parts.push(CANVAS_EXPORT_FOLDER.to_string());
+    for seg in segments {
+        parts.push(seg.clone());
+    }
+    parts.push(file_name.to_string());
+    parts.join("/")
+}
+
+/// Write (or overwrite) a `.canvas` file and optional PNG assets.
+///
+/// Returns the absolute path of the written `.canvas` file.
+pub fn export_canvas_json(
+    vault_path: &Path,
+    export_subdir: &Path,
+    canvas: &VaultCanvasExport,
+) -> crate::Result<PathBuf> {
+    let dir = canvas_export_dir(vault_path, export_subdir, &canvas.folder_segments);
+    fs::create_dir_all(&dir).map_err(crate::AppError::Io)?;
+
+    let stem = sanitize_component(&canvas.canvas_title);
+    let assets_dir = dir.join("_assets");
+    if !canvas.ink_pngs.is_empty() {
+        fs::create_dir_all(&assets_dir).map_err(crate::AppError::Io)?;
+    }
+
+    let mut doc = canvas.doc.clone();
+    if canvas.include_ink_file_nodes {
+        for (node_id, _) in &canvas.ink_pngs {
+            let file_rel = canvas_export_rel(
+                export_subdir,
+                &canvas.folder_segments,
+                &format!("_assets/{node_id}.png"),
+            );
+            // Place PNG file node near the matching text card when possible.
+            let (x, y, width, height) = doc
+                .nodes
+                .iter()
+                .find(|n| n.id() == node_id)
+                .map(|n| (n.x() + n.width() + 20, n.y(), 200, n.height().min(160)))
+                .unwrap_or((0, 0, 200, 120));
+            doc.nodes.push(CanvasNode::File(FileNode {
+                id: new_canvas_id(),
+                x,
+                y,
+                width,
+                height,
+                file: file_rel,
+                subpath: None,
+                color: None,
+            }));
+            // Ensure the text node still carries markdown when empty.
+            if let Some(CanvasNode::Text(TextNode { text, .. })) =
+                doc.nodes.iter_mut().find(|n| n.id() == node_id)
+            {
+                if text.trim().is_empty() {
+                    *text = String::new();
+                }
+            }
+        }
+    }
+
+    for (node_id, png) in &canvas.ink_pngs {
+        let png_path = assets_dir.join(format!("{node_id}.png"));
+        atomic_write_bytes(&png_path, png)?;
+    }
+
+    let canvas_path = dir.join(format!("{stem}.canvas"));
+    let body = doc
+        .to_json_pretty()
+        .map_err(|e| crate::AppError::Storage(format!("serialize .canvas: {e}")))?;
+    atomic_write(&canvas_path, &body)?;
+    Ok(canvas_path)
+}
+
+/// Sync every canvas in `canvases` into the vault export tree.
+pub fn sync_canvases_to_vault(
+    vault_path: &Path,
+    export_subdir: &Path,
+    canvases: &[VaultCanvasExport],
+) -> crate::Result<usize> {
+    let mut n = 0;
+    for c in canvases {
+        export_canvas_json(vault_path, export_subdir, c)?;
+        n += 1;
+    }
+    Ok(n)
+}
+
 /// Sanitize a single path component for cross-platform vault folders.
 pub fn sanitize_component(name: &str) -> String {
     let trimmed = name.trim();
@@ -180,7 +304,12 @@ fn escape_yaml(s: &str) -> String {
 }
 
 fn atomic_write(path: &Path, content: &str) -> crate::Result<()> {
-    let tmp = path.with_extension("md.ephemeris-tmp");
+    atomic_write_bytes(path, content.as_bytes())
+}
+
+fn atomic_write_bytes(path: &Path, content: &[u8]) -> crate::Result<()> {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("dat");
+    let tmp = path.with_extension(format!("{ext}.ephemeris-tmp"));
     fs::write(&tmp, content).map_err(crate::AppError::Io)?;
     fs::rename(&tmp, path).map_err(crate::AppError::Io)?;
     Ok(())
@@ -294,6 +423,46 @@ mod tests {
         assert_eq!(rel, "Ephemeris/Notes/Work/Ideas/n.pdf");
         let unfiled = notebook_export_rel(Path::new("Ephemeris"), &[], "loose.md");
         assert_eq!(unfiled, "Ephemeris/Notes/loose.md");
+    }
+
+    #[test]
+    fn export_canvas_writes_json_and_assets() {
+        let tmp = TempDir::new().unwrap();
+        let mut doc = JsonCanvas::default();
+        doc.nodes.push(CanvasNode::Text(TextNode {
+            id: "abc1234567890def".into(),
+            x: 0,
+            y: 0,
+            width: 200,
+            height: 100,
+            text: "Hello".into(),
+            color: None,
+        }));
+        let export = VaultCanvasExport {
+            folder_title: "Work".into(),
+            folder_segments: vec!["Work".into()],
+            canvas_title: "Map".into(),
+            canvas_id: 3,
+            doc,
+            ink_pngs: vec![("abc1234567890def".into(), vec![137, 80, 78, 71])],
+            include_ink_file_nodes: true,
+        };
+        let path = export_canvas_json(tmp.path(), Path::new("Ephemeris"), &export).unwrap();
+        assert!(path.ends_with("Ephemeris/Canvas/Work/Map.canvas"));
+        assert!(tmp
+            .path()
+            .join("Ephemeris/Canvas/Work/_assets/abc1234567890def.png")
+            .exists());
+        let body = fs::read_to_string(&path).unwrap();
+        assert!(body.contains("\"type\": \"text\""));
+        assert!(body.contains("Hello"));
+        assert!(body.contains("_assets/abc1234567890def.png"));
+    }
+
+    #[test]
+    fn canvas_export_rel_includes_canvas_folder() {
+        let rel = canvas_export_rel(Path::new("Ephemeris"), &["A".into()], "x.canvas");
+        assert_eq!(rel, "Ephemeris/Canvas/A/x.canvas");
     }
 
     #[test]

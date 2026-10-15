@@ -249,7 +249,7 @@ impl BackgroundRecogQueue {
     }
 }
 
-fn recognition_model_version_for(config: &Config) -> String {
+pub(crate) fn recognition_model_version_for(config: &Config) -> String {
     recognition_model_version(
         RECOGNITION_CACHE_FORMAT,
         config.handwriting_language.as_str(),
@@ -932,6 +932,25 @@ impl App {
             }
         }
         ui.clear_strokes_dirty();
+
+        // ── Obsidian Canvas (spatial boards) ───────────────────────────────────
+        let canvas_session = Rc::new(crate::canvas_app::CanvasSession::load());
+        *canvas_session.profile_filter.borrow_mut() = active_profile_filter.borrow().clone();
+        let canvas_focus_page = notes
+            .borrow()
+            .iter()
+            .map(|n| n.page_index)
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0);
+        crate::canvas_app::wire_canvas(
+            ui.clone(),
+            canvas_session,
+            config.clone(),
+            connections.clone(),
+            active_profile_filter.clone(),
+            canvas_focus_page,
+        );
 
         // ── Microphone detection & recordings ─────────────────────────────────
         let device_has_mic = has_microphone();
@@ -2641,7 +2660,7 @@ impl App {
                         ui2.set_show_calendar(true);
                         ui2.set_show_note_list(false);
                         ui2.set_show_notebook_list(false);
-                        ui2.set_nav_section(3);
+                        ui2.set_nav_section(4);
                     }
                 }
             });
@@ -2736,7 +2755,7 @@ impl App {
                     ui2.set_show_start_page(false);
                     push_recs_audio();
                     ui2.set_show_recording_list(true);
-                    ui2.set_nav_section(3);
+                    ui2.set_nav_section(4);
                     return;
                 }
                 let pf = filter_ra.borrow().clone();
@@ -3239,7 +3258,7 @@ impl App {
                 ui2.set_show_md_viewer(false);
                 ui2.set_ring_visible(false);
                 ui2.set_show_task_view(true);
-                ui2.set_nav_section(2);
+                ui2.set_nav_section(3);
             });
         }
 
@@ -3672,7 +3691,7 @@ impl App {
                     ui2.set_show_notebook_list(false);
                     push_recs();
                     ui2.set_show_recording_list(true);
-                    ui2.set_nav_section(3);
+                    ui2.set_nav_section(4);
                     open_rec_detail(id);
                 }
             });
@@ -4678,13 +4697,13 @@ impl App {
                         // Task view is refreshed by existing nav handler patterns.
                         let _ = filter_str;
                         ui2.set_show_task_view(true);
-                        ui2.set_nav_section(2);
+                        ui2.set_nav_section(3);
                     }
                     "calendar" => {
                         ui2.set_show_search(false);
                         ui2.set_show_md_viewer(false);
                         ui2.set_show_calendar(true);
-                        ui2.set_nav_section(3);
+                        ui2.set_nav_section(4);
                     }
                     _ => {}
                 }
@@ -4700,7 +4719,7 @@ impl App {
                 if ret.get() {
                     ret.set(false);
                     ui2.set_show_task_view(true);
-                    ui2.set_nav_section(2); // Tasks
+                    ui2.set_nav_section(4); // Tasks
                 } else {
                     ui2.set_show_search(true);
                 }
@@ -6872,13 +6891,13 @@ fn note_updated_at(n: &AppNote) -> u64 {
 
 /// An external connection (vault path, calendar file/URL) with per-profile assignment.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
-struct AppConnection {
-    id: u32,
+pub(crate) struct AppConnection {
+    pub(crate) id: u32,
     /// `"vault"` | `"calendar"` (ICS) | `"caldav"` (authenticated CalDAV).
-    kind: String,
-    display: String,
-    value: String,
-    profile_id: String,
+    pub(crate) kind: String,
+    pub(crate) display: String,
+    pub(crate) value: String,
+    pub(crate) profile_id: String,
     allow_in_aggregated: bool,
     /// CalDAV username (empty for ICS/vault).
     #[serde(default)]

@@ -269,6 +269,21 @@ export struct NotebookEntry {
     custom-profile-icon: image,
 }
 
+/// Canvas folder row (parallel to NotebookEntry).
+export struct CanvasFolderEntry {
+    id: string,
+    title: string,
+    canvas-count: int,
+    folder-count: int,
+}
+
+/// Canvas document row in the browser.
+export struct CanvasEntry {
+    id: string,
+    title: string,
+    date-label: string,
+}
+
 /// A profile chip for the profile switcher.
 export struct ProfileEntry {
     id: string,
@@ -441,6 +456,40 @@ export component EphemerisPage inherits Window {
     in property <bool> show-filebrowser: false;
     in property <bool> show-note-list: false;
     in property <bool> show-notebook-list: false;
+    in property <bool> show-canvas-folder-list: false;
+    in property <bool> show-canvas-list: false;
+    in-out property <bool> show-canvas-board: false;
+    in-out property <bool> canvas-focus-active: false;
+    in-out property <bool> canvas-menu-open: false;
+    in-out property <bool> canvas-connect-mode: false;
+    in-out property <string> canvas-tool: "select"; // select | move
+    in-out property <string> canvas-selected-id: "";
+    in-out property <string> canvas-board-title: "Canvas";
+    in-out property <string> canvas-browser-title: "Canvas";
+    in-out property <bool> canvas-at-root: true;
+    in property <image> canvas-board-image;
+    in property <[CanvasFolderEntry]> canvas-folder-list: [];
+    in property <[CanvasEntry]> canvas-list: [];
+    in-out property <bool> canvas-add-visible: false;
+    in-out property <bool> canvas-file-dialog-visible: false;
+    in-out property <bool> canvas-link-dialog-visible: false;
+    in-out property <string> canvas-file-path: "";
+    in-out property <string> canvas-link-url: "";
+    callback nav-canvas-tapped();
+    callback start-page-canvas-tapped();
+    callback canvas-folder-tapped(string);
+    callback canvas-browser-back-tapped();
+    callback canvas-folder-new-tapped();
+    callback canvas-new-tapped();
+    callback canvas-tapped(string);
+    callback canvas-board-pointer(float, float, string, string);
+    callback canvas-zoom-preset(string);
+    callback canvas-add-confirm(string);
+    callback canvas-file-confirm();
+    callback canvas-link-confirm();
+    callback canvas-focus-done();
+    callback canvas-delete-selected();
+    callback canvas-leave-board();
     in-out property <bool> show-search: false;
     in-out property <bool> show-md-viewer: false;
 
@@ -530,10 +579,16 @@ export component EphemerisPage inherits Window {
     // ── Drawing mode ─────────────────────────────────────────────────────
     // True when no overlay view is active (pure drawing canvas).
     // See-text is a reading view (nav visible); exclude it so chrome returns.
+    private property <bool> is-obsidian-canvas-context:
+        root.show-canvas-board && !root.canvas-focus-active;
+
+    // Note ink page OR canvas text-card focus (fullscreen ink).
     private property <bool> is-canvas-context:
         !root.show-start-page && !root.show-task-view &&
         !root.show-settings && !root.show-filebrowser &&
         !root.show-note-list && !root.show-notebook-list &&
+        !root.show-canvas-folder-list && !root.show-canvas-list &&
+        !root.show-canvas-board &&
         !root.show-calendar && !root.task-dialog-visible &&
         !root.note-rename-visible && !root.note-move-visible &&
         !root.notebook-rename-visible && !root.notebook-delete-visible &&
@@ -1014,7 +1069,23 @@ export component EphemerisPage inherits Window {
                         }
                         // Subtitle lives in WIP / empty-state copy; chips filter by context.
 
+                        
                         Rectangle {
+                            width: 88px; height: 36px;
+                            background: EinkTheme.btn-bg;
+                            border-radius: 4px;
+                            border-width: 2px;
+                            border-color: EinkTheme.btn-border;
+                            Text {
+                                text: "Canvas";
+                                font-size: 13px;
+                                color: EinkTheme.btn-fg;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            TouchArea { clicked => { root.start-page-canvas-tapped(); } }
+                        }
+Rectangle {
                             width: 96px; height: 36px;
                             background: EinkTheme.btn-bg;
                             border-radius: 4px;
@@ -3761,10 +3832,370 @@ export component EphemerisPage inherits Window {
         }
     }
 
+
+    // ── Canvas browser (folders + canvases) ───────────────────────────────
+    canvas-browser-view := Rectangle {
+        visible: root.show-canvas-folder-list || root.show-canvas-list;
+        x: root.nav-w; y: 0;
+        width: parent.width - root.nav-w;
+        height: parent.height;
+        background: EinkTheme.canvas-bg;
+        clip: true;
+
+        VerticalLayout {
+            padding: 0px; spacing: 0px;
+            Rectangle {
+                height: 44px;
+                background: EinkTheme.canvas-bg;
+                HorizontalLayout {
+                    padding-left: 8px; padding-right: 8px;
+                    padding-top: 6px; padding-bottom: 6px;
+                    spacing: 6px;
+                    Rectangle {
+                        width: 40px; height: 32px;
+                        background: EinkTheme.btn-bg;
+                        border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                        Text {
+                            text: Icons.back; font-family: "Material Icons"; font-size: 20px;
+                            color: EinkTheme.btn-fg;
+                            horizontal-alignment: center; vertical-alignment: center;
+                            width: parent.width; height: parent.height;
+                        }
+                        TouchArea { clicked => { root.canvas-browser-back-tapped(); } }
+                    }
+                    Text {
+                        text: root.canvas-browser-title;
+                        font-size: 15px; font-weight: 700; color: EinkTheme.btn-fg;
+                        vertical-alignment: center; horizontal-stretch: 1; overflow: elide;
+                    }
+                    Rectangle {
+                        width: 72px; height: 32px;
+                        background: EinkTheme.btn-bg;
+                        border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                        Text { text: "+ Folder"; font-size: 12px; color: EinkTheme.btn-fg;
+                               horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea { clicked => { root.canvas-folder-new-tapped(); } }
+                    }
+                    Rectangle {
+                        width: 72px; height: 32px;
+                        background: EinkTheme.btn-active-bg;
+                        border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                        Text { text: "+ Canvas"; font-size: 12px; color: EinkTheme.btn-active-fg;
+                               horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea { clicked => { root.canvas-new-tapped(); } }
+                    }
+                }
+            }
+            Rectangle { height: 2px; background: EinkTheme.chrome-border; }
+            Flickable {
+                content-height: folders-col.preferred-height + canvases-col.preferred-height + 24px;
+                VerticalLayout {
+                    padding: 8px; spacing: 4px;
+                    folders-col := VerticalLayout {
+                        spacing: 4px;
+                        for f in root.canvas-folder-list: Rectangle {
+                            height: 52px;
+                            background: EinkTheme.btn-bg;
+                            border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                            HorizontalLayout {
+                                padding-left: 10px; padding-right: 10px; spacing: 8px;
+                                Text {
+                                    text: Icons.folder; font-family: "Material Icons"; font-size: 22px;
+                                    color: EinkTheme.btn-fg; vertical-alignment: center;
+                                }
+                                VerticalLayout {
+                                    alignment: center; spacing: 2px; horizontal-stretch: 1;
+                                    Text { text: f.title; font-size: 14px; font-weight: 600; color: EinkTheme.btn-fg; overflow: elide; }
+                                    Text {
+                                        text: "Open folder";
+                                        font-size: 11px; color: EinkTheme.text-secondary;
+                                    }
+                                }
+                            }
+                            TouchArea { clicked => { root.canvas-folder-tapped(f.id); } }
+                        }
+                    }
+                    canvases-col := VerticalLayout {
+                        spacing: 4px;
+                        for c in root.canvas-list: Rectangle {
+                            height: 52px;
+                            background: transparent;
+                            HorizontalLayout {
+                                padding-left: 10px; padding-right: 10px; spacing: 8px;
+                                Text {
+                                    text: Icons.grid-view; font-family: "Material Icons"; font-size: 22px;
+                                    color: EinkTheme.btn-fg; vertical-alignment: center;
+                                }
+                                VerticalLayout {
+                                    alignment: center; spacing: 2px; horizontal-stretch: 1;
+                                    Text { text: c.title; font-size: 14px; font-weight: 600; color: EinkTheme.btn-fg; overflow: elide; }
+                                    Text { text: c.date-label; font-size: 11px; color: EinkTheme.text-secondary; }
+                                }
+                            }
+                            TouchArea { clicked => { root.canvas-tapped(c.id); } }
+                            Rectangle {
+                                x: 0; y: parent.height - 1px; width: parent.width; height: 1px;
+                                background: EinkTheme.chrome-border; opacity: 0.4;
+                            }
+                        }
+                    }
+                    if root.canvas-folder-list.length == 0 && root.canvas-list.length == 0: Rectangle {
+                        height: 64px;
+                        Text {
+                            text: "No canvases yet — tap + Canvas";
+                            font-size: 13px; color: EinkTheme.text-secondary;
+                            horizontal-alignment: center; vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Canvas board overview (fullscreen; burger restores chrome) ────────
+    canvas-board-view := Rectangle {
+        visible: root.show-canvas-board && !root.canvas-focus-active;
+        x: 0; y: 0; width: parent.width; height: parent.height;
+        background: EinkTheme.canvas-bg;
+        Image {
+            width: parent.width; height: parent.height;
+            source: root.canvas-board-image;
+            image-fit: fill;
+        }
+        TouchArea {
+            width: parent.width; height: parent.height;
+            property <bool> tracked: false;
+            property <float> down-x: 0;
+            property <float> down-y: 0;
+            property <bool> did-drag: false;
+            pointer-event(event) => {
+                if (event.kind == PointerEventKind.down) {
+                    self.tracked = true; self.did-drag = false;
+                    self.down-x = self.mouse-x / 1px; self.down-y = self.mouse-y / 1px;
+                    root.canvas-board-pointer(self.down-x, self.down-y, "down", "finger");
+                }
+                if (event.kind == PointerEventKind.move && self.tracked) {
+                    if ((self.mouse-x / 1px - self.down-x).abs() > 6 || (self.mouse-y / 1px - self.down-y).abs() > 6) {
+                        self.did-drag = true;
+                    }
+                    root.canvas-board-pointer(self.mouse-x / 1px, self.mouse-y / 1px, "move", "finger");
+                }
+                if (event.kind == PointerEventKind.up && self.tracked) {
+                    self.tracked = false;
+                    root.canvas-board-pointer(self.mouse-x / 1px, self.mouse-y / 1px, "up", "finger");
+                    if (!self.did-drag) {
+                        root.canvas-board-pointer(self.mouse-x / 1px, self.mouse-y / 1px, "tap", "finger");
+                    }
+                }
+            }
+        }
+    }
+
+    // Canvas board burger + menu
+    canvas-burger := Rectangle {
+        visible: root.is-obsidian-canvas-context;
+        x: parent.width - 52px; y: 8px; width: 44px; height: 44px;
+        background: root.canvas-menu-open ? EinkTheme.btn-active-bg : EinkTheme.chrome-bg;
+        border-radius: 22px; border-width: 2px; border-color: EinkTheme.btn-border;
+        Text {
+            text: root.canvas-menu-open ? Icons.close : Icons.menu;
+            font-family: "Material Icons"; font-size: 20px;
+            color: root.canvas-menu-open ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+            horizontal-alignment: center; vertical-alignment: center;
+            width: parent.width; height: parent.height;
+        }
+        TouchArea { clicked => { root.canvas-menu-open = !root.canvas-menu-open; } }
+    }
+
+    if root.canvas-menu-open && root.is-obsidian-canvas-context: Rectangle {
+        x: 0; y: 0; width: parent.width; height: parent.height;
+        background: transparent;
+        TouchArea { clicked => { root.canvas-menu-open = false; } }
+    }
+
+    canvas-dropdown := Rectangle {
+        visible: root.canvas-menu-open && root.is-obsidian-canvas-context;
+        x: parent.width - 200px; y: 60px; width: 192px; height: 340px;
+        background: EinkTheme.chrome-bg;
+        border-width: 2px; border-color: EinkTheme.chrome-border; border-radius: 6px;
+        VerticalLayout {
+            padding: 8px; spacing: 6px;
+            Text { text: root.canvas-board-title; font-size: 13px; font-weight: 700; color: EinkTheme.btn-fg; overflow: elide; }
+            Rectangle {
+                height: 36px; background: EinkTheme.btn-bg; border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                Text { text: "Add card"; font-size: 13px; color: EinkTheme.btn-fg; horizontal-alignment: center; vertical-alignment: center; }
+                TouchArea { clicked => { root.canvas-add-visible = true; root.canvas-menu-open = false; } }
+            }
+            Rectangle {
+                height: 36px; background: root.canvas-connect-mode ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+                border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                Text {
+                    text: root.canvas-connect-mode ? "Connecting…" : "Connect";
+                    font-size: 13px;
+                    color: root.canvas-connect-mode ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                    horizontal-alignment: center; vertical-alignment: center;
+                }
+                TouchArea {
+                    clicked => {
+                        root.canvas-connect-mode = !root.canvas-connect-mode;
+                        root.canvas-tool = "select";
+                        root.canvas-menu-open = false;
+                    }
+                }
+            }
+            Rectangle {
+                height: 36px; background: root.canvas-tool == "move" ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+                border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                Text {
+                    text: "Move";
+                    font-size: 13px;
+                    color: root.canvas-tool == "move" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                    horizontal-alignment: center; vertical-alignment: center;
+                }
+                TouchArea {
+                    clicked => {
+                        root.canvas-tool = root.canvas-tool == "move" ? "select" : "move";
+                        root.canvas-connect-mode = false;
+                        root.canvas-menu-open = false;
+                    }
+                }
+            }
+            HorizontalLayout {
+                spacing: 4px;
+                Rectangle {
+                    height: 32px; horizontal-stretch: 1; background: EinkTheme.btn-bg;
+                    border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                    Text { text: "Fit"; font-size: 12px; color: EinkTheme.btn-fg; horizontal-alignment: center; vertical-alignment: center; }
+                    TouchArea { clicked => { root.canvas-zoom-preset("fit"); root.canvas-menu-open = false; } }
+                }
+                Rectangle {
+                    height: 32px; horizontal-stretch: 1; background: EinkTheme.btn-bg;
+                    border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                    Text { text: "100%"; font-size: 12px; color: EinkTheme.btn-fg; horizontal-alignment: center; vertical-alignment: center; }
+                    TouchArea { clicked => { root.canvas-zoom-preset("100"); root.canvas-menu-open = false; } }
+                }
+                Rectangle {
+                    height: 32px; horizontal-stretch: 1; background: EinkTheme.btn-bg;
+                    border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                    Text { text: "Focus"; font-size: 12px; color: EinkTheme.btn-fg; horizontal-alignment: center; vertical-alignment: center; }
+                    TouchArea { clicked => { root.canvas-zoom-preset("focus"); root.canvas-menu-open = false; } }
+                }
+            }
+            Rectangle {
+                height: 36px; background: EinkTheme.btn-bg; border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                Text { text: "Delete selected"; font-size: 13px; color: EinkTheme.btn-fg; horizontal-alignment: center; vertical-alignment: center; }
+                TouchArea { clicked => { root.canvas-delete-selected(); root.canvas-menu-open = false; } }
+            }
+            Rectangle {
+                height: 36px; background: EinkTheme.btn-active-bg; border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                Text { text: "Leave board"; font-size: 13px; color: EinkTheme.btn-active-fg; horizontal-alignment: center; vertical-alignment: center; }
+                TouchArea { clicked => { root.canvas-leave-board(); } }
+            }
+        }
+    }
+
+    // Focus-mode Done chip (returns to board)
+    if root.canvas-focus-active: Rectangle {
+        x: parent.width - 96px; y: 8px; width: 88px; height: 44px;
+        background: EinkTheme.btn-active-bg;
+        border-radius: 6px; border-width: 2px; border-color: EinkTheme.btn-border;
+        Text { text: "Done"; font-size: 14px; font-weight: 700; color: EinkTheme.btn-active-fg;
+               horizontal-alignment: center; vertical-alignment: center; }
+        TouchArea { clicked => { root.canvas-focus-done(); } }
+    }
+
+    // Add card sheet
+    if root.canvas-add-visible: Rectangle {
+        x: 0; y: 0; width: parent.width; height: parent.height;
+        background: #00000055;
+        TouchArea { clicked => { root.canvas-add-visible = false; } }
+        Rectangle {
+            x: (parent.width - 280px) / 2; y: (parent.height - 260px) / 2;
+            width: 280px; height: 260px;
+            background: EinkTheme.chrome-bg;
+            border-radius: 8px; border-width: 2px; border-color: EinkTheme.btn-border;
+            VerticalLayout {
+                padding: 16px; spacing: 10px;
+                Text { text: "Add to canvas"; font-size: 16px; font-weight: 700; color: EinkTheme.btn-fg; }
+                Rectangle {
+                    height: 40px; background: EinkTheme.btn-bg; border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                    Text { text: "Text card"; font-size: 14px; color: EinkTheme.btn-fg; horizontal-alignment: center; vertical-alignment: center; }
+                    TouchArea { clicked => { root.canvas-add-confirm("text"); } }
+                }
+                Rectangle {
+                    height: 40px; background: EinkTheme.btn-bg; border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                    Text { text: "File card"; font-size: 14px; color: EinkTheme.btn-fg; horizontal-alignment: center; vertical-alignment: center; }
+                    TouchArea { clicked => { root.canvas-add-confirm("file"); } }
+                }
+                Rectangle {
+                    height: 40px; background: EinkTheme.btn-bg; border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                    Text { text: "Link card"; font-size: 14px; color: EinkTheme.btn-fg; horizontal-alignment: center; vertical-alignment: center; }
+                    TouchArea { clicked => { root.canvas-add-confirm("link"); } }
+                }
+                Rectangle {
+                    height: 40px; background: EinkTheme.btn-bg; border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                    Text { text: "Group"; font-size: 14px; color: EinkTheme.btn-fg; horizontal-alignment: center; vertical-alignment: center; }
+                    TouchArea { clicked => { root.canvas-add-confirm("group"); } }
+                }
+            }
+        }
+    }
+
+    // File path dialog
+    if root.canvas-file-dialog-visible: Rectangle {
+        x: 0; y: 0; width: parent.width; height: parent.height; background: #00000055;
+        TouchArea { clicked => { root.canvas-file-dialog-visible = false; } }
+        Rectangle {
+            x: (parent.width - 320px) / 2; y: (parent.height - 160px) / 2;
+            width: 320px; height: 160px; background: EinkTheme.chrome-bg;
+            border-radius: 8px; border-width: 2px; border-color: EinkTheme.btn-border;
+            VerticalLayout {
+                padding: 16px; spacing: 10px;
+                Text { text: "Vault-relative file path"; font-size: 14px; font-weight: 700; color: EinkTheme.btn-fg; }
+                TextInput {
+                    text <=> root.canvas-file-path; font-size: 14px; color: EinkTheme.btn-fg;
+                    height: 36px;
+                }
+                Rectangle {
+                    height: 40px; background: EinkTheme.btn-active-bg; border-radius: 4px;
+                    Text { text: "Add file card"; font-size: 14px; color: EinkTheme.btn-active-fg;
+                           horizontal-alignment: center; vertical-alignment: center; }
+                    TouchArea { clicked => { root.canvas-file-confirm(); } }
+                }
+            }
+        }
+    }
+
+    // Link URL dialog
+    if root.canvas-link-dialog-visible: Rectangle {
+        x: 0; y: 0; width: parent.width; height: parent.height; background: #00000055;
+        TouchArea { clicked => { root.canvas-link-dialog-visible = false; } }
+        Rectangle {
+            x: (parent.width - 320px) / 2; y: (parent.height - 160px) / 2;
+            width: 320px; height: 160px; background: EinkTheme.chrome-bg;
+            border-radius: 8px; border-width: 2px; border-color: EinkTheme.btn-border;
+            VerticalLayout {
+                padding: 16px; spacing: 10px;
+                Text { text: "URL"; font-size: 14px; font-weight: 700; color: EinkTheme.btn-fg; }
+                TextInput {
+                    text <=> root.canvas-link-url; font-size: 14px; color: EinkTheme.btn-fg;
+                    height: 36px;
+                }
+                Rectangle {
+                    height: 40px; background: EinkTheme.btn-active-bg; border-radius: 4px;
+                    Text { text: "Add link card"; font-size: 14px; color: EinkTheme.btn-active-fg;
+                           horizontal-alignment: center; vertical-alignment: center; }
+                    TouchArea { clicked => { root.canvas-link-confirm(); } }
+                }
+            }
+        }
+    }
+
+
     // ── Left navigation rail ─────────────────────────────────────────────
     nav-rail := Rectangle {
         // Hidden in pure drawing mode; reappears when burger menu is open.
-        visible: !root.is-canvas-context || root.drawing-menu-open;
+        visible: (!root.is-canvas-context && !root.is-obsidian-canvas-context) || root.drawing-menu-open || root.canvas-menu-open;
         x: 0;
         y: 0;
         width: root.nav-w;
@@ -3829,28 +4260,55 @@ export component EphemerisPage inherits Window {
 
             Rectangle { height: 1px; background: EinkTheme.chrome-border; }
 
-            // Tasks
+            // Canvas (Obsidian-compatible spatial boards)
             Rectangle {
                 height: 72px;
                 background: root.nav-section == 2 ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
                 VerticalLayout {
                     padding: 6px; spacing: 2px; alignment: center;
                     Text {
-                        text: Icons.tasks;
+                        text: Icons.grid-view;
                         font-family: "Material Icons";
                         font-size: 26px;
                         color: root.nav-section == 2 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
                         horizontal-alignment: center;
                     }
                     Text {
-                        text: "Tasks";
+                        text: "Canvas";
                         font-size: 10px;
                         color: root.nav-section == 2 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
                         horizontal-alignment: center;
                     }
                 }
                 TouchArea {
-                    clicked => { root.nav-section = 2; root.nav-tasks-tapped(); }
+                    clicked => { root.nav-section = 2; root.nav-canvas-tapped(); }
+                }
+            }
+
+            Rectangle { height: 1px; background: EinkTheme.chrome-border; }
+
+            // Tasks
+            Rectangle {
+                height: 72px;
+                background: root.nav-section == 3 ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+                VerticalLayout {
+                    padding: 6px; spacing: 2px; alignment: center;
+                    Text {
+                        text: Icons.tasks;
+                        font-family: "Material Icons";
+                        font-size: 26px;
+                        color: root.nav-section == 3 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                        horizontal-alignment: center;
+                    }
+                    Text {
+                        text: "Tasks";
+                        font-size: 10px;
+                        color: root.nav-section == 3 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                        horizontal-alignment: center;
+                    }
+                }
+                TouchArea {
+                    clicked => { root.nav-section = 3; root.nav-tasks-tapped(); }
                 }
             }
 
@@ -3859,25 +4317,25 @@ export component EphemerisPage inherits Window {
             // Calendar
             Rectangle {
                 height: 72px;
-                background: root.nav-section == 3 ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+                background: root.nav-section == 4 ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
                 VerticalLayout {
                     padding: 6px; spacing: 2px; alignment: center;
                     Text {
                         text: Icons.calendar;
                         font-family: "Material Icons";
                         font-size: 26px;
-                        color: root.nav-section == 3 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                        color: root.nav-section == 4 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
                         horizontal-alignment: center;
                     }
                     Text {
                         text: "Cal";
                         font-size: 10px;
-                        color: root.nav-section == 3 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                        color: root.nav-section == 4 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
                         horizontal-alignment: center;
                     }
                 }
                 TouchArea {
-                    clicked => { root.nav-section = 3; root.nav-calendar-tapped(); }
+                    clicked => { root.nav-section = 4; root.nav-calendar-tapped(); }
                 }
             }
 
@@ -3885,25 +4343,25 @@ export component EphemerisPage inherits Window {
 
             if root.has-mic: Rectangle {
                 height: 72px;
-                background: root.nav-section == 4 ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+                background: root.nav-section == 5 ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
                 VerticalLayout {
                     padding: 6px; spacing: 2px; alignment: center;
                     Text {
                         text: Icons.mic;
                         font-family: "Material Icons";
                         font-size: 26px;
-                        color: root.nav-section == 4 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                        color: root.nav-section == 5 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
                         horizontal-alignment: center;
                     }
                     Text {
                         text: "Rec";
                         font-size: 10px;
-                        color: root.nav-section == 4 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                        color: root.nav-section == 5 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
                         horizontal-alignment: center;
                     }
                 }
                 TouchArea {
-                    clicked => { root.nav-section = 4; root.nav-rec-tapped(); }
+                    clicked => { root.nav-section = 5; root.nav-rec-tapped(); }
                 }
             }
 
@@ -3912,7 +4370,7 @@ export component EphemerisPage inherits Window {
             // Search — after Rec, before profile/settings
             Rectangle {
                 height: 72px;
-                background: root.show-search || root.show-md-viewer || root.nav-section == 5
+                background: root.show-search || root.show-md-viewer || root.nav-section == 6
                     ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
                 VerticalLayout {
                     padding: 6px; spacing: 2px; alignment: center;
@@ -3920,20 +4378,20 @@ export component EphemerisPage inherits Window {
                         text: Icons.search;
                         font-family: "Material Icons";
                         font-size: 26px;
-                        color: root.show-search || root.show-md-viewer || root.nav-section == 5
+                        color: root.show-search || root.show-md-viewer || root.nav-section == 6
                             ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
                         horizontal-alignment: center;
                     }
                     Text {
                         text: "Search";
                         font-size: 10px;
-                        color: root.show-search || root.show-md-viewer || root.nav-section == 5
+                        color: root.show-search || root.show-md-viewer || root.nav-section == 6
                             ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
                         horizontal-alignment: center;
                     }
                 }
                 TouchArea {
-                    clicked => { root.nav-section = 5; root.search-open(); }
+                    clicked => { root.nav-section = 6; root.search-open(); }
                 }
             }
 
