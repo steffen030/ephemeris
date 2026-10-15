@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.19](https://github.com/steffen030/ephemeris/compare/v0.1.18...v0.1.19) (2026-10-15)
+
+
+### Features
+
+* Obsidian-compatible Canvas (e-ink spatial boards) ([#51](https://github.com/steffen030/ephemeris/issues/51)) ([34aa65c](https://github.com/steffen030/ephemeris/commit/34aa65cd5d111e7cee1ec441544cd1c0809dbca5))
+
+
+### Bug Fixes
+
+* PineNote ink stalls, dropped strokes, PDF yellow, burger clip ([#49](https://github.com/steffen030/ephemeris/issues/49)) ([14a54d1](https://github.com/steffen030/ephemeris/commit/14a54d1261178ace7bf3be13bbfc93aeea1b1c25))
+
 ## [0.1.18](https://github.com/steffen030/ephemeris/compare/v0.1.17...v0.1.18) (2026-10-15)
 
 
