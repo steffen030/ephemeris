@@ -2,14 +2,14 @@
 
 use ephemeris_core::profile_manager::ProfileManager;
 use ephemeris_core::{
-    canvas_data_dir, delete_canvas_files, export_canvas_json, gray8_to_png, hit_port, hit_side,
-    hit_test, load_canvas_doc, load_canvas_index, load_card_page_pixels, load_card_strokes,
-    load_card_text, new_canvas_id, render_board, save_canvas_doc, save_canvas_index,
-    save_card_page_pixels, save_card_strokes, save_card_text, snap_grid, view_for_fit,
-    view_for_focus, zoom_view_at, AppCanvasFolder, AppCanvasMeta, BoardDrawOpts, CanvasDoc,
-    CanvasEdge, CanvasIndex, CanvasNode, CanvasZoomPreset, Config, EdgeEnd, NodeSide,
-    PageRecognitionCache, StrokePage, TextNode, VaultCanvasExport, Viewport, DEFAULT_EXPORT_SUBDIR,
-    PORT_HIT_RADIUS, RECOGNITION_CACHE_FORMAT,
+    canvas_data_dir, crop_ink_preview, delete_canvas_files, export_canvas_json, gray8_to_png,
+    hit_port, hit_resize_handle, hit_side, hit_test, load_canvas_doc, load_canvas_index,
+    load_card_page_pixels, load_card_strokes, load_card_text, new_canvas_id, render_board,
+    save_canvas_doc, save_canvas_index, save_card_page_pixels, save_card_strokes, save_card_text,
+    snap_grid, view_for_fit, view_for_focus, zoom_view_at, AppCanvasFolder, AppCanvasMeta,
+    BoardDrawOpts, CanvasDoc, CanvasEdge, CanvasIndex, CanvasNode, CanvasZoomPreset, Config,
+    EdgeEnd, NodeSide, PageRecognitionCache, StrokePage, TextNode, VaultCanvasExport, Viewport,
+    DEFAULT_EXPORT_SUBDIR, PORT_HIT_RADIUS, RECOGNITION_CACHE_FORMAT,
 };
 use ephemeris_ui::{CanvasFolderListItem, CanvasListItem, EphemerisUi, FolderListItem};
 use std::cell::{Cell, RefCell};
@@ -26,7 +26,8 @@ use crate::app::{
 const GRID: i32 = 20;
 const CONNECT_MARGIN: f32 = 48.0;
 const LONG_PRESS_MS: u64 = 480;
-const LONG_PRESS_SLOP: f32 = 14.0;
+/// Finger contacts on PineNote wobble well past 14px during a hold.
+const LONG_PRESS_SLOP: f32 = 28.0;
 /// Min interval between board re-renders while a drag / pinch is in flight.
 /// Each render is a full-panel raster + e-ink refresh; rendering every touch
 /// sample stalls the PineNote UI thread until GNOME offers force-quit.
@@ -37,6 +38,15 @@ type BoardPressStart = (u64, f32, f32, Option<String>);
 
 /// Move-tool drag: screen start point + each dragged node's original position.
 type MoveOrigin = ((f32, f32), Vec<(String, i32, i32)>);
+
+/// Resize-handle drag: node id, screen start point, original `(w, h)`.
+type ResizeDrag = (String, (f32, f32), (i32, i32));
+
+/// Smallest card / group after a resize (board px).
+const MIN_NODE_W: i32 = 80;
+const MIN_NODE_H: i32 = 40;
+/// Margin around cards when wrapping a selection in a group (board px).
+const GROUP_PAD: i32 = 40;
 
 /// Ink thumbnails keyed by node id: `(w, h, gray8)`.
 type InkPreviews = HashMap<String, (u32, u32, Vec<u8>)>;
@@ -66,6 +76,7 @@ pub(crate) struct CanvasSession {
     pub long_press_consumed: Cell<bool>,
     pub move_dragging: Cell<bool>,
     pub move_origin: RefCell<Option<MoveOrigin>>,
+    pub resize_drag: RefCell<Option<ResizeDrag>>,
     /// Card ink thumbnails for `ink_previews_canvas` (loaded once, not per frame).
     ink_previews: RefCell<InkPreviews>,
     ink_previews_canvas: Cell<Option<u32>>,
@@ -162,6 +173,7 @@ impl CanvasSession {
             long_press_consumed: Cell::new(false),
             move_dragging: Cell::new(false),
             move_origin: RefCell::new(None),
+            resize_drag: RefCell::new(None),
             ink_previews: RefCell::new(HashMap::new()),
             ink_previews_canvas: Cell::new(None),
             last_board_render: Cell::new(None),
@@ -247,9 +259,19 @@ impl CanvasSession {
         let page = ui.clone_component();
         let sel = self.selected_ids.borrow();
         let id = sel.first().cloned().unwrap_or_default();
-        page.set_canvas_selected_id(id.into());
+        page.set_canvas_selected_id(id.as_str().into());
         page.set_canvas_selection_count(sel.len() as i32);
         page.set_canvas_multi_select(self.multi_select.get());
+        let group_label = if !self.multi_select.get() && sel.len() == 1 {
+            match self.doc.borrow().find_node(&id) {
+                Some(CanvasNode::Group(g)) => Some(g.label.clone().unwrap_or_default()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        page.set_canvas_selected_group(group_label.is_some());
+        page.set_canvas_selected_label(group_label.unwrap_or_default().into());
     }
 }
 
@@ -280,6 +302,7 @@ pub(crate) fn leave_canvas_session(
     page.set_drawing_menu_open(false);
     *session.connect_from.borrow_mut() = None;
     *session.port_drag.borrow_mut() = None;
+    *session.resize_drag.borrow_mut() = None;
     session.clear_selection();
     session.sync_selection_ui(ui);
     session.pan_last.set(None);
@@ -661,6 +684,10 @@ pub(crate) fn wire_canvas(
                     .find(|f| f.id.to_string() == id)
                     .map(|f| f.title.clone())
                     .unwrap_or_default(),
+                "group" => match session.doc.borrow().find_node(&id) {
+                    Some(CanvasNode::Group(g)) => g.label.clone().unwrap_or_default(),
+                    _ => return,
+                },
                 "board" => {
                     let cid = session.active_canvas_id.get();
                     session
@@ -691,10 +718,22 @@ pub(crate) fn wire_canvas(
     {
         let ui_rc = ui.clone();
         let session = session.clone();
+        let refresh = refresh.clone();
         ui.on_canvas_rename_confirm(move |kind, id, title| {
             let page = ui_rc.clone_component();
             page.set_canvas_rename_visible(false);
             let title = title.trim().to_string();
+            if kind == "group" {
+                // Obsidian groups may be unlabeled: empty clears the label.
+                let label = (!title.is_empty()).then_some(title);
+                if let Some(CanvasNode::Group(g)) = session.doc.borrow_mut().find_node_mut(&id) {
+                    g.label = label;
+                }
+                session.save_doc();
+                session.sync_selection_ui(&ui_rc);
+                refresh();
+                return;
+            }
             if title.is_empty() {
                 return;
             }
@@ -796,9 +835,20 @@ pub(crate) fn wire_canvas(
                     let hit = hit_test(&session.doc.borrow(), &vp, x, y);
                     *session.press_start.borrow_mut() = Some((now_ms(), x, y, hit.clone()));
 
-                    // Port drag from single selection.
+                    // Resize handle / port drag from single selection.
                     if !session.multi_select.get() && session.selected_ids.borrow().len() == 1 {
                         let id = session.selected_ids.borrow()[0].clone();
+                        let size = {
+                            let doc = session.doc.borrow();
+                            hit_resize_handle(&doc, &vp, x, y, &id, PORT_HIT_RADIUS)
+                                .then(|| doc.find_node(&id).map(|n| (n.width(), n.height())))
+                                .flatten()
+                        };
+                        if let Some(size) = size {
+                            *session.resize_drag.borrow_mut() = Some((id, (x, y), size));
+                            session.pan_last.set(None);
+                            return;
+                        }
                         if let Some(side) =
                             hit_port(&session.doc.borrow(), &vp, x, y, &id, PORT_HIT_RADIUS)
                         {
@@ -812,14 +862,26 @@ pub(crate) fn wire_canvas(
                         if let Some(id) = hit {
                             let mut sel = session.selected_ids.borrow_mut();
                             if !sel.contains(&id) {
+                                if session.multi_select.get() {
+                                    // Leave the selection to the tap / long-press
+                                    // that follows (it adds this card).
+                                    return;
+                                }
                                 sel.clear();
                                 sel.push(id);
-                                session.multi_select.set(false);
                             }
-                            let ids = sel.clone();
+                            let mut ids = sel.clone();
                             drop(sel);
                             session.sync_selection_ui(&ui_rc);
                             let doc = session.doc.borrow();
+                            // Groups carry the nodes fully inside them (Obsidian).
+                            for gid in ids.clone() {
+                                for m in doc.group_members(&gid) {
+                                    if !ids.contains(&m) {
+                                        ids.push(m);
+                                    }
+                                }
+                            }
                             let origin = ids
                                 .into_iter()
                                 .filter_map(|id| {
@@ -841,6 +903,18 @@ pub(crate) fn wire_canvas(
                     }
                 }
                 "move" => {
+                    let resize = session.resize_drag.borrow().clone();
+                    if let Some((id, (sx, sy), (w0, h0))) = resize {
+                        let (bx0, by0) = vp.screen_to_board(sx, sy);
+                        let (bx1, by1) = vp.screen_to_board(x, y);
+                        let w = snap_grid(w0 + (bx1 - bx0) as i32, GRID).max(MIN_NODE_W);
+                        let h = snap_grid(h0 + (by1 - by0) as i32, GRID).max(MIN_NODE_H);
+                        if let Some(n) = session.doc.borrow_mut().find_node_mut(&id) {
+                            n.set_size(w, h);
+                        }
+                        refresh_board_throttled(&ui_rc, &session);
+                        return;
+                    }
                     if session.port_drag.borrow().is_some() {
                         return;
                     }
@@ -879,9 +953,20 @@ pub(crate) fn wire_canvas(
                     }
                 }
                 "up" => {
+                    let resized = session.resize_drag.borrow_mut().take();
+                    if resized.is_some() {
+                        // A short resize press must not also count as a tap.
+                        session.long_press_consumed.set(true);
+                        *session.press_start.borrow_mut() = None;
+                        session.save_doc();
+                        refresh();
+                        return;
+                    }
                     // Finish port-drag connect.
-                    if let Some((from_id, from_side)) = session.port_drag.borrow_mut().take() {
-                        if let Some(to_id) = hit_test(&session.doc.borrow(), &vp, x, y) {
+                    let port_drag = session.port_drag.borrow_mut().take();
+                    if let Some((from_id, from_side)) = port_drag {
+                        let to_hit = hit_test(&session.doc.borrow(), &vp, x, y);
+                        if let Some(to_id) = to_hit {
                             if to_id != from_id {
                                 let (bx, by) = vp.screen_to_board(x, y);
                                 let to_side =
@@ -917,10 +1002,11 @@ pub(crate) fn wire_canvas(
                         let still =
                             (x - px).abs() <= LONG_PRESS_SLOP && (y - py).abs() <= LONG_PRESS_SLOP;
                         if held >= LONG_PRESS_MS && still {
+                            // Additive: keeps the current selection (a tapped
+                            // card, or an existing multi-select) and adds this one.
                             session.multi_select.set(true);
                             let mut sel = session.selected_ids.borrow_mut();
                             if !sel.contains(&id) {
-                                sel.clear();
                                 sel.push(id);
                             }
                             drop(sel);
@@ -1074,6 +1160,31 @@ pub(crate) fn wire_canvas(
         let session = session.clone();
         let refresh = refresh.clone();
         let ui_rc = ui.clone();
+        ui.on_canvas_group_selected(move || {
+            let ids = session.selected_ids.borrow().clone();
+            let gid = session
+                .doc
+                .borrow_mut()
+                .add_group_around(&ids, GROUP_PAD, "Group");
+            let Some(gid) = gid else {
+                return;
+            };
+            session.multi_select.set(false);
+            session.set_single_selection(Some(gid.clone()));
+            session.sync_selection_ui(&ui_rc);
+            session.save_doc();
+            refresh();
+            // Name it right away; Cancel keeps "Group".
+            ui_rc
+                .clone_component()
+                .invoke_canvas_rename_request("group".into(), gid.as_str().into());
+        });
+    }
+
+    {
+        let session = session.clone();
+        let refresh = refresh.clone();
+        let ui_rc = ui.clone();
         ui.on_canvas_delete_selected(move || {
             let ids = session
                 .selected_ids
@@ -1120,6 +1231,7 @@ fn open_canvas(ui: &EphemerisUi, session: &CanvasSession, id: u32, refresh: &Rc<
     session.clear_selection();
     *session.connect_from.borrow_mut() = None;
     *session.port_drag.borrow_mut() = None;
+    *session.resize_drag.borrow_mut() = None;
     *session.focus_node_id.borrow_mut() = None;
     let page = ui.clone_component();
     page.set_show_canvas_folder_list(false);
@@ -1151,6 +1263,7 @@ pub(crate) fn cancel_board_pointer_gesture(session: &CanvasSession) {
     session.long_press_consumed.set(false);
     *session.press_start.borrow_mut() = None;
     *session.port_drag.borrow_mut() = None;
+    *session.resize_drag.borrow_mut() = None;
 }
 
 /// Continuous zoom around a screen point (pinch / trackpad). Refreshes the board
@@ -1204,9 +1317,9 @@ fn ensure_ink_previews(session: &CanvasSession) {
     for n in &doc.nodes {
         if let CanvasNode::Text(t) = n {
             if let Some((w, h, px)) = load_card_page_pixels(&session.data_dir, canvas_id, &t.id) {
-                // Skip blank pages (all near-white).
-                if px.iter().any(|&p| p < 220) {
-                    previews.insert(t.id.clone(), (w, h, px));
+                // Cropped to the ink so it scales up to fill the card; None = blank page.
+                if let Some(preview) = crop_ink_preview(w, h, &px) {
+                    previews.insert(t.id.clone(), preview);
                 }
             }
         }
@@ -1467,8 +1580,9 @@ fn handle_board_tap(
             };
             let side = hit_side(&session.doc.borrow(), &id, bx, by, CONNECT_MARGIN)
                 .unwrap_or(NodeSide::Right);
-            let mut from = session.connect_from.borrow_mut();
-            if let Some((from_id, from_side)) = from.take() {
+            // Release connect_from before refresh(): the board render reads it.
+            let pending = session.connect_from.borrow_mut().take();
+            if let Some((from_id, from_side)) = pending {
                 if from_id != id {
                     let edge = CanvasEdge {
                         id: new_canvas_id(),
@@ -1485,7 +1599,7 @@ fn handle_board_tap(
                     session.save_doc();
                 }
             } else {
-                *from = Some((id, side));
+                *session.connect_from.borrow_mut() = Some((id, side));
             }
             refresh();
         }
@@ -1526,10 +1640,17 @@ fn handle_board_tap(
         session.sync_selection_ui(ui);
         *session.last_tap.borrow_mut() = Some((now, x, y, id.clone()));
         if is_dbl {
-            let is_text = matches!(
-                session.doc.borrow().find_node(&id),
-                Some(CanvasNode::Text(_))
-            );
+            let (is_text, is_group) = match session.doc.borrow().find_node(&id) {
+                Some(CanvasNode::Text(_)) => (true, false),
+                Some(CanvasNode::Group(_)) => (false, true),
+                _ => (false, false),
+            };
+            if is_group {
+                refresh();
+                ui.clone_component()
+                    .invoke_canvas_rename_request("group".into(), id.as_str().into());
+                return;
+            }
             if is_text {
                 enter_focus(ui, session, config, &id);
                 return;

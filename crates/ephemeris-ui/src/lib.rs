@@ -2102,6 +2102,10 @@ impl EphemerisUi {
         self.component.on_canvas_clear_selection(handler);
     }
 
+    pub fn on_canvas_group_selected<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_canvas_group_selected(handler);
+    }
+
     pub fn on_canvas_leave_board<F: FnMut() + 'static>(&self, handler: F) {
         self.component.on_canvas_leave_board(handler);
     }

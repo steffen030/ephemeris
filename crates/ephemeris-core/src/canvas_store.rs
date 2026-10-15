@@ -198,6 +198,55 @@ impl CanvasDoc {
         }));
         id
     }
+
+    /// Nodes fully inside group `group_id` (Obsidian moves these with the group).
+    pub fn group_members(&self, group_id: &str) -> Vec<String> {
+        let Some(g) = self.find_node(group_id) else {
+            return Vec::new();
+        };
+        if !matches!(g, CanvasNode::Group(_)) {
+            return Vec::new();
+        }
+        self.nodes
+            .iter()
+            .filter(|n| n.id() != group_id && g.contains(n))
+            .map(|n| n.id().to_string())
+            .collect()
+    }
+
+    /// New group framing `ids` with `pad` board px of margin. Inserted at the
+    /// bottom of the z-order so it stays behind its members.
+    pub fn add_group_around(&mut self, ids: &[String], pad: i32, label: &str) -> Option<String> {
+        let mut bounds: Option<(i32, i32, i32, i32)> = None;
+        for n in self
+            .nodes
+            .iter()
+            .filter(|n| ids.iter().any(|id| id == n.id()))
+        {
+            let (x1, y1) = (n.x() + n.width(), n.y() + n.height());
+            bounds = Some(match bounds {
+                None => (n.x(), n.y(), x1, y1),
+                Some((a, b, c, d)) => (a.min(n.x()), b.min(n.y()), c.max(x1), d.max(y1)),
+            });
+        }
+        let (x0, y0, x1, y1) = bounds?;
+        let id = new_canvas_id();
+        self.nodes.insert(
+            0,
+            CanvasNode::Group(GroupNode {
+                id: id.clone(),
+                x: x0 - pad,
+                y: y0 - pad,
+                width: x1 - x0 + 2 * pad,
+                height: y1 - y0 + 2 * pad,
+                label: Some(label.to_string()),
+                background: None,
+                background_style: None,
+                color: None,
+            }),
+        );
+        Some(id)
+    }
 }
 
 /// `~/.local/share/ephemeris/canvas/` (respects `XDG_DATA_HOME`).
@@ -372,6 +421,28 @@ fn atomic_write_bytes(path: &Path, content: &[u8]) -> crate::Result<()> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn group_around_frames_members_and_moves_with_them() {
+        let mut doc = CanvasDoc::default();
+        let a = doc.add_text_card(100, 100);
+        let b = doc.add_text_card(500, 300);
+        let outside = doc.add_text_card(2000, 2000);
+        let g = doc
+            .add_group_around(&[a.clone(), b.clone()], 40, "Ideas")
+            .unwrap();
+        let n = doc.find_node(&g).unwrap();
+        assert_eq!((n.x(), n.y()), (60, 60));
+        assert_eq!((n.width(), n.height()), (280 + 400 + 80, 160 + 200 + 80));
+        assert!(matches!(doc.nodes[0], CanvasNode::Group(_)));
+        let mut members = doc.group_members(&g);
+        members.sort();
+        let mut want = vec![a, b];
+        want.sort();
+        assert_eq!(members, want);
+        assert!(!doc.group_members(&g).contains(&outside));
+        assert!(doc.add_group_around(&[], 40, "x").is_none());
+    }
 
     #[test]
     fn index_and_doc_round_trip() {

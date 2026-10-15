@@ -261,6 +261,22 @@ pub fn hit_port(
     best.map(|(s, _)| s)
 }
 
+/// Hit-test the bottom-right resize handle of `node_id` (screen px radius).
+pub fn hit_resize_handle(
+    doc: &CanvasDoc,
+    vp: &Viewport,
+    sx: f32,
+    sy: f32,
+    node_id: &str,
+    radius_screen: f32,
+) -> bool {
+    let Some(n) = doc.find_node(node_id) else {
+        return false;
+    };
+    let (hx, hy) = vp.board_to_screen((n.x() + n.width()) as f32, (n.y() + n.height()) as f32);
+    (sx - hx).abs() <= radius_screen && (sy - hy).abs() <= radius_screen
+}
+
 /// Render the board into a gray8 buffer (`width * height` bytes).
 pub fn render_board(
     doc: &CanvasDoc,
@@ -324,6 +340,30 @@ fn draw_ports(buf: &mut [u8], width: u32, height: u32, vp: &Viewport, n: &Canvas
         fill_circle(buf, width, height, sx as i32, sy as i32, r, BLACK);
         fill_circle(buf, width, height, sx as i32, sy as i32, r - 2, WHITE);
     }
+    // Bottom-right resize handle: solid square so it reads apart from ports.
+    let (cx, cy) = vp.board_to_screen((n.x() + n.width()) as f32, (n.y() + n.height()) as f32);
+    let (cx, cy) = (cx as i32, cy as i32);
+    fill_rect(buf, width, height, cx - r, cy - r, 2 * r, 2 * r, BLACK);
+    fill_rect(
+        buf,
+        width,
+        height,
+        cx - r + 2,
+        cy - r + 2,
+        2 * r - 4,
+        2 * r - 4,
+        WHITE,
+    );
+    fill_rect(
+        buf,
+        width,
+        height,
+        cx - r + 5,
+        cy - r + 5,
+        2 * r - 10,
+        2 * r - 10,
+        BLACK,
+    );
 }
 
 fn fill_circle(buf: &mut [u8], w: u32, h: u32, cx: i32, cy: i32, r: i32, color: u8) {
@@ -367,7 +407,11 @@ fn draw_node(
         CanvasNode::Group(g) => {
             draw_rect_outline(buf, width, height, x0, y0, sw, sh, border, border_w, true);
             if let Some(label) = &g.label {
-                blit_label(buf, width, height, x0 + 8, y0 + 8, label);
+                // 2× glyphs so the group name stays legible on e-ink.
+                let max = ((sw - 16) / 12).max(0) as usize;
+                for (i, c) in label.chars().take(max).enumerate() {
+                    blit_glyph_scaled(buf, width, height, x0 + 8 + i as i32 * 12, y0 + 8, c, 2);
+                }
             }
         }
         CanvasNode::Text(t) => {
@@ -388,8 +432,16 @@ fn draw_node(
             } else if t.text.trim().is_empty() {
                 blit_label(buf, width, height, x0 + 8, y0 + 8, "Empty");
             } else {
-                let preview = t.text.lines().next().unwrap_or("");
-                blit_label(buf, width, height, x0 + 8, y0 + 8, preview);
+                blit_text_fit(
+                    buf,
+                    width,
+                    height,
+                    x0 + 8,
+                    y0 + 8,
+                    sw - 16,
+                    sh - 16,
+                    &t.text,
+                );
             }
             draw_rect_outline(buf, width, height, x0, y0, sw, sh, border, border_w, false);
         }
@@ -408,7 +460,59 @@ fn draw_node(
     }
 }
 
-/// Nearest-neighbour downsample of gray8 ink into a card rect.
+/// Ink darker than this counts as a stroke; lighter is page background.
+const INK_THRESHOLD: u8 = 220;
+/// Longest side kept for a cached ink preview (min-pooled down to this).
+const INK_PREVIEW_MAX: u32 = 640;
+
+/// Crop gray8 page pixels to the ink bounding box (plus a small margin) and
+/// min-pool down so the longest side is at most `INK_PREVIEW_MAX`. Returns
+/// `None` for a blank page. Run once on load, not per frame.
+pub fn crop_ink_preview(w: u32, h: u32, px: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    if w == 0 || h == 0 || px.len() < (w as usize) * (h as usize) {
+        return None;
+    }
+    let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0u32, 0u32);
+    for y in 0..h {
+        let row = &px[(y * w) as usize..((y + 1) * w) as usize];
+        for (x, &p) in row.iter().enumerate() {
+            if p < INK_THRESHOLD {
+                let x = x as u32;
+                x0 = x0.min(x);
+                x1 = x1.max(x);
+                y0 = y0.min(y);
+                y1 = y1.max(y);
+            }
+        }
+    }
+    if x1 < x0 {
+        return None;
+    }
+    let margin = 8;
+    let x0 = x0.saturating_sub(margin);
+    let y0 = y0.saturating_sub(margin);
+    let x1 = (x1 + margin).min(w - 1);
+    let y1 = (y1 + margin).min(h - 1);
+    let (cw, ch) = (x1 - x0 + 1, y1 - y0 + 1);
+    let f = cw.max(ch).div_ceil(INK_PREVIEW_MAX).max(1);
+    let (ow, oh) = (cw.div_ceil(f), ch.div_ceil(f));
+    let mut out = vec![WHITE; (ow * oh) as usize];
+    for oy in 0..oh {
+        for ox in 0..ow {
+            let mut v = WHITE;
+            for sy in (y0 + oy * f)..(y0 + (oy + 1) * f).min(y1 + 1) {
+                for sx in (x0 + ox * f)..(x0 + (ox + 1) * f).min(x1 + 1) {
+                    v = v.min(px[(sy * w + sx) as usize]);
+                }
+            }
+            out[(oy * ow + ox) as usize] = v;
+        }
+    }
+    Some((ow, oh, out))
+}
+
+/// Fit gray8 ink into a card rect with a uniform scale (aspect kept, centred).
+/// Downscaling min-pools so thin strokes survive.
 #[allow(clippy::too_many_arguments)]
 fn blit_ink_preview(
     buf: &mut [u8],
@@ -429,22 +533,93 @@ fn blit_ink_preview(
     if pixels.len() < expect {
         return;
     }
-    for dy in 0..dh {
-        let sy = (dy as u32 * ih) / dh as u32;
-        for dx in 0..dw {
-            let sx = (dx as u32 * iw) / dw as u32;
-            let src = pixels[(sy * iw + sx) as usize];
-            // Only stamp dark ink so white page doesn't fight the card fill.
-            if src > 220 {
+    let scale = (dw as f32 / iw as f32).min(dh as f32 / ih as f32);
+    let fw = ((iw as f32 * scale) as i32).max(1);
+    let fh = ((ih as f32 * scale) as i32).max(1);
+    let ox = x0 + (dw - fw) / 2;
+    let oy = y0 + (dh - fh) / 2;
+    for dy in 0..fh {
+        let y = oy + dy;
+        if y < 0 || y >= bh as i32 {
+            continue;
+        }
+        let sy0 = (dy as u32 * ih) / fh as u32;
+        let sy1 = (((dy + 1) as u32 * ih) / fh as u32).clamp(sy0 + 1, ih);
+        for dx in 0..fw {
+            let x = ox + dx;
+            if x < 0 || x >= bw as i32 {
                 continue;
             }
-            let x = x0 + dx;
-            let y = y0 + dy;
-            if x >= 0 && y >= 0 && x < bw as i32 && y < bh as i32 {
-                buf[(y as u32 * bw + x as u32) as usize] = src;
+            let sx0 = (dx as u32 * iw) / fw as u32;
+            let sx1 = (((dx + 1) as u32 * iw) / fw as u32).clamp(sx0 + 1, iw);
+            let mut src = WHITE;
+            for sy in sy0..sy1 {
+                let row = (sy * iw) as usize;
+                for sx in sx0..sx1 {
+                    src = src.min(pixels[row + sx as usize]);
+                }
             }
+            // Only stamp dark ink so white page doesn't fight the card fill.
+            if src >= INK_THRESHOLD {
+                continue;
+            }
+            buf[(y as u32 * bw + x as u32) as usize] = src;
         }
     }
+}
+
+/// Word-wrap `text` into a `cw`×`ch` box at the largest integer glyph scale
+/// (1–4×) that fits; at 1× overflowing lines are dropped.
+#[allow(clippy::too_many_arguments)]
+fn blit_text_fit(buf: &mut [u8], w: u32, h: u32, x0: i32, y0: i32, cw: i32, ch: i32, text: &str) {
+    if cw <= 0 || ch <= 0 {
+        return;
+    }
+    for s in (1..=4).rev() {
+        let cols = (cw / (6 * s)).max(1) as usize;
+        let rows = (ch / (9 * s)).max(0) as usize;
+        let lines = wrap_text(text, cols);
+        if lines.len() <= rows || s == 1 {
+            for (i, line) in lines.iter().take(rows).enumerate() {
+                let ly = y0 + i as i32 * 9 * s;
+                for (j, c) in line.chars().enumerate() {
+                    blit_glyph_scaled(buf, w, h, x0 + j as i32 * 6 * s, ly, c, s);
+                }
+            }
+            return;
+        }
+    }
+}
+
+fn wrap_text(text: &str, cols: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for para in text.lines() {
+        let mut line = String::new();
+        for word in para.split_whitespace() {
+            let mut word: Vec<char> = word.chars().collect();
+            // Hard-break words longer than a line.
+            while word.len() > cols {
+                if !line.is_empty() {
+                    out.push(std::mem::take(&mut line));
+                }
+                out.push(word.drain(..cols).collect());
+            }
+            let word: String = word.into_iter().collect();
+            let len = line.chars().count();
+            if len > 0 && len + 1 + word.chars().count() > cols {
+                out.push(std::mem::take(&mut line));
+            }
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(&word);
+        }
+        out.push(line);
+    }
+    while out.last().is_some_and(|l| l.is_empty()) {
+        out.pop();
+    }
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -592,6 +767,21 @@ fn blit_glyph(buf: &mut [u8], w: u32, h: u32, x0: i32, y0: i32, ch: char) {
     }
 }
 
+fn blit_glyph_scaled(buf: &mut [u8], w: u32, h: u32, x0: i32, y0: i32, ch: char, s: i32) {
+    if s <= 1 {
+        blit_glyph(buf, w, h, x0, y0, ch);
+        return;
+    }
+    let bits = glyph5x7(ch);
+    for (row, &row_bits) in bits.iter().enumerate() {
+        for col in 0..5 {
+            if row_bits & (1 << (4 - col)) != 0 {
+                fill_rect(buf, w, h, x0 + col * s, y0 + row as i32 * s, s, s, BLACK);
+            }
+        }
+    }
+}
+
 fn glyph5x7(ch: char) -> [u8; 7] {
     // Very small set; unknown → block.
     match ch.to_ascii_uppercase() {
@@ -695,6 +885,73 @@ mod tests {
         let buf = render_board(&doc, &vp, 800, 600, &opts);
         assert_eq!(buf.len(), 800 * 600);
         assert!(buf.iter().any(|&p| p < 255));
+    }
+
+    #[test]
+    fn crop_ink_preview_trims_blank_page() {
+        let (w, h) = (200u32, 100u32);
+        let mut px = vec![WHITE; (w * h) as usize];
+        for x in 50..60 {
+            px[(40 * w + x) as usize] = BLACK;
+        }
+        let (cw, ch, out) = crop_ink_preview(w, h, &px).unwrap();
+        assert_eq!((cw, ch), (10 + 16, 1 + 16));
+        assert!(out.contains(&BLACK));
+        assert!(crop_ink_preview(w, h, &vec![WHITE; (w * h) as usize]).is_none());
+    }
+
+    #[test]
+    fn crop_ink_preview_minpools_large_pages() {
+        let (w, h) = (2000u32, 1000u32);
+        let mut px = vec![WHITE; (w * h) as usize];
+        px[0] = BLACK;
+        px[(h * w - 1) as usize] = BLACK;
+        // Thin 1px stroke must survive the downsample.
+        px[(500 * w + 1001) as usize] = BLACK;
+        let (cw, ch, out) = crop_ink_preview(w, h, &px).unwrap();
+        assert!(cw <= INK_PREVIEW_MAX && ch <= INK_PREVIEW_MAX);
+        assert_eq!(out.iter().filter(|&&p| p == BLACK).count(), 3);
+    }
+
+    #[test]
+    fn ink_preview_keeps_aspect_ratio() {
+        // 10×10 solid ink into a 100×50 rect → 50×50 centred square.
+        let ink = vec![BLACK; 100];
+        let (bw, bh) = (100u32, 50u32);
+        let mut buf = vec![WHITE; (bw * bh) as usize];
+        blit_ink_preview(&mut buf, bw, bh, 0, 0, 100, 50, 10, 10, &ink);
+        let dark: Vec<u32> = (0..bw)
+            .filter(|&x| buf[(25 * bw + x) as usize] == BLACK)
+            .collect();
+        assert_eq!((dark[0], *dark.last().unwrap()), (25, 74));
+    }
+
+    #[test]
+    fn text_fit_wraps_and_scales() {
+        assert_eq!(wrap_text("hello big world", 9), vec!["hello big", "world"]);
+        assert_eq!(wrap_text("abcdefghij", 4), vec!["abcd", "efgh", "ij"]);
+        // Short text in a roomy card renders at > 1× (glyph rows taller than 7px).
+        let (bw, bh) = (300u32, 200u32);
+        let mut buf = vec![WHITE; (bw * bh) as usize];
+        blit_text_fit(&mut buf, bw, bh, 0, 0, 300, 200, "HI");
+        let rows = (0..bh)
+            .filter(|&y| (0..bw).any(|x| buf[(y * bw + x) as usize] == BLACK))
+            .count();
+        assert_eq!(rows, 7 * 4);
+    }
+
+    #[test]
+    fn resize_handle_hits_bottom_right_corner_only() {
+        let mut doc = CanvasDoc::default();
+        let id = doc.add_text_card(100, 100); // 280×160
+        let vp = Viewport {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            scale: 0.5,
+        };
+        assert!(hit_resize_handle(&doc, &vp, 190.0, 130.0, &id, 22.0));
+        assert!(!hit_resize_handle(&doc, &vp, 50.0, 50.0, &id, 22.0));
+        assert!(!hit_resize_handle(&doc, &vp, 190.0, 130.0, "nope", 22.0));
     }
 
     #[test]

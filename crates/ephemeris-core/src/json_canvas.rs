@@ -82,6 +82,25 @@ impl CanvasNode {
         }
     }
 
+    pub fn set_size(&mut self, width: i32, height: i32) {
+        let (w, h) = match self {
+            Self::Text(n) => (&mut n.width, &mut n.height),
+            Self::File(n) => (&mut n.width, &mut n.height),
+            Self::Link(n) => (&mut n.width, &mut n.height),
+            Self::Group(n) => (&mut n.width, &mut n.height),
+        };
+        *w = width;
+        *h = height;
+    }
+
+    /// True when `other` lies entirely inside this node's bounds.
+    pub fn contains(&self, other: &CanvasNode) -> bool {
+        other.x() >= self.x()
+            && other.y() >= self.y()
+            && other.x() + other.width() <= self.x() + self.width()
+            && other.y() + other.height() <= self.y() + self.height()
+    }
+
     pub fn set_pos(&mut self, x: i32, y: i32) {
         match self {
             Self::Text(n) => {

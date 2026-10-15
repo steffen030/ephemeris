@@ -45,6 +45,9 @@ use ephemeris_ui::EphemerisUi;
 const CHROME_SWIPE_EDGE_Y: f32 = 36.0;
 /// Minimum downward travel (UI logical px) to count as a chrome reveal swipe.
 const CHROME_SWIPE_MIN_DY: f32 = 20.0;
+/// After window creation, un-fullscreen geometry is compositor settling, not
+/// a shell-driven reveal.
+const KIOSK_SETTLE: Duration = Duration::from_secs(3);
 
 /// Debounce flag for background vault git commit/push.
 static VAULT_GIT_PUSH_PENDING: AtomicBool = AtomicBool::new(false);
@@ -5780,6 +5783,7 @@ impl App {
             chrome_pointer_held: false,
             chrome_swallow: false,
             chrome_was_covering: false,
+            kiosk_settle_until: None,
             chrome_swipe_start: None,
             last_kiosk_check: Instant::now(),
             canvas_session: canvas_session.clone(),
@@ -5950,6 +5954,9 @@ struct WinitHandler {
     chrome_swallow: bool,
     /// Was covering output last check (detect shell-driven un-fullscreen).
     chrome_was_covering: bool,
+    /// Startup grace: geometry churn while the compositor settles fullscreen
+    /// re-applies kiosk instead of entering peek (peek swallows the next tap).
+    kiosk_settle_until: Option<Instant>,
     /// Top-edge swipe tracking: start Y in UI logical px.
     chrome_swipe_start: Option<f32>,
     /// Throttle for the kiosk geometry watchdog.
@@ -6120,7 +6127,10 @@ impl WinitHandler {
             self.sync_pen_geometry();
             return;
         }
-        if self.chrome_was_covering {
+        let settling = self.kiosk_settle_until.is_some_and(|t| Instant::now() < t);
+        if self.chrome_was_covering && settling {
+            tracing::info!("kiosk: transient un-fullscreen during startup, re-entering");
+        } else if self.chrome_was_covering {
             // Shell (or compositor) shrunk us off exclusive fullscreen — enter peek.
             self.begin_chrome_peek();
             return;
@@ -6843,6 +6853,7 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
                 d.request_redraw();
                 self.display = Some(d);
                 self.chrome_was_covering = false;
+                self.kiosk_settle_until = Some(Instant::now() + KIOSK_SETTLE);
                 self.on_kiosk_geometry();
             }
             Err(e) => {

@@ -95,8 +95,9 @@ pub use aggregation::AggregationService;
 pub use caldav::{default_sync_window, CalDavCalendar, CalDavClient, CalDavConfig};
 pub use calendar_cache::CalendarCache;
 pub use canvas_render::{
-    hit_port, hit_side, hit_test, render_board, snap_grid, view_for_fit, view_for_focus,
-    zoom_view_at, BoardDrawOpts, Viewport, MAX_BOARD_SCALE, MIN_BOARD_SCALE, PORT_HIT_RADIUS,
+    crop_ink_preview, hit_port, hit_resize_handle, hit_side, hit_test, render_board, snap_grid,
+    view_for_fit, view_for_focus, zoom_view_at, BoardDrawOpts, Viewport, MAX_BOARD_SCALE,
+    MIN_BOARD_SCALE, PORT_HIT_RADIUS,
 };
 pub use canvas_store::{
     canvas_data_dir, card_page_path, card_strokes_path, card_text_path, delete_canvas_files,
