@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.22](https://github.com/steffen030/ephemeris/compare/v0.1.21...v0.1.22) (2026-10-15)
+
+
+### Bug Fixes
+
+* **canvas:** RefCell double-borrow panic when dragging a card ([5dbceed](https://github.com/steffen030/ephemeris/commit/5dbceed2f45ada15a496fd47be7b028670d3e45c))
+
 ## [0.1.21](https://github.com/steffen030/ephemeris/compare/v0.1.20...v0.1.21) (2026-10-15)
 
 
