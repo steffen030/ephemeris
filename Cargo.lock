@@ -1363,7 +1363,7 @@ dependencies = [
 
 [[package]]
 name = "ephemeris-app"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "chrono",
  "cpal",
@@ -1387,7 +1387,7 @@ dependencies = [
 
 [[package]]
 name = "ephemeris-core"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "bytes",
  "chrono",
@@ -1414,7 +1414,7 @@ dependencies = [
 
 [[package]]
 name = "ephemeris-pal"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "crossbeam-channel",
  "evdev",
@@ -1429,7 +1429,7 @@ dependencies = [
 
 [[package]]
 name = "ephemeris-ui"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "ephemeris-core",
  "ephemeris-pal",

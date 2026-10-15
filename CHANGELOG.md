@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.21](https://github.com/steffen030/ephemeris/compare/v0.1.20...v0.1.21) (2026-10-15)
+
+
+### Bug Fixes
+
+* **canvas:** PineNote drag/pinch freeze, focus modal, Notes-parity browser ([#54](https://github.com/steffen030/ephemeris/issues/54)) ([7e7a7c0](https://github.com/steffen030/ephemeris/commit/7e7a7c00fdfa9c4d71e6b19081a1fac81420d8d1))
+
 ## [0.1.20](https://github.com/steffen030/ephemeris/compare/v0.1.19...v0.1.20) (2026-10-15)
 
 
