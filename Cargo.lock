@@ -849,9 +849,9 @@ checksum = "3d7b894f5411737b7867f4827955924d7c254fc9f4d91a6aad6b097804b1018b"
 
 [[package]]
 name = "combine"
-version = "4.6.8"
+version = "4.6.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cfc320937d09e6de266b31b9afb480f197d7a861be86be7cb2ea7e5d1bfffc5e"
+checksum = "4356eba6976435498d05a311ee9fc486da3bc81c200d3f0d7dd9703b41913f92"
 dependencies = [
  "bytes",
  "memchr",
@@ -1363,7 +1363,7 @@ dependencies = [
 
 [[package]]
 name = "ephemeris-app"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "chrono",
  "cpal",
@@ -1387,7 +1387,7 @@ dependencies = [
 
 [[package]]
 name = "ephemeris-core"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "bytes",
  "chrono",
@@ -1414,7 +1414,7 @@ dependencies = [
 
 [[package]]
 name = "ephemeris-pal"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "crossbeam-channel",
  "evdev",
@@ -1429,7 +1429,7 @@ dependencies = [
 
 [[package]]
 name = "ephemeris-ui"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "ephemeris-core",
  "ephemeris-pal",
@@ -1590,9 +1590,9 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "font-types"
-version = "0.12.6"
+version = "0.12.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c92d9081c7ab3bd83ef1eecdfad090f3d966e3ce74106779664114cfe1a6274"
+checksum = "835ae9d781464a79026cde387f9cbc650c9a4909d7cf7e658b127e3c35d2f35d"
 dependencies = [
  "bytemuck",
 ]
