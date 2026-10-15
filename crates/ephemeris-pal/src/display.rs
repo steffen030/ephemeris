@@ -171,6 +171,18 @@ pub fn kiosk_enabled() -> bool {
     std::env::var_os("EPHEMERIS_WINDOWED").is_none()
 }
 
+/// Whether to hide the OS mouse / pointer cursor.
+///
+/// PineNote and other e-ink Linux targets stay pen-first (cursor hidden).
+/// macOS desktop builds keep a visible pointer for testing. Set
+/// `EPHEMERIS_SHOW_CURSOR=1` to force a visible cursor on any platform.
+fn hide_os_cursor() -> bool {
+    if std::env::var_os("EPHEMERIS_SHOW_CURSOR").is_some() {
+        return false;
+    }
+    !cfg!(target_os = "macos")
+}
+
 /// Live desktop window backed by winit + softbuffer.
 ///
 /// Created inside an `ApplicationHandler::resumed` callback; presents an
@@ -239,12 +251,16 @@ impl DesktopWindow {
 
         // Transparent cursor + visibility hide — Wayland often ignores
         // set_cursor_visible alone when the digitiser is also a pointer.
+        // macOS desktop builds keep a normal pointer for testing; override
+        // with EPHEMERIS_SHOW_CURSOR=1 on Linux if needed.
         let blank_cursor = event_loop.create_custom_cursor(
             winit::window::CustomCursor::from_rgba(vec![0, 0, 0, 0], 1, 1, 0, 0)
                 .map_err(|e| DisplayError::init(e.to_string()))?,
         );
-        window.set_cursor(blank_cursor.clone());
-        window.set_cursor_visible(false);
+        if hide_os_cursor() {
+            window.set_cursor(blank_cursor.clone());
+            window.set_cursor_visible(false);
+        }
 
         let tablet_cursor = match crate::input::TabletCursorHider::new(window.as_ref()) {
             Ok(h) => {
@@ -382,9 +398,14 @@ impl DesktopWindow {
 
     /// Hide the OS pointer (pen-first note canvas). Safe to call repeatedly.
     ///
-    /// Affects the `wl_pointer` / mouse cursor only. On PineNote the stylus
-    /// cursor is cleared by [`Self::poll_tablet_cursor`] via tablet_v2.
+    /// No-op on macOS (and when `EPHEMERIS_SHOW_CURSOR` is set) so desktop
+    /// testing keeps a visible mouse. Affects the `wl_pointer` / mouse cursor
+    /// only; on PineNote the stylus cursor is cleared by
+    /// [`Self::poll_tablet_cursor`] via tablet_v2.
     pub fn hide_cursor(&self) {
+        if !hide_os_cursor() {
+            return;
+        }
         self.window.set_cursor(self.blank_cursor.clone());
         self.window.set_cursor_visible(false);
     }

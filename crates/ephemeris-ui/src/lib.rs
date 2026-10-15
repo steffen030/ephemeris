@@ -280,6 +280,15 @@ pub struct FolderListItem {
     pub custom_profile_icon: slint::Image,
 }
 
+/// Profile badge fields shared by Notes / Canvas / Recordings list rows.
+#[derive(Clone, Default)]
+pub struct ProfileBadgeFields {
+    pub show_profile: bool,
+    pub profile_icon_char: String,
+    pub has_custom_profile_icon: bool,
+    pub custom_profile_icon: slint::Image,
+}
+
 /// One folder row for the Canvas browser.
 #[derive(Clone)]
 pub struct CanvasFolderListItem {
@@ -287,6 +296,10 @@ pub struct CanvasFolderListItem {
     pub title: String,
     pub canvas_count: i32,
     pub folder_count: i32,
+    pub show_profile: bool,
+    pub profile_icon_char: String,
+    pub has_custom_profile_icon: bool,
+    pub custom_profile_icon: slint::Image,
 }
 
 /// One canvas document row for the Canvas browser.
@@ -295,6 +308,10 @@ pub struct CanvasListItem {
     pub id: String,
     pub title: String,
     pub date_label: String,
+    pub show_profile: bool,
+    pub profile_icon_char: String,
+    pub has_custom_profile_icon: bool,
+    pub custom_profile_icon: slint::Image,
 }
 
 fn folder_list_item_to_entry(e: &FolderListItem) -> NotebookEntry {
@@ -856,6 +873,10 @@ impl EphemerisUi {
     /// this still counts as the note page — see [`Self::is_canvas_active`]).
     pub fn is_note_canvas_page(&self) -> bool {
         let c = &self.component;
+        // Canvas text-card focus keeps the board visible under a modal veil.
+        if c.get_canvas_focus_active() {
+            return true;
+        }
         !c.get_show_start_page()
             && !c.get_show_task_view()
             && !c.get_show_settings()
@@ -1951,6 +1972,10 @@ impl EphemerisUi {
                 title: slint::SharedString::from(e.title.as_str()),
                 canvas_count: e.canvas_count,
                 folder_count: e.folder_count,
+                show_profile: e.show_profile,
+                profile_icon_char: slint::SharedString::from(e.profile_icon_char.as_str()),
+                has_custom_profile_icon: e.has_custom_profile_icon,
+                custom_profile_icon: e.custom_profile_icon.clone(),
             })
             .collect();
         self.component
@@ -1964,6 +1989,10 @@ impl EphemerisUi {
                 id: slint::SharedString::from(e.id.as_str()),
                 title: slint::SharedString::from(e.title.as_str()),
                 date_label: slint::SharedString::from(e.date_label.as_str()),
+                show_profile: e.show_profile,
+                profile_icon_char: slint::SharedString::from(e.profile_icon_char.as_str()),
+                has_custom_profile_icon: e.has_custom_profile_icon,
+                custom_profile_icon: e.custom_profile_icon.clone(),
             })
             .collect();
         self.component
@@ -1997,10 +2026,6 @@ impl EphemerisUi {
 
     pub fn on_nav_canvas_tapped<F: FnMut() + 'static>(&self, handler: F) {
         self.component.on_nav_canvas_tapped(handler);
-    }
-
-    pub fn on_start_page_canvas_tapped<F: FnMut() + 'static>(&self, handler: F) {
-        self.component.on_start_page_canvas_tapped(handler);
     }
 
     pub fn on_canvas_folder_tapped<F: FnMut(String) + 'static>(&self, mut handler: F) {
@@ -2061,8 +2086,39 @@ impl EphemerisUi {
         self.component.on_canvas_delete_selected(handler);
     }
 
+    pub fn on_canvas_clear_selection<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_canvas_clear_selection(handler);
+    }
+
     pub fn on_canvas_leave_board<F: FnMut() + 'static>(&self, handler: F) {
         self.component.on_canvas_leave_board(handler);
+    }
+
+    pub fn on_canvas_sort_toggled<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_canvas_sort_toggled(handler);
+    }
+
+    pub fn on_canvas_view_mode_toggled<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_canvas_view_mode_toggled(handler);
+    }
+
+    pub fn on_canvas_rename_request<F: FnMut(String, String) + 'static>(&self, mut handler: F) {
+        self.component
+            .on_canvas_rename_request(move |kind, id| handler(kind.to_string(), id.to_string()));
+    }
+
+    pub fn on_canvas_rename_confirm<F: FnMut(String, String, String) + 'static>(
+        &self,
+        mut handler: F,
+    ) {
+        self.component
+            .on_canvas_rename_confirm(move |kind, id, title| {
+                handler(kind.to_string(), id.to_string(), title.to_string())
+            });
+    }
+
+    pub fn on_canvas_rename_cancel<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_canvas_rename_cancel(handler);
     }
 
     /// Register a closure called when the user confirms a note rename.
