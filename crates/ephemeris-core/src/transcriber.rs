@@ -5,11 +5,12 @@
 //! models only when the primary score is weak, and Tesseract as an opt-in last resort.
 
 use crate::config::{HandwritingLanguage, ResolvedHandwritingLanguage};
+use crate::ink_layout::{split_page_ink, MarkStroke, PageInk};
+#[cfg(feature = "htr")]
 #[cfg(feature = "htr")]
 use crate::line_htr::{decode_line_alphabet, line_logits_confidence, DE_HTR_V2_ALPHABET};
 use crate::line_htr::{prepare_line_htr_input, split_ink_line_bands};
-use crate::model::{Point, Stroke, Tool};
-#[cfg(feature = "htr")]
+use crate::model::{Point, Stroke};
 use crate::stroke_htr::{
     armrest::{self, featurize_line_armrest_pieces},
     ctc_decode_with_lm, ctc_softmax_confidence, decode_charset_with_blank,
@@ -17,7 +18,8 @@ use crate::stroke_htr::{
 };
 use crate::stroke_htr::{
     bundled_htr_lexicon_text, default_line_gap, featurize_line_pieces,
-    group_strokes_into_lines_with_ruling, HtrLexicon, StrokeLine, MAX_STROKE_HTR_TIMESTEPS,
+    group_strokes_into_lines_with_ruling, is_text_ink, HtrLexicon, StrokeLine,
+    MAX_STROKE_HTR_TIMESTEPS,
 };
 use crate::stroke_render::{prepare_line_htr_from_strokes, render_stroke_line, StrokeRenderParams};
 #[cfg(feature = "ocr")]
@@ -420,18 +422,35 @@ impl CascadingTranscriber {
         height: u32,
         gray8: &[u8],
     ) -> crate::Result<Vec<TextSpan>> {
+        self.transcribe_page_with_marks(strokes, width, height, gray8)
+            .map(|(spans, _)| spans)
+    }
+
+    /// Like [`Self::transcribe_page`], also returning the classified mark
+    /// strokes (underlines, bullets, checkboxes) that were kept out of HTR.
+    ///
+    /// Marks are empty for raster-only pages. See [`crate::ink_layout`].
+    pub fn transcribe_page_with_marks(
+        &self,
+        strokes: &[Stroke],
+        width: u32,
+        height: u32,
+        gray8: &[u8],
+    ) -> crate::Result<(Vec<TextSpan>, Vec<MarkStroke>)> {
         if strokes.is_empty() {
-            return self.transcribe_raster_cascade(width, height, gray8);
+            return Ok((
+                self.transcribe_raster_cascade(width, height, gray8)?,
+                Vec::new(),
+            ));
         }
-        let gap = default_line_gap(strokes);
-        let lines = group_strokes_into_lines_with_ruling(strokes, gap, self.ruling_pitch());
+        let PageInk { lines, marks, .. } = split_page_ink(strokes, self.ruling_pitch());
         let mut out = Vec::with_capacity(lines.len());
         for (i, line) in lines.iter().enumerate() {
             if let Some(span) = self.transcribe_line(line, i as i32)? {
                 out.push(span);
             }
         }
-        Ok(out)
+        Ok((out, marks))
     }
 
     fn transcribe_raster_cascade(
@@ -2009,7 +2028,7 @@ pub fn rasterize_strokes(strokes: &[Stroke]) -> (u32, u32, Vec<u8>) {
     let mut max_y = f32::MIN;
     let mut any = false;
     for s in strokes {
-        if s.tool == Tool::Eraser {
+        if !is_text_ink(s) {
             continue;
         }
         for p in &s.points {
@@ -2033,7 +2052,7 @@ pub fn rasterize_strokes(strokes: &[Stroke]) -> (u32, u32, Vec<u8>) {
     let oy = if any { min_y - 24.0 } else { 0.0 };
 
     for s in strokes {
-        if s.tool == Tool::Eraser || s.points.len() < 2 {
+        if !is_text_ink(s) || s.points.len() < 2 {
             continue;
         }
         let thickness = s.base_width.max(1.5).ceil() as i32;
@@ -2091,7 +2110,7 @@ fn draw_line_thick(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Color;
+    use crate::model::{Color, Tool};
 
     #[cfg(feature = "htr")]
     #[test]

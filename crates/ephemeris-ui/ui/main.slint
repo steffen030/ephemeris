@@ -151,6 +151,23 @@ export struct MdBlockEntry {
     text: string,
 }
 
+/// One formatted line of the See-text view.
+export struct SeeTextLine {
+    kind: int,   // 0=h1 1=h2 2=h3 3=para 4=bullet 5=numbered 6=checkbox
+    number: int,
+    checked: bool,
+    indent: int,
+    gap-before: bool,
+    pending: bool,
+    stale: bool,
+    line-index: int,
+    editable: bool,
+    whole-highlight: bool,
+    whole-underline: bool,
+    plain: string,
+    body: styled-text,
+}
+
 /// A calendar event row for the agenda view.
 export struct AgendaEntry {
     title: string,
@@ -301,6 +318,30 @@ export global EinkTheme {
 
 /// Renders a profile icon — Material glyph or custom image.
 /// Clipped so Material Icons’ tall em-box cannot push the glyph above siblings.
+/// Square-ish toggle button for the See-text line editor (inverts when active;
+/// min 40px high touch target, no animation).
+component SeeChip inherits Rectangle {
+    in property <string> label;
+    in property <bool> active: false;
+    in property <length> min-w: 48px;
+    callback clicked();
+    min-width: root.min-w;
+    height: 40px;
+    border-radius: 4px;
+    border-width: 2px;
+    border-color: EinkTheme.btn-border;
+    background: root.active ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+    Text {
+        text: root.label;
+        font-size: 14px;
+        font-weight: 700;
+        color: root.active ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    TouchArea { clicked => { root.clicked(); } }
+}
+
 component ProfileIcon inherits Rectangle {
     in property <string> icon-char: Icons.profile-person;
     in property <bool> has-custom: false;
@@ -528,12 +569,27 @@ export component EphemerisPage inherits Window {
     in-out property <string> active-paper: "blank";
     // See-text: overlay machine-readable / OCR text for the current note.
     in-out property <bool> note-see-text: false;
-    in-out property <string> note-text-content: "";
+    in property <[SeeTextLine]> see-text-lines: [];
 
     callback notebook-quick-new-note(string);
     callback paper-type-tapped(string);
     callback rename-canvas-note();
     callback note-see-text-toggled(bool);
+    // See-text line editor (bottom sheet); state lives here, Rust persists.
+    in-out property <bool> see-text-edit-open: false;
+    in-out property <int> see-text-edit-index: -1;
+    in-out property <string> see-text-edit-text: "";
+    in-out property <int> see-text-edit-kind: 3;
+    in-out property <int> see-text-edit-number: 0;
+    in-out property <int> see-text-edit-indent: 0;
+    in-out property <bool> see-text-edit-highlight: false;
+    in-out property <bool> see-text-edit-underline: false;
+    in-out property <bool> see-text-edit-stale: false;
+    // index, text, kind, number, indent, highlight, underline
+    callback see-text-line-save(int, string, int, int, int, bool, bool);
+    callback see-text-line-reset(int);
+    callback see-text-line-keep(int);
+    callback see-text-line-accept(int);
 
     // ── Settings view ────────────────────────────────────────────────────
     in-out property <int> settings-theme-idx: 0;
@@ -3375,7 +3431,7 @@ export component EphemerisPage inherits Window {
         background: EinkTheme.canvas-bg;
         clip: true;
 
-        property <bool> has-body: root.note-text-content != "";
+        property <bool> has-body: root.see-text-lines.length > 0;
 
         VerticalLayout {
             padding: 0px;
@@ -3422,6 +3478,7 @@ export component EphemerisPage inherits Window {
                         }
                         TouchArea {
                             clicked => {
+                                root.see-text-edit-open = false;
                                 root.note-see-text = false;
                                 root.note-see-text-toggled(false);
                             }
@@ -3483,12 +3540,75 @@ export component EphemerisPage inherits Window {
                     padding-bottom: 28px;
                     spacing: 0px;
 
-                    Text {
-                        text: root.note-text-content;
-                        font-size: 17px;
-                        color: EinkTheme.btn-fg;
-                        wrap: word-wrap;
-                        width: parent.width - 40px;
+                    for line[i] in root.see-text-lines: TouchArea {
+                      enabled: line.editable && !root.see-text-edit-open;
+                      clicked => {
+                        root.see-text-edit-index = line.line-index;
+                        root.see-text-edit-text = line.plain;
+                        root.see-text-edit-kind = line.kind;
+                        root.see-text-edit-number = line.number;
+                        root.see-text-edit-indent = line.indent;
+                        root.see-text-edit-highlight = line.whole-highlight;
+                        root.see-text-edit-underline = line.whole-underline;
+                        root.see-text-edit-stale = line.stale;
+                        root.see-text-edit-open = true;
+                        edit-input.focus();
+                      }
+                      HorizontalLayout {
+                        min-height: 36px;
+                        spacing: 8px;
+                        padding-top: line.gap-before ? 14px : 4px;
+                        padding-bottom: 4px;
+                        padding-left: line.indent * 24px;
+
+                        if line.kind == 4: Text {
+                            text: "•";
+                            font-size: 17px;
+                            color: EinkTheme.btn-fg;
+                            width: 16px;
+                            vertical-alignment: top;
+                        }
+                        if line.kind == 5: Text {
+                            text: line.number + ".";
+                            font-size: 17px;
+                            color: EinkTheme.btn-fg;
+                            width: 28px;
+                            horizontal-alignment: right;
+                            vertical-alignment: top;
+                        }
+                        if line.kind == 6: Rectangle {
+                            width: 16px;
+                            height: 16px;
+                            y: 3px;
+                            border-width: 2px;
+                            border-color: EinkTheme.btn-fg;
+                            background: line.checked ? EinkTheme.btn-fg : transparent;
+                            Text {
+                                text: line.checked ? "✓" : "";
+                                font-size: 12px;
+                                font-weight: 700;
+                                color: EinkTheme.canvas-bg;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+                        StyledText {
+                            text: line.body;
+                            horizontal-stretch: 1;
+                            default-font-size: line.kind == 0 ? 20px
+                                : line.kind == 1 ? 17px
+                                : line.kind == 2 ? 15px
+                                : 17px;
+                            default-color: line.pending ? EinkTheme.text-secondary : EinkTheme.btn-fg;
+                        }
+                        if line.stale: Text {
+                            text: "✎";
+                            font-size: 12px;
+                            color: EinkTheme.text-secondary;
+                            width: 16px;
+                            vertical-alignment: top;
+                        }
+                      }
                     }
                 }
             }
@@ -3521,6 +3641,131 @@ export component EphemerisPage inherits Window {
                         color: EinkTheme.text-secondary;
                         wrap: word-wrap;
                         horizontal-alignment: center;
+                    }
+                }
+            }
+        }
+
+        // Line editor bottom sheet: plain-text edit + format chips. No
+        // animation; chips invert (not colour-only) when active.
+        see-text-sheet := Rectangle {
+            visible: root.see-text-edit-open;
+            x: 0;
+            y: parent.height - self.height;
+            width: parent.width;
+            height: root.see-text-edit-stale ? 316px : 264px;
+            background: EinkTheme.canvas-bg;
+            border-width: 2px;
+            border-color: EinkTheme.chrome-border;
+
+            VerticalLayout {
+                padding: 12px;
+                spacing: 8px;
+
+                Rectangle {
+                    height: 84px;
+                    border-width: 2px;
+                    border-color: EinkTheme.btn-border;
+                    background: EinkTheme.canvas-bg;
+                    edit-input := TextInput {
+                        x: 8px;
+                        y: 6px;
+                        width: parent.width - 16px;
+                        height: parent.height - 12px;
+                        text <=> root.see-text-edit-text;
+                        font-size: 17px;
+                        color: EinkTheme.btn-fg;
+                        wrap: word-wrap;
+                        single-line: false;
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 6px;
+                    SeeChip { label: "H1"; active: root.see-text-edit-kind == 0; clicked => { root.see-text-edit-kind = 0; } }
+                    SeeChip { label: "H2"; active: root.see-text-edit-kind == 1; clicked => { root.see-text-edit-kind = 1; } }
+                    SeeChip { label: "¶"; active: root.see-text-edit-kind == 3; clicked => { root.see-text-edit-kind = 3; } }
+                    SeeChip { label: "•"; active: root.see-text-edit-kind == 4; clicked => { root.see-text-edit-kind = 4; } }
+                    SeeChip { label: "1."; active: root.see-text-edit-kind == 5; clicked => { root.see-text-edit-kind = 5; } }
+                    SeeChip { label: "Task"; active: root.see-text-edit-kind == 6; clicked => { root.see-text-edit-kind = 6; } }
+                }
+
+                HorizontalLayout {
+                    spacing: 6px;
+                    SeeChip {
+                        label: "← Indent";
+                        min-w: 84px;
+                        clicked => { root.see-text-edit-indent = max(0, root.see-text-edit-indent - 1); }
+                    }
+                    SeeChip {
+                        label: "Indent →";
+                        min-w: 84px;
+                        clicked => { root.see-text-edit-indent = min(3, root.see-text-edit-indent + 1); }
+                    }
+                    SeeChip {
+                        label: "Highlight";
+                        min-w: 84px;
+                        active: root.see-text-edit-highlight;
+                        clicked => { root.see-text-edit-highlight = !root.see-text-edit-highlight; }
+                    }
+                    SeeChip {
+                        label: "Underline";
+                        min-w: 84px;
+                        active: root.see-text-edit-underline;
+                        clicked => { root.see-text-edit-underline = !root.see-text-edit-underline; }
+                    }
+                }
+
+                if root.see-text-edit-stale: HorizontalLayout {
+                    spacing: 6px;
+                    SeeChip {
+                        label: "Keep my edit";
+                        min-w: 120px;
+                        horizontal-stretch: 1;
+                        clicked => {
+                            root.see-text-line-keep(root.see-text-edit-index);
+                            root.see-text-edit-open = false;
+                        }
+                    }
+                    SeeChip {
+                        label: "Use new recognition";
+                        min-w: 120px;
+                        horizontal-stretch: 1;
+                        clicked => {
+                            root.see-text-line-accept(root.see-text-edit-index);
+                            root.see-text-edit-open = false;
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 6px;
+                    SeeChip {
+                        label: "Reset line";
+                        min-w: 100px;
+                        clicked => {
+                            root.see-text-line-reset(root.see-text-edit-index);
+                            root.see-text-edit-open = false;
+                        }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    SeeChip {
+                        label: "Cancel";
+                        min-w: 90px;
+                        clicked => { root.see-text-edit-open = false; }
+                    }
+                    SeeChip {
+                        label: "Save";
+                        min-w: 90px;
+                        active: true;
+                        clicked => {
+                            root.see-text-line-save(
+                                root.see-text-edit-index, root.see-text-edit-text,
+                                root.see-text-edit-kind, root.see-text-edit-number,
+                                root.see-text-edit-indent, root.see-text-edit-highlight,
+                                root.see-text-edit-underline);
+                            root.see-text-edit-open = false;
+                        }
                     }
                 }
             }

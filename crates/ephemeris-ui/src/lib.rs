@@ -949,15 +949,49 @@ impl EphemerisUi {
         self.component.set_note_see_text(show);
     }
 
-    /// Set the machine-readable text shown in the see-text overlay.
-    pub fn set_note_text_content(&self, text: &str) {
+    /// Set the formatted rows shown in the see-text overlay (empty = empty state).
+    pub fn set_see_text_rows(&self, rows: &[ephemeris_core::see_text::SeeTextRow]) {
+        let lines: Vec<SeeTextLine> = rows.iter().map(see_text_line).collect();
         // Skip no-op updates — Slint property sets dirty UI damage and can
         // upgrade the next ink present from Fast → Partial.
-        if self.component.get_note_text_content().as_str() == text {
+        let current = self.component.get_see_text_lines();
+        if current.row_count() == lines.len()
+            && lines
+                .iter()
+                .enumerate()
+                .all(|(i, l)| current.row_data(i).as_ref() == Some(l))
+        {
             return;
         }
         self.component
-            .set_note_text_content(slint::SharedString::from(text));
+            .set_see_text_lines(Rc::new(slint::VecModel::from(lines)).into());
+    }
+
+    /// Save from the See-text editor: `(line_index, text, kind, number,
+    /// indent, highlight, underline)`.
+    pub fn on_see_text_line_save<F: FnMut(i32, String, i32, i32, i32, bool, bool) + 'static>(
+        &self,
+        mut handler: F,
+    ) {
+        self.component
+            .on_see_text_line_save(move |i, t, k, n, d, h, u| {
+                handler(i, t.to_string(), k, n, d, h, u)
+            });
+    }
+
+    /// Reset a line's user correction (`line_index`).
+    pub fn on_see_text_line_reset<F: FnMut(i32) + 'static>(&self, handler: F) {
+        self.component.on_see_text_line_reset(handler);
+    }
+
+    /// Stale line: keep the user's edit.
+    pub fn on_see_text_line_keep<F: FnMut(i32) + 'static>(&self, handler: F) {
+        self.component.on_see_text_line_keep(handler);
+    }
+
+    /// Stale line: use the new recognition.
+    pub fn on_see_text_line_accept<F: FnMut(i32) + 'static>(&self, handler: F) {
+        self.component.on_see_text_line_accept(handler);
     }
 
     /// Register a closure called when the see-text toggle changes.
@@ -5020,5 +5054,151 @@ mod tests {
         ui.feed_input(&InputEvent::PenUp(pen_sample(200.0, 100.0)), 1008);
         assert!(ui.get_page_strokes().is_empty());
         assert!(ui.committed_layer.borrow().data.iter().all(|&v| v == 255));
+    }
+}
+
+/// Build a Slint row; falls back to plain text when StyledText rejects the markdown.
+fn see_text_line(r: &ephemeris_core::see_text::SeeTextRow) -> SeeTextLine {
+    let body = slint::StyledText::from_markdown(&r.styled_md)
+        .unwrap_or_else(|_| slint::StyledText::from_plain_text(&r.plain));
+    SeeTextLine {
+        kind: r.kind,
+        number: r.number,
+        checked: r.checked,
+        indent: r.indent,
+        gap_before: r.gap_before,
+        pending: r.pending,
+        stale: r.stale,
+        line_index: r.line_index,
+        editable: r.editable,
+        whole_highlight: r.whole_highlight,
+        whole_underline: r.whole_underline,
+        plain: r.plain.as_str().into(),
+        body,
+    }
+}
+
+#[cfg(test)]
+mod see_text_tests {
+    use super::*;
+    use ephemeris_core::see_text::{rows_from_markdown, SeeTextRow};
+
+    fn row(md: &str) -> SeeTextRow {
+        SeeTextRow {
+            kind: 3,
+            number: 0,
+            checked: false,
+            indent: 0,
+            gap_before: false,
+            pending: false,
+            stale: false,
+            line_index: 0,
+            editable: false,
+            whole_highlight: false,
+            whole_underline: false,
+            styled_md: md.into(),
+            plain: md.into(),
+        }
+    }
+
+    #[test]
+    fn converted_output_is_accepted_by_slint() {
+        use ephemeris_core::{styled_inline_markdown as conv, InlineKind, InlineMark};
+        let mk = |kind, start, end| InlineMark { kind, start, end };
+        let cases: Vec<(&str, Vec<InlineMark>)> = vec![
+            ("Grüße über Äpfel", vec![mk(InlineKind::Highlight, 0, 5)]),
+            ("2 * 3 = 6 and a_b_c", vec![]),
+            (
+                "`code` <b>x</b> # [a](b)",
+                vec![mk(InlineKind::Underline, 0, 4)],
+            ),
+            (
+                "nested marks here",
+                vec![
+                    mk(InlineKind::Bold, 0, 10),
+                    mk(InlineKind::Underline, 3, 17),
+                    mk(InlineKind::Highlight, 7, 12),
+                ],
+            ),
+            ("# heading-like", vec![]),
+            ("1. numbered-like", vec![]),
+            ("- dash-like", vec![]),
+        ];
+        for (text, marks) in cases {
+            let md = conv(text, &marks);
+            assert!(
+                slint::StyledText::from_markdown(&md).is_ok(),
+                "rejected {md:?} for {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn markdown_rows_are_accepted_by_slint() {
+        let rows =
+            rows_from_markdown("# A\n\n- b\n  - c\n\n==d== <u>e</u> **f** \\# g\n- [x] h_i <b>");
+        for r in &rows {
+            assert!(
+                slint::StyledText::from_markdown(&r.styled_md).is_ok(),
+                "rejected {:?}",
+                r.styled_md
+            );
+        }
+    }
+
+    /// Renders See-text to a PGM when `SEE_TEXT_PGM` names an output path.
+    #[test]
+    fn render_see_text_snapshot() {
+        use ephemeris_pal::{DisplayError, PixelBuf, RefreshMode};
+        struct Cap(Option<PixelBuf>);
+        impl Display for Cap {
+            fn size(&self) -> (u32, u32) {
+                (800, 600)
+            }
+            fn present(
+                &mut self,
+                buf: &PixelBuf,
+                _: &[Rect],
+                _: RefreshMode,
+            ) -> Result<(), DisplayError> {
+                self.0 = Some(buf.clone());
+                Ok(())
+            }
+        }
+        let Ok(path) = std::env::var("SEE_TEXT_PGM") else {
+            return;
+        };
+        let ui = EphemerisUi::new(800, 600).expect("UI");
+        let rows = rows_from_markdown(
+            "# Heading one\n\n## Sub heading\n\n- bullet b\n  - nested c\n- [ ] open task\n- [x] done task\n3. numbered\n\n==highlight d== <u>underline e</u> and plain Grüße *star*\nsecond line\n\n…",
+        );
+        ui.set_see_text_rows(&rows);
+        ui.set_note_see_text(true);
+        // `SEE_TEXT_EDITOR=1` renders with the line editor sheet open.
+        if std::env::var("SEE_TEXT_EDITOR").is_ok() {
+            let c = ui.clone_component();
+            c.set_see_text_edit_text("bullet b".into());
+            c.set_see_text_edit_kind(4);
+            c.set_see_text_edit_indent(1);
+            c.set_see_text_edit_underline(true);
+            c.set_see_text_edit_stale(true);
+            c.set_see_text_edit_open(true);
+        }
+        ui.request_screen_change();
+        let mut cap = Cap(None);
+        ui.render_frame(&mut cap).expect("render");
+        let buf = cap.0.expect("frame");
+        let mut out = format!("P5\n{} {}\n255\n", buf.width, buf.height).into_bytes();
+        for row in 0..buf.height as usize {
+            let st = buf.stride as usize;
+            out.extend_from_slice(&buf.data[row * st..row * st + buf.width as usize]);
+        }
+        std::fs::write(path, out).unwrap();
+    }
+
+    #[test]
+    fn invalid_markdown_falls_back_to_plain() {
+        let l = see_text_line(&row("# heading"));
+        assert_eq!(l.body, slint::StyledText::from_plain_text("# heading"));
     }
 }

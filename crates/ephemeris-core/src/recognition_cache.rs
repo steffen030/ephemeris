@@ -8,8 +8,11 @@
 //! [`BG_RECOG_IDLE_DELAY`] after the last PenUp, cancelled on PenDown, and
 //! never while drawing.
 
+use crate::ink_layout::{estimate_text_height, split_page_ink, PageInk};
+use crate::layout_detect::{detect_line_formats, LayoutLine};
 use crate::model::{Stroke, StrokeId};
-use crate::stroke_htr::{default_line_gap, group_strokes_into_lines_with_ruling, StrokeLine};
+use crate::stroke_htr::{stroke_bounds, StrokeLine};
+use crate::text_format::{lines_to_markdown, LineFormat};
 use crate::transcriber::TextSpan;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
@@ -21,7 +24,7 @@ use std::time::{Duration, Instant};
 pub const BG_RECOG_IDLE_DELAY: Duration = Duration::from_millis(1500);
 
 /// Bump when cascade / feature pipeline changes invalidate stored line text.
-pub const RECOGNITION_CACHE_FORMAT: &str = "cascade-v2";
+pub const RECOGNITION_CACHE_FORMAT: &str = "cascade-v3";
 
 /// Placeholder shown in See-text for lines not yet recognised.
 pub const PENDING_LINE_MARKER: &str = "…";
@@ -62,9 +65,14 @@ pub struct CachedLine {
     pub stroke_ids_hash: u64,
     /// Stroke ids that formed this line when recognised (or when marked pending).
     pub stroke_ids: Vec<StrokeId>,
-    /// Recognised text when ready; empty while pending.
+    /// Recognised text when ready; empty while pending. Layout detection
+    /// strips list prefixes (`- `, `1. `) from it; the block lives in `format`.
     #[serde(default)]
     pub text: String,
+    /// Raw recogniser output when layout detection stripped a prefix from
+    /// `text` (so re-detection stays idempotent); `None` when identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_text: Option<String>,
     /// Model confidence in `[0, 1]`; negative when unknown / pending.
     #[serde(default = "default_pending_confidence")]
     pub confidence: f32,
@@ -75,6 +83,19 @@ pub struct CachedLine {
     /// True until a recogniser result has been applied for this hash.
     #[serde(default)]
     pub pending: bool,
+    /// Block / inline formatting; absent in old caches (plain paragraph).
+    #[serde(default)]
+    pub format: LineFormat,
+    /// User-corrected text; overrides `text` everywhere (see [`Self::effective_text`]).
+    #[serde(default)]
+    pub user_text: Option<String>,
+    /// User-corrected format; overrides `format`.
+    #[serde(default)]
+    pub user_format: Option<LineFormat>,
+    /// The line's strokes changed after the correction was made; the UI should
+    /// offer "keep my edit" vs "use new recognition".
+    #[serde(default)]
+    pub user_stale: bool,
 }
 
 fn default_pending_confidence() -> f32 {
@@ -89,18 +110,54 @@ impl CachedLine {
             stroke_ids_hash: line_stroke_ids_hash(&stroke_ids),
             stroke_ids,
             text: String::new(),
+            raw_text: None,
             confidence: -1.0,
             x: line.x,
             y: line.y,
             width: line.width,
             height: line.height,
             pending: true,
+            format: LineFormat::default(),
+            user_text: None,
+            user_format: None,
+            user_stale: false,
         }
+    }
+
+    /// True when the user has overridden the text and/or format.
+    pub fn has_correction(&self) -> bool {
+        self.user_text.is_some() || self.user_format.is_some()
+    }
+
+    /// User text if set, else the recognised text.
+    pub fn effective_text(&self) -> &str {
+        self.user_text.as_deref().unwrap_or(&self.text)
+    }
+
+    /// User format if set, else the recognised format.
+    pub fn effective_format(&self) -> &LineFormat {
+        self.user_format.as_ref().unwrap_or(&self.format)
+    }
+
+    /// Whether this line contributes to completed text: a corrected line counts
+    /// even while its re-recognition is pending.
+    pub(crate) fn is_completed(&self) -> bool {
+        (!self.pending || self.has_correction()) && !self.effective_text().is_empty()
+    }
+
+    /// Drop recognised output (keeps the user's correction).
+    fn reset_recognised(&mut self) {
+        self.text.clear();
+        self.raw_text = None;
+        self.confidence = -1.0;
+        self.format = LineFormat::default();
+        self.pending = true;
     }
 
     /// Store a recognised span for this line (clears pending).
     pub fn apply_span(&mut self, span: &TextSpan) {
         self.text = span.text.clone();
+        self.raw_text = None;
         self.confidence = span.confidence;
         self.x = span.x;
         self.y = span.y;
@@ -169,6 +226,8 @@ impl PageRecognitionCache {
     /// Reconcile cache with current strokes: reuse matching line hashes, mark
     /// the rest pending. Does **not** run recognition.
     ///
+    /// Line formats are re-detected (see [`Self::apply_layout`]).
+    ///
     /// Returns how many lines were invalidated vs reused.
     pub fn sync_strokes(
         &mut self,
@@ -176,53 +235,241 @@ impl PageRecognitionCache {
         ruling_pitch: Option<f32>,
         model_version: &str,
     ) -> RecogCacheStats {
-        let gap = default_line_gap(strokes);
-        let live = group_strokes_into_lines_with_ruling(strokes, gap, ruling_pitch);
+        // Same mark-free lines as `CascadingTranscriber::transcribe_page`.
+        let ink = split_page_ink(strokes, ruling_pitch);
+        let live = &ink.lines;
         let version_ok = self.model_version == model_version;
-        let mut by_hash: std::collections::HashMap<u64, CachedLine> =
-            std::collections::HashMap::new();
-        if version_ok {
-            for line in self.lines.drain(..) {
-                by_hash.insert(line.stroke_ids_hash, line);
+        // A model-version bump drops recognised output but never user corrections.
+        let mut old: Vec<Option<CachedLine>> = Vec::new();
+        for mut line in self.lines.drain(..) {
+            if version_ok {
+                old.push(Some(line));
+            } else if line.has_correction() {
+                line.reset_recognised();
+                old.push(Some(line));
             }
-        } else {
-            self.lines.clear();
         }
         self.model_version = model_version.to_string();
 
+        // Pass 1: exact stroke-hash matches.
+        let hashes: Vec<u64> = live.iter().map(stroke_line_ids_hash).collect();
+        let mut matched: Vec<Option<CachedLine>> = hashes
+            .iter()
+            .map(|h| {
+                old.iter_mut()
+                    .find(|o| o.as_ref().is_some_and(|c| c.stroke_ids_hash == *h))
+                    .and_then(|o| o.take())
+            })
+            .collect();
+        // Pass 2: unmatched live lines inherit a stale correction (see
+        // [`Self::heir_of_correction`]).
+        let mut inherited: Vec<Option<CachedLine>> = Vec::with_capacity(live.len());
+        for (line, m) in live.iter().zip(&matched) {
+            inherited.push(if m.is_none() {
+                Self::heir_of_correction(&mut old, line)
+            } else {
+                None
+            });
+        }
+
         let mut stats = RecogCacheStats::default();
         let mut next = Vec::with_capacity(live.len());
-        for line in &live {
-            let hash = stroke_line_ids_hash(line);
-            match by_hash.remove(&hash) {
-                Some(mut cached) if !cached.pending => {
-                    // Keep recognised text; refresh geometry from live grouping.
-                    cached.x = line.x;
-                    cached.y = line.y;
-                    cached.width = line.width;
-                    cached.height = line.height;
-                    cached.stroke_ids = line.strokes.iter().map(|s| s.id).collect();
-                    next.push(cached);
-                    stats.reused += 1;
-                }
+        for (i, line) in live.iter().enumerate() {
+            let ids: Vec<StrokeId> = line.strokes.iter().map(|s| s.id).collect();
+            match matched[i].take() {
                 Some(mut cached) => {
+                    // Refresh geometry from live grouping.
                     cached.x = line.x;
                     cached.y = line.y;
                     cached.width = line.width;
                     cached.height = line.height;
-                    cached.stroke_ids = line.strokes.iter().map(|s| s.id).collect();
-                    cached.pending = true;
+                    cached.stroke_ids = ids;
+                    if cached.pending {
+                        stats.invalidated += 1;
+                    } else {
+                        stats.reused += 1;
+                    }
                     next.push(cached);
-                    stats.invalidated += 1;
                 }
                 None => {
-                    next.push(CachedLine::pending_from_line(line));
+                    let mut fresh = CachedLine::pending_from_line(line);
+                    if let Some(prev) = inherited[i].take() {
+                        fresh.user_text = prev.user_text;
+                        fresh.user_format = prev.user_format;
+                        fresh.user_stale = true;
+                    }
+                    next.push(fresh);
                     stats.invalidated += 1;
                 }
             }
         }
         self.lines = next;
+        self.apply_layout_with(&ink);
         stats
+    }
+
+    /// Re-detect every completed line's [`LineFormat`] from the page's ink
+    /// (headings, lists, checkboxes, paragraph breaks, whole-line marks; see
+    /// [`crate::layout_detect`]). Cheap and idempotent: runs inside
+    /// [`Self::sync_strokes`] and [`Self::recognise_pending`], so a new
+    /// highlight or underline (which leaves text-line hashes alone) updates
+    /// formats without re-running HTR.
+    pub fn apply_layout(&mut self, strokes: &[Stroke], ruling_pitch: Option<f32>) {
+        self.apply_layout_with(&split_page_ink(strokes, ruling_pitch));
+    }
+
+    /// Recognised text gets its list prefix stripped (raw kept in
+    /// `raw_text`); user text is never rewritten nor prefix-interpreted.
+    fn apply_layout_with(&mut self, ink: &PageInk) {
+        let glyph: std::collections::HashMap<u64, f32> = ink
+            .lines
+            .iter()
+            .map(|l| (stroke_line_ids_hash(l), estimate_text_height(&l.strokes)))
+            .collect();
+        // Text stroke x-extents per line, for word-level marks.
+        let spans: std::collections::HashMap<u64, Vec<(f32, f32)>> = ink
+            .lines
+            .iter()
+            .map(|l| {
+                let xs = l
+                    .strokes
+                    .iter()
+                    .filter_map(stroke_bounds)
+                    .map(|(x0, _, x1, _)| (x0, x1))
+                    .collect();
+                (stroke_line_ids_hash(l), xs)
+            })
+            .collect();
+        let completed: Vec<bool> = self.lines.iter().map(|l| l.is_completed()).collect();
+        let raw: Vec<String> = self
+            .lines
+            .iter()
+            .map(|l| match &l.user_text {
+                Some(u) => u.clone(),
+                None => l.raw_text.clone().unwrap_or_else(|| l.text.clone()),
+            })
+            .collect();
+        let layout: Vec<LayoutLine> = self
+            .lines
+            .iter()
+            .zip(&raw)
+            .zip(&completed)
+            .map(|((l, t), done)| LayoutLine {
+                x: l.x,
+                y: l.y,
+                width: l.width,
+                height: l.height,
+                glyph_height: glyph.get(&l.stroke_ids_hash).copied().unwrap_or(0.0),
+                text: if *done { t } else { "" },
+                strip_prefix: l.user_text.is_none(),
+                stroke_spans: spans.get(&l.stroke_ids_hash).map_or(&[], Vec::as_slice),
+            })
+            .collect();
+        let detected = detect_line_formats(&layout, &ink.marks, &ink.highlights);
+        for ((line, d), (done, raw)) in self
+            .lines
+            .iter_mut()
+            .zip(detected)
+            .zip(completed.into_iter().zip(raw))
+        {
+            if !done {
+                continue;
+            }
+            if line.user_text.is_none() {
+                line.raw_text = (d.text != raw).then_some(raw);
+                line.text = d.text;
+            }
+            line.format = d.format;
+        }
+    }
+
+    /// Pick the old corrected line a changed live line descends from.
+    ///
+    /// Among still-unclaimed old lines that carry a correction, choose the one
+    /// sharing the most stroke ids with `line` (must be > 0); ties go to the
+    /// smallest vertical distance between line `y` values. The chosen line is
+    /// taken out of `old` so each correction is inherited at most once. A
+    /// corrected line whose strokes were all erased has no heir and is dropped.
+    fn heir_of_correction(old: &mut [Option<CachedLine>], line: &StrokeLine) -> Option<CachedLine> {
+        let ids: std::collections::HashSet<StrokeId> = line.strokes.iter().map(|s| s.id).collect();
+        let mut best: Option<(usize, usize, f32)> = None; // (idx, overlap, dy)
+        for (i, o) in old.iter().enumerate() {
+            let Some(c) = o.as_ref().filter(|c| c.has_correction()) else {
+                continue;
+            };
+            let overlap = c.stroke_ids.iter().filter(|id| ids.contains(id)).count();
+            if overlap == 0 {
+                continue;
+            }
+            let dy = (c.y - line.y).abs();
+            let better = match best {
+                None => true,
+                Some((_, bo, bd)) => overlap > bo || (overlap == bo && dy < bd),
+            };
+            if better {
+                best = Some((i, overlap, dy));
+            }
+        }
+        best.and_then(|(i, _, _)| old[i].take())
+    }
+
+    /// Set (or replace) the user's correction for a line; clears staleness.
+    /// Passing `None` for both is the same as [`Self::clear_line_correction`].
+    pub fn set_line_correction(
+        &mut self,
+        line_idx: usize,
+        text: Option<String>,
+        format: Option<LineFormat>,
+    ) {
+        if let Some(l) = self.lines.get_mut(line_idx) {
+            l.user_text = text;
+            l.user_format = format;
+            l.user_stale = false;
+        }
+    }
+
+    /// Remove the user's correction, reverting to the recognised value.
+    pub fn clear_line_correction(&mut self, line_idx: usize) {
+        self.set_line_correction(line_idx, None, None);
+    }
+
+    /// Resolve a stale correction by discarding it in favour of the new recognition.
+    pub fn accept_recognised(&mut self, line_idx: usize) {
+        self.clear_line_correction(line_idx);
+    }
+
+    /// Resolve a stale correction by keeping the user's edit.
+    pub fn keep_correction(&mut self, line_idx: usize) {
+        if let Some(l) = self.lines.get_mut(line_idx) {
+            l.user_stale = false;
+        }
+    }
+
+    /// Take user corrections from `current` for lines with the same stroke
+    /// hash. A background job recognises a snapshot; edits saved while it ran
+    /// live only in `current` and must survive the job's result. Returns true
+    /// when anything changed.
+    pub fn adopt_corrections_from(&mut self, current: &PageRecognitionCache) -> bool {
+        let mut changed = false;
+        for line in &mut self.lines {
+            let Some(cur) = current
+                .lines
+                .iter()
+                .find(|c| c.stroke_ids_hash == line.stroke_ids_hash)
+            else {
+                continue;
+            };
+            if line.user_text != cur.user_text
+                || line.user_format != cur.user_format
+                || line.user_stale != cur.user_stale
+            {
+                line.user_text = cur.user_text.clone();
+                line.user_format = cur.user_format.clone();
+                line.user_stale = cur.user_stale;
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// True when at least one line still needs recognition.
@@ -238,10 +485,22 @@ impl PageRecognitionCache {
     pub fn completed_text(&self) -> String {
         self.lines
             .iter()
-            .filter(|l| !l.pending && !l.text.is_empty())
-            .map(|l| l.text.as_str())
+            .filter(|l| l.is_completed())
+            .map(|l| l.effective_text())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Completed lines rendered as Obsidian markdown via
+    /// [`lines_to_markdown`]; this is what `note.text_content` stores.
+    pub fn completed_markdown(&self) -> String {
+        let lines: Vec<(String, LineFormat)> = self
+            .lines
+            .iter()
+            .filter(|l| l.is_completed())
+            .map(|l| (l.effective_text().to_string(), l.effective_format().clone()))
+            .collect();
+        lines_to_markdown(&lines)
     }
 
     /// See-text body: recognised lines plus [`PENDING_LINE_MARKER`] for pending.
@@ -252,10 +511,10 @@ impl PageRecognitionCache {
         self.lines
             .iter()
             .map(|l| {
-                if l.pending || l.text.is_empty() {
-                    PENDING_LINE_MARKER
+                if l.is_completed() {
+                    l.effective_text()
                 } else {
-                    l.text.as_str()
+                    PENDING_LINE_MARKER
                 }
             })
             .collect::<Vec<_>>()
@@ -267,9 +526,9 @@ impl PageRecognitionCache {
         self.lines
             .iter()
             .enumerate()
-            .filter(|(_, l)| !l.pending && !l.text.is_empty())
+            .filter(|(_, l)| l.is_completed())
             .map(|(i, l)| {
-                let mut span = TextSpan::new(&l.text, l.x, l.y, l.width, l.height);
+                let mut span = TextSpan::new(l.effective_text(), l.x, l.y, l.width, l.height);
                 span.confidence = l.confidence;
                 span.line = i as i32;
                 span
@@ -291,8 +550,9 @@ impl PageRecognitionCache {
     where
         F: FnMut(&StrokeLine, i32) -> crate::Result<Option<TextSpan>>,
     {
-        let gap = default_line_gap(strokes);
-        let live = group_strokes_into_lines_with_ruling(strokes, gap, ruling_pitch);
+        // Same mark-free lines as `CascadingTranscriber::transcribe_page`.
+        let ink = split_page_ink(strokes, ruling_pitch);
+        let live = &ink.lines;
         let mut stats = RecogCacheStats::default();
         if live.len() != self.lines.len() {
             // Caller should sync first; still attempt by hash.
@@ -317,12 +577,14 @@ impl PageRecognitionCache {
                 None => {
                     // Empty result: clear pending so we do not spin forever.
                     slot.text.clear();
+                    slot.raw_text = None;
                     slot.confidence = -1.0;
                     slot.pending = false;
                     stats.recognised += 1;
                 }
             }
         }
+        self.apply_layout_with(&ink);
         Ok(stats)
     }
 }
@@ -629,6 +891,32 @@ mod tests {
     }
 
     #[test]
+    fn old_cache_json_without_format_loads() {
+        let json = r#"{"model_version":"v1","lines":[{"stroke_ids_hash":1,"stroke_ids":[],"text":"alt","confidence":0.5,"x":0.0,"y":0.0,"width":1.0,"height":1.0,"pending":false}]}"#;
+        let cache: PageRecognitionCache = serde_json::from_str(json).unwrap();
+        assert_eq!(cache.lines[0].format, LineFormat::default());
+        assert_eq!(cache.completed_markdown(), "alt");
+    }
+
+    #[test]
+    fn completed_markdown_matches_plain_for_paragraphs() {
+        let mut cache = PageRecognitionCache::new("v1");
+        for (i, t) in ["L0", "L1"].iter().enumerate() {
+            let mut l = CachedLine::pending_from_line(&StrokeLine {
+                strokes: vec![],
+                x: 0.0,
+                y: i as f32,
+                width: 1.0,
+                height: 1.0,
+            });
+            l.text = (*t).into();
+            l.pending = false;
+            cache.lines.push(l);
+        }
+        assert_eq!(cache.completed_markdown(), cache.completed_text());
+    }
+
+    #[test]
     fn page_cache_round_trips_json() {
         let dir = tempfile::tempdir().unwrap();
         let mut cache = PageRecognitionCache::new("v1");
@@ -636,12 +924,17 @@ mod tests {
             stroke_ids_hash: 42,
             stroke_ids: vec![StrokeId::new()],
             text: "hi".into(),
+            raw_text: None,
             confidence: 0.8,
             x: 1.0,
             y: 2.0,
             width: 3.0,
             height: 4.0,
             pending: false,
+            format: LineFormat::default(),
+            user_text: None,
+            user_format: None,
+            user_stale: false,
         });
         cache.save(dir.path(), 7, 1).unwrap();
         let loaded = PageRecognitionCache::load(dir.path(), 7, 1).unwrap();
@@ -652,5 +945,191 @@ mod tests {
             PageRecognitionCache::path(dir.path(), 7, 1),
             dir.path().join("text_7_p1.json")
         );
+    }
+
+    /// Recognise all pending lines as `{prefix}{idx}`.
+    fn recognise_all(cache: &mut PageRecognitionCache, strokes: &[Stroke], prefix: &str) {
+        cache
+            .recognise_pending(strokes, None, &|| false, |line, idx| {
+                Ok(Some(TextSpan::new(
+                    format!("{prefix}{idx}"),
+                    line.x,
+                    line.y,
+                    line.width,
+                    line.height,
+                )))
+            })
+            .unwrap();
+    }
+
+    fn heading() -> LineFormat {
+        LineFormat {
+            block: crate::text_format::BlockKind::Heading(1),
+            ..LineFormat::default()
+        }
+    }
+
+    #[test]
+    fn correction_survives_unrelated_line_change() {
+        let (a1, a2, b1, b2) = two_line_strokes();
+        let mut strokes = vec![a1, a2, b1, b2];
+        let mut cache = PageRecognitionCache::new("v1");
+        cache.sync_strokes(&strokes, None, "v1");
+        recognise_all(&mut cache, &strokes, "r");
+        cache.set_line_correction(0, Some("Fixed".into()), Some(heading()));
+        // Add ink to line B only.
+        strokes.push(stroke_at(124.0, None));
+        let sync = cache.sync_strokes(&strokes, None, "v1");
+        assert_eq!(sync.reused, 1);
+        assert_eq!(sync.invalidated, 1);
+        assert!(!cache.lines[0].user_stale);
+        assert_eq!(cache.lines[0].effective_text(), "Fixed");
+        assert_eq!(cache.completed_markdown(), "# Fixed");
+    }
+
+    #[test]
+    fn correction_becomes_stale_when_own_strokes_change() {
+        let (a1, a2, b1, b2) = two_line_strokes();
+        let mut strokes = vec![a1, a2, b1, b2];
+        let mut cache = PageRecognitionCache::new("v1");
+        cache.sync_strokes(&strokes, None, "v1");
+        recognise_all(&mut cache, &strokes, "r");
+        cache.set_line_correction(0, Some("Fixed".into()), None);
+        strokes.push(stroke_at(21.0, None)); // more ink on line A
+        cache.sync_strokes(&strokes, None, "v1");
+        let l = &cache.lines[0];
+        assert!(l.pending && l.user_stale);
+        assert_eq!(l.user_text.as_deref(), Some("Fixed"));
+        assert_eq!(cache.display_text().lines().next(), Some("Fixed"));
+        recognise_all(&mut cache, &strokes, "n");
+        assert!(cache.lines[0].user_stale);
+        assert_eq!(cache.lines[0].text, "n0");
+        cache.keep_correction(0);
+        assert!(!cache.lines[0].user_stale);
+        assert_eq!(cache.lines[0].effective_text(), "Fixed");
+    }
+
+    #[test]
+    fn apply_layout_keeps_user_text_and_format() {
+        let (a1, a2, b1, b2) = two_line_strokes();
+        let strokes = vec![a1, a2, b1, b2];
+        let mut cache = PageRecognitionCache::new("v1");
+        cache.sync_strokes(&strokes, None, "v1");
+        recognise_all(&mut cache, &strokes, "r");
+        cache.set_line_correction(0, Some("- Fixed".into()), Some(heading()));
+        cache.apply_layout(&strokes, None);
+        cache.apply_layout(&strokes, None);
+        let l = &cache.lines[0];
+        assert_eq!(l.user_text.as_deref(), Some("- Fixed"));
+        assert_eq!(l.user_format, Some(heading()));
+        assert_eq!(cache.completed_markdown().lines().next(), Some("# - Fixed"));
+    }
+
+    #[test]
+    fn accept_recognised_clears_correction() {
+        let (a1, a2, b1, b2) = two_line_strokes();
+        let mut strokes = vec![a1, a2, b1, b2];
+        let mut cache = PageRecognitionCache::new("v1");
+        cache.sync_strokes(&strokes, None, "v1");
+        recognise_all(&mut cache, &strokes, "r");
+        cache.set_line_correction(0, Some("Fixed".into()), Some(heading()));
+        strokes.push(stroke_at(21.0, None));
+        cache.sync_strokes(&strokes, None, "v1");
+        recognise_all(&mut cache, &strokes, "n");
+        cache.accept_recognised(0);
+        let l = &cache.lines[0];
+        assert!(!l.has_correction() && !l.user_stale);
+        assert_eq!(l.effective_text(), "n0");
+    }
+
+    #[test]
+    fn correction_survives_model_version_bump() {
+        let (a1, a2, b1, b2) = two_line_strokes();
+        let strokes = vec![a1, a2, b1, b2];
+        let mut cache = PageRecognitionCache::new("v1");
+        cache.sync_strokes(&strokes, None, "v1");
+        recognise_all(&mut cache, &strokes, "r");
+        cache.set_line_correction(0, Some("Fixed".into()), Some(heading()));
+        let sync = cache.sync_strokes(&strokes, None, "v2");
+        assert_eq!(sync.reused, 0);
+        assert_eq!(sync.invalidated, 2);
+        assert_eq!(cache.model_version, "v2");
+        let l = &cache.lines[0];
+        assert!(l.pending && l.text.is_empty() && !l.user_stale);
+        assert_eq!(l.effective_text(), "Fixed");
+        assert_eq!(l.effective_format(), &heading());
+        assert_eq!(cache.completed_markdown(), "# Fixed");
+        // Uncorrected line lost its recognised text.
+        assert!(cache.lines[1].user_text.is_none() && cache.lines[1].text.is_empty());
+    }
+
+    #[test]
+    fn stale_heir_is_line_with_largest_stroke_overlap() {
+        let (a1, a2, b1, b2) = two_line_strokes();
+        let mut strokes = vec![a1, a2.clone(), b1, b2];
+        let mut cache = PageRecognitionCache::new("v1");
+        cache.sync_strokes(&strokes, None, "v1");
+        recognise_all(&mut cache, &strokes, "r");
+        cache.set_line_correction(0, Some("A".into()), None);
+        cache.set_line_correction(1, Some("B".into()), None);
+        // Erase a2 from line A and add ink to line B: both hashes change.
+        strokes.retain(|s| s.id != a2.id);
+        strokes.push(stroke_at(124.0, None));
+        cache.sync_strokes(&strokes, None, "v1");
+        assert_eq!(cache.lines[0].user_text.as_deref(), Some("A"));
+        assert_eq!(cache.lines[1].user_text.as_deref(), Some("B"));
+        assert!(cache.lines.iter().all(|l| l.user_stale));
+    }
+
+    #[test]
+    fn old_cache_json_without_user_fields_loads() {
+        let json = r#"{"model_version":"v1","lines":[{"stroke_ids_hash":1,"stroke_ids":[],"text":"alt","confidence":0.5,"x":0.0,"y":0.0,"width":1.0,"height":1.0,"pending":false,"format":{}}]}"#;
+        let cache: PageRecognitionCache = serde_json::from_str(json).unwrap();
+        let l = &cache.lines[0];
+        assert!(l.user_text.is_none() && l.user_format.is_none() && !l.user_stale);
+        assert_eq!(cache.completed_text(), "alt");
+    }
+
+    #[test]
+    fn completed_markdown_uses_effective_values() {
+        let mut cache = PageRecognitionCache::new("v1");
+        let mut l = CachedLine::pending_from_line(&StrokeLine {
+            strokes: vec![],
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+        });
+        l.text = "raw".into();
+        l.pending = false;
+        cache.lines.push(l);
+        cache.set_line_correction(0, Some("Edited".into()), Some(heading()));
+        assert_eq!(cache.completed_markdown(), "# Edited");
+        assert_eq!(cache.completed_text(), "Edited");
+        assert_eq!(cache.to_spans()[0].text, "Edited");
+        cache.clear_line_correction(0);
+        assert_eq!(cache.completed_markdown(), "raw");
+    }
+
+    #[test]
+    fn job_result_adopts_corrections_saved_meanwhile() {
+        let (a1, a2, b1, b2) = two_line_strokes();
+        let strokes = vec![a1, a2, b1, b2];
+        let mut current = PageRecognitionCache::new("v1");
+        current.sync_strokes(&strokes, None, "v1");
+        // Snapshot handed to the background job before the user edits.
+        let mut job = current.clone();
+        let _ = job.recognise_pending(&strokes, None, &|| false, |_, idx| {
+            Ok(Some(TextSpan::new(format!("r{idx}"), 0.0, 0.0, 1.0, 1.0)))
+        });
+        current.set_line_correction(1, Some("Edited".into()), None);
+        assert!(job.adopt_corrections_from(&current));
+        assert_eq!(job.lines[1].effective_text(), "Edited");
+        assert_eq!(job.lines[0].effective_text(), "r0");
+        // Reset while the job ran also wins.
+        current.clear_line_correction(1);
+        assert!(job.adopt_corrections_from(&current));
+        assert_eq!(job.lines[1].effective_text(), "r1");
+        assert!(!job.adopt_corrections_from(&current));
     }
 }

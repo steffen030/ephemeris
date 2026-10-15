@@ -14,11 +14,13 @@ pub mod error;
 pub mod geom;
 pub mod ics;
 pub mod ink;
+pub mod ink_layout;
 pub mod model;
 pub mod refresh;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 pub mod store;
+pub mod text_format;
 
 pub use action::{Action, ActionMap, ActionRouter, CanvasPoint, DefaultActionMap, RouterOutput};
 pub use config::{
@@ -39,6 +41,9 @@ pub use task_context::{
     review_queue, set_lane_tag, sync_tags_from_structured, todoist_priority,
     todoist_section_to_lane, EngageFilter, TodoistTaskFields, LANE_TAG_PREFIX,
 };
+pub use text_format::{
+    lines_to_markdown, styled_inline_markdown, BlockKind, InlineKind, InlineMark, LineFormat,
+};
 
 /// Initialize tracing with environment filter.
 pub fn init_tracing() {
@@ -56,14 +61,18 @@ pub fn init_tracing() {
 pub mod caldav;
 pub mod calendar_cache;
 pub mod htr_eval;
+pub mod layout_detect;
 pub mod line_htr;
+pub mod local_task_store;
 pub mod markdown_tasks;
 pub mod note_search;
+pub mod note_tasks;
 pub mod obsidian;
 pub mod pdf_export;
 pub mod prioritizer;
 pub mod profile_manager;
 pub mod recognition_cache;
+pub mod see_text;
 pub mod stroke_htr;
 pub mod stroke_persistence;
 pub mod stroke_render;
@@ -80,14 +89,23 @@ pub use aggregation::AggregationService;
 #[cfg(feature = "caldav")]
 pub use caldav::{default_sync_window, CalDavCalendar, CalDavClient, CalDavConfig};
 pub use calendar_cache::CalendarCache;
+pub use ink_layout::{classify_mark_strokes, split_page_ink, MarkKind, MarkStroke, PageInk};
+pub use layout_detect::{detect_line_formats, DetectedLine, LayoutLine};
 pub use line_htr::{
     prepare_line_htr_input, split_ink_line_bands, ImageLineBand, LineHtrInput, DE_HTR_V2_ALPHABET,
     LINE_HTR_HEIGHT, LINE_HTR_MAX_WIDTH,
+};
+pub use local_task_store::{
+    LocalTaskStore, NoteTaskState, LOCAL_TASK_SOURCE, LOCAL_TASK_STORE_VERSION,
 };
 pub use markdown_tasks::{MarkdownTaskExtractor, DEFAULT_TASKS_INBOX};
 pub use note_search::{
     list_markdown_files, markdown_to_blocks, markdown_to_plain, search_events, search_local_notes,
     search_tasks, strip_inline_markdown, MdBlock, MdBlockKind, SearchHit, VaultFtsIndex,
+};
+pub use note_tasks::{
+    checkbox_tasks_for_page, note_task_id, note_task_source_ref, parse_note_source_ref,
+    reconcile_note_tasks, sync_page_tasks, NoteTaskChanges, NOTE_TASK_SOURCE,
 };
 pub use pdf_export::{
     export_raster_pages_to_pdf, export_stroke_pages_to_pdf, gray8_to_rgb_with_yellow_highlights,

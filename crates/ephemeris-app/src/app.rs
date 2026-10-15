@@ -130,6 +130,11 @@ impl BackgroundRecogQueue {
         self.caches.borrow_mut().insert((note_id, doc_page), cache);
     }
 
+    /// In-memory cache for a page, if loaded (holds the latest user edits).
+    fn current(&self, note_id: u32, doc_page: usize) -> Option<PageRecognitionCache> {
+        self.caches.borrow().get(&(note_id, doc_page)).cloned()
+    }
+
     fn drop_note(&self, note_id: u32, doc_page_count: usize) {
         let mut caches = self.caches.borrow_mut();
         for p in 0..doc_page_count.max(1) {
@@ -211,7 +216,11 @@ fn recognition_model_version_for(config: &Config) -> String {
 }
 
 fn note_ruling_pitch(ui: &EphemerisUi) -> Option<f32> {
-    match ui.current_page_template() {
+    template_ruling_pitch(ui.current_page_template())
+}
+
+fn template_ruling_pitch(template: ephemeris_core::PageTemplate) -> Option<f32> {
+    match template {
         ephemeris_core::PageTemplate::Blank => None,
         ephemeris_core::PageTemplate::Lines
         | ephemeris_core::PageTemplate::Grid
@@ -757,6 +766,14 @@ impl App {
             }
         };
 
+        // Local + handwritten-checkbox task state (ephemeris-rjz): restored before
+        // the note-task startup sync so it sees persisted ticks and ink_seen.
+        let task_dir = note_data_dir();
+        let persist = Rc::new(TaskPersist::new(&task_dir));
+        let mut initial_tasks = initial_tasks;
+        if let Some(store) = load_local_task_store(&task_dir) {
+            *persist.state.borrow_mut() = store.apply(&mut initial_tasks);
+        }
         let tasks: Rc<RefCell<Vec<Task>>> = Rc::new(RefCell::new(initial_tasks));
 
         // ── Calendar events ───────────────────────────────────────────────────
@@ -1274,6 +1291,66 @@ impl App {
                 push_recs_switch();
                 push_nbs_switch();
             });
+        }
+
+        // ── Hand-drawn checkboxes → tasks (ephemeris-fmt.11) ──────────────────
+        // Reconciles a page's checkbox lines into `tasks` (source "note") and
+        // refreshes the task view when anything changed. In-memory like all
+        // non-vault tasks; rebuilt below from the on-disk caches at startup.
+        let sync_note_tasks: SyncNoteTasksFn = {
+            let tasks2 = tasks.clone();
+            let notes2 = notes.clone();
+            let ui2 = ui.clone_component();
+            let filter_rc = active_profile_filter.clone();
+            let mgr2 = profile_mgr.clone();
+            let cfg2 = config.clone();
+            let persist2 = persist.clone();
+            Rc::new(move |note_id, doc_page, cache| {
+                let profile = notes2
+                    .borrow()
+                    .iter()
+                    .find(|n| n.id == note_id)
+                    .and_then(|n| uuid::Uuid::parse_str(&n.profile_id).ok())
+                    .map(ProfileId)
+                    .unwrap_or(work_pid);
+                let changed = ephemeris_core::sync_page_tasks(
+                    &mut tasks2.borrow_mut(),
+                    &mut persist2.state.borrow_mut(),
+                    note_id,
+                    doc_page,
+                    profile,
+                    cache,
+                );
+                if changed {
+                    persist2.save(&tasks2.borrow());
+                    let filter_str = filter_rc.borrow().clone();
+                    let filtered = filter_tasks_by_profile(&tasks2.borrow(), &filter_str);
+                    refresh_comp(&ui2, &filtered, work_pid, &mgr2, &cfg2.borrow());
+                }
+            })
+        };
+        {
+            // Drop restored note tasks whose note no longer exists.
+            let live: std::collections::HashSet<u32> =
+                notes.borrow().iter().map(|n| n.id).collect();
+            tasks.borrow_mut().retain(|t| {
+                t.source != ephemeris_core::NOTE_TASK_SOURCE
+                    || t.source_ref
+                        .as_deref()
+                        .and_then(ephemeris_core::parse_note_source_ref)
+                        .is_none_or(|(id, _)| live.contains(&id))
+            });
+            let snapshot: Vec<(u32, usize)> = notes
+                .borrow()
+                .iter()
+                .flat_map(|n| (0..n.doc_page_count.max(1)).map(move |p| (n.id, p)))
+                .collect();
+            for (note_id, doc_page) in snapshot {
+                if let Some(cache) = PageRecognitionCache::load(&data_dir, note_id, doc_page) {
+                    sync_note_tasks(note_id, doc_page, &cache);
+                }
+            }
+            persist.save(&tasks.borrow());
         }
 
         // ── Connection management ─────────────────────────────────────────────
@@ -1842,11 +1919,16 @@ impl App {
                     let version = recognition_model_version_for(&cfg2.borrow());
                     let strokes = ui_rc.get_page_strokes();
                     let ruling = note_ruling_pitch(&ui_rc);
-                    let display = if let (Some(nid), Some(page)) = (note_id, doc_page) {
+                    let rows = if let (Some(nid), Some(page)) = (note_id, doc_page) {
                         let mut cache = bg.get_or_load(&data_dir_st, nid, page, &version);
                         cache.sync_strokes(&strokes, ruling, &version);
-                        let text = cache.display_text();
                         let pending = cache.has_pending();
+                        let stored = notes_prior
+                            .borrow()
+                            .iter()
+                            .find(|n| n.id == nid)
+                            .and_then(|n| n.text_content.clone());
+                        let rows = see_text_rows(&cache, stored.as_deref());
                         bg.store(nid, page, cache);
                         if pending {
                             // Kick low-priority worker immediately (still blocked while drawing).
@@ -1860,25 +1942,11 @@ impl App {
                                 ruling,
                             );
                         }
-                        if text.is_empty() {
-                            if pending {
-                                "Recognising…".to_string()
-                            } else {
-                                notes_prior
-                                    .borrow()
-                                    .iter()
-                                    .find(|n| n.id == nid)
-                                    .and_then(|n| n.text_content.clone())
-                                    .filter(|t| !t.is_empty())
-                                    .unwrap_or_else(|| "No text recognised yet.".into())
-                            }
-                        } else {
-                            text
-                        }
+                        rows
                     } else {
-                        "No active note.".into()
+                        Vec::new()
                     };
-                    ui_rc.set_note_text_content(&display);
+                    ui_rc.set_see_text_rows(&rows);
                 } else {
                     // Discard late See-text overlay updates from a closed view.
                     gen_counter.fetch_add(1, Ordering::AcqRel);
@@ -1886,6 +1954,54 @@ impl App {
                 // Force a clear refresh so ink disappears under see-text (or
                 // reappears when returning to ink) without eink ghosting.
                 ui_rc.request_screen_change();
+            });
+        }
+
+        // ── See-text line editor: save / reset / keep / accept ───────────────
+        {
+            let ctx = SeeTextEditCtx {
+                ui: ui.clone(),
+                bg: bg_recog.clone(),
+                data_dir: data_dir.clone(),
+                notes: notes.clone(),
+                notebooks: notebooks.clone(),
+                note_id_seq: note_id_seq.clone(),
+                notebook_id_seq: notebook_id_seq.clone(),
+                config: config.clone(),
+                vault_export: vault_export.clone(),
+            };
+            let c = ctx.clone();
+            ui.on_see_text_line_save(move |idx, text, kind, number, indent, hl, ul| {
+                c.apply(idx, |cache, i| {
+                    use ephemeris_core::see_text::{
+                        apply_line_edit, block_from_kind, line_edit_state,
+                    };
+                    let checked = line_edit_state(cache, i)
+                        .is_some_and(|e| e.block == ephemeris_core::BlockKind::Checkbox(true));
+                    apply_line_edit(
+                        cache,
+                        i,
+                        &ephemeris_core::see_text::LineEdit {
+                            text,
+                            block: block_from_kind(kind, number, checked),
+                            indent: indent.clamp(0, 3) as u8,
+                            highlight: hl,
+                            underline: ul,
+                        },
+                    );
+                });
+            });
+            let c = ctx.clone();
+            ui.on_see_text_line_reset(move |idx| {
+                c.apply(idx, |cache, i| cache.clear_line_correction(i));
+            });
+            let c = ctx.clone();
+            ui.on_see_text_line_keep(move |idx| {
+                c.apply(idx, |cache, i| cache.keep_correction(i));
+            });
+            let c = ctx;
+            ui.on_see_text_line_accept(move |idx| {
+                c.apply(idx, |cache, i| cache.accept_recognised(i));
             });
         }
 
@@ -1977,7 +2093,7 @@ impl App {
                 ui2.set_show_notebook_list(false);
                 ui2.set_drawing_menu_open(false);
                 ui2.set_active_note_id(new_id.to_string().as_str().into());
-                ui_rc.set_note_text_content("");
+                ui_rc.set_see_text_rows(&[]);
                 ui_rc.set_note_see_text(false);
                 save_notes_index_and_sync_vault(
                     &data_dir2,
@@ -3104,12 +3220,14 @@ impl App {
             let ui2 = ui.clone_component();
             let cfg2 = config.clone();
             let filter_rc = active_profile_filter.clone();
+            let persist2 = persist.clone();
             ui.on_task_complete_toggled(move |id| {
                 let mut dirty: Option<Task> = None;
                 {
                     let mut ts = tasks2.borrow_mut();
                     if let Some(t) = ts.iter_mut().find(|t| t.id.0.to_string() == id) {
                         t.set_done(!t.done);
+                        persist2.mark_edited(t);
                         if t.source == "obsidian" {
                             dirty = Some(t.clone());
                         }
@@ -3118,6 +3236,7 @@ impl App {
                 if let Some(ref t) = dirty {
                     write_back_obsidian_task(&cfg2.borrow(), t);
                 }
+                persist2.save(&tasks2.borrow());
                 let filter_str = filter_rc.borrow().clone();
                 let filtered = filter_tasks_by_profile(&tasks2.borrow(), &filter_str);
                 refresh_comp(&ui2, &filtered, work_pid, &mgr_refresh_1, &cfg2.borrow());
@@ -3220,6 +3339,7 @@ impl App {
             let cfg2 = config.clone();
             let filter_rc = active_profile_filter.clone();
             let counter = new_task_n.clone();
+            let persist2 = persist.clone();
             ui.on_task_confirm_add(move |title, priority, due, tags, lane, contexts, waiting| {
                 let title = title.trim().to_string();
                 let title = if title.is_empty() {
@@ -3281,6 +3401,7 @@ impl App {
                         Some(id)
                     }
                 };
+                persist2.save(&tasks2.borrow());
                 ui2.set_task_dialog_visible(false);
                 let filtered = filter_tasks_by_profile(&tasks2.borrow(), &filter_str);
                 refresh_comp(&ui2, &filtered, work_pid, &mgr_refresh_2, &cfg2.borrow());
@@ -3309,6 +3430,7 @@ impl App {
             let ui2 = ui.clone_component();
             let cfg2 = config.clone();
             let filter_rc = active_profile_filter.clone();
+            let persist2 = persist.clone();
             ui.on_task_confirm_edit(
                 move |id, title, priority, due, tags, lane, contexts, waiting| {
                     let title = title.trim().to_string();
@@ -3323,6 +3445,7 @@ impl App {
                             t.due = parse_due_ymd(&due);
                             t.tags = parse_tag_list(&tags);
                             apply_task_dialog_fields(t, lane.trim(), &contexts, &waiting);
+                            persist2.mark_edited(t);
                             if t.source == "obsidian" {
                                 dirty = Some(t.clone());
                             }
@@ -3331,6 +3454,7 @@ impl App {
                     if let Some(ref t) = dirty {
                         write_back_obsidian_task(&cfg2.borrow(), t);
                     }
+                    persist2.save(&tasks2.borrow());
                     ui2.set_task_dialog_visible(false);
                     let filter_str = filter_rc.borrow().clone();
                     let filtered = filter_tasks_by_profile(&tasks2.borrow(), &filter_str);
@@ -3597,6 +3721,7 @@ impl App {
             let tasks2 = tasks.clone();
             let cfg2 = config.clone();
             let filter_rc = active_profile_filter.clone();
+            let persist2 = persist.clone();
             ui.on_task_priority_cycle(move |id| {
                 let mut dirty: Option<Task> = None;
                 {
@@ -3608,6 +3733,7 @@ impl App {
                             TaskPriority::Medium => TaskPriority::Low,
                             TaskPriority::Low => TaskPriority::Urgent,
                         };
+                        persist2.mark_edited(t);
                         if t.source == "obsidian" {
                             dirty = Some(t.clone());
                         }
@@ -3616,6 +3742,7 @@ impl App {
                 if let Some(ref t) = dirty {
                     write_back_obsidian_task(&cfg2.borrow(), t);
                 }
+                persist2.save(&tasks2.borrow());
                 let filter_str = filter_rc.borrow().clone();
                 let profile_filtered = filter_tasks_by_profile(&tasks2.borrow(), &filter_str);
                 refresh_comp(&ui2, &profile_filtered, work_pid, &mgr_prio, &cfg2.borrow());
@@ -3664,6 +3791,7 @@ impl App {
             let ui2 = ui.clone_component();
             let cfg2 = config.clone();
             let filter_rc = active_profile_filter.clone();
+            let persist2 = persist.clone();
             page.on_clarify_save(move |id, lane, contexts, waiting| {
                 let id = id.to_string();
                 let lane = lane.to_string();
@@ -3674,6 +3802,7 @@ impl App {
                     let mut ts = tasks2.borrow_mut();
                     if let Some(t) = ts.iter_mut().find(|t| t.id.0.to_string() == id) {
                         apply_task_dialog_fields(t, lane.trim(), &contexts, &waiting);
+                        persist2.mark_edited(t);
                         if t.source == "obsidian" {
                             dirty = Some(t.clone());
                         }
@@ -3682,6 +3811,7 @@ impl App {
                 if let Some(ref t) = dirty {
                     write_back_obsidian_task(&cfg2.borrow(), t);
                 }
+                persist2.save(&tasks2.borrow());
                 ui2.set_clarify_visible(false);
                 let filter_str = filter_rc.borrow().clone();
                 let filtered = filter_tasks_by_profile(&tasks2.borrow(), &filter_str);
@@ -3746,6 +3876,7 @@ impl App {
             let filter_rc = active_profile_filter.clone();
             let q_ids = review_queue_ids.clone();
             let q_idx = review_index.clone();
+            let persist2 = persist.clone();
             page.on_review_confirm(move || {
                 let id_str = ui2.get_review_task_id().to_string();
                 if !id_str.is_empty() {
@@ -3754,6 +3885,7 @@ impl App {
                         let mut ts = tasks2.borrow_mut();
                         if let Some(t) = ts.iter_mut().find(|t| t.id.0.to_string() == id_str) {
                             mark_reviewed(t, now_secs());
+                            persist2.mark_edited(t);
                             if t.source == "obsidian" {
                                 dirty = Some(t.clone());
                             }
@@ -3762,6 +3894,7 @@ impl App {
                     if let Some(ref t) = dirty {
                         write_back_obsidian_task(&cfg2.borrow(), t);
                     }
+                    persist2.save(&tasks2.borrow());
                 }
                 let next = q_idx.get() + 1;
                 q_idx.set(next);
@@ -3808,6 +3941,7 @@ impl App {
             let filter_rc = active_profile_filter.clone();
             let q_ids = review_queue_ids.clone();
             let q_idx = review_index.clone();
+            let persist2 = persist.clone();
             page.on_review_done(move || {
                 let id_str = ui2.get_review_task_id().to_string();
                 if !id_str.is_empty() {
@@ -3816,6 +3950,7 @@ impl App {
                         let mut ts = tasks2.borrow_mut();
                         if let Some(t) = ts.iter_mut().find(|t| t.id.0.to_string() == id_str) {
                             t.set_done(true);
+                            persist2.mark_edited(t);
                             if t.source == "obsidian" {
                                 dirty = Some(t.clone());
                             }
@@ -3824,6 +3959,7 @@ impl App {
                     if let Some(ref t) = dirty {
                         write_back_obsidian_task(&cfg2.borrow(), t);
                     }
+                    persist2.save(&tasks2.borrow());
                 }
                 let next = q_idx.get() + 1;
                 q_idx.set(next);
@@ -4483,7 +4619,9 @@ impl App {
                             ui2.set_active_note_id(id.as_str().into());
                             ui_rc.set_page_title(&title);
                             ui_rc.set_current_page_template(template);
-                            ui_rc.set_note_text_content(&text);
+                            ui_rc.set_see_text_rows(&ephemeris_core::see_text::rows_from_markdown(
+                                &text,
+                            ));
                             ui_rc.set_note_see_text(false);
                             ui_rc.navigate_to_page(page_idx);
                         }
@@ -4862,6 +5000,16 @@ impl App {
                 } else {
                     sample_tasks_split(work_pid, personal_pid)
                 };
+                // Keep app-local and note tasks across the provider reload.
+                let kept: Vec<Task> = tasks2
+                    .borrow()
+                    .iter()
+                    .filter(|t| t.source == "local" || t.source == ephemeris_core::NOTE_TASK_SOURCE)
+                    .cloned()
+                    .collect();
+                let mut new_tasks = new_tasks;
+                new_tasks.retain(|t| t.source != "local");
+                new_tasks.extend(kept);
                 *tasks2.borrow_mut() = new_tasks;
 
                 // Reload calendar events (ICS + CalDAV), keep local quick-add events.
@@ -5371,7 +5519,7 @@ impl App {
                         ui2.set_show_note_list(false);
                         ui2.set_show_notebook_list(false);
                         ui2.set_active_note_id(new_id.to_string().as_str().into());
-                        ui_rc.set_note_text_content("");
+                        ui_rc.set_see_text_rows(&[]);
                         ui_rc.set_note_see_text(false);
                         save_notes_index_and_sync_vault(
                             &data_dir2,
@@ -5459,6 +5607,7 @@ impl App {
             calendar_events: calendar_events.clone(),
             active_profile_filter: active_profile_filter.clone(),
             push_recordings,
+            sync_note_tasks,
             #[cfg(target_os = "linux")]
             pen_source,
             #[cfg(target_os = "linux")]
@@ -5512,6 +5661,9 @@ enum PointerSource {
     Finger,
     Mouse,
 }
+
+/// `(note_id, doc_page, cache)` → reconcile handwritten checkboxes into tasks.
+type SyncNoteTasksFn = Rc<dyn Fn(u32, usize, &PageRecognitionCache)>;
 
 struct WinitHandler {
     _rt: Runtime,
@@ -5595,6 +5747,8 @@ struct WinitHandler {
     active_profile_filter: Rc<RefCell<String>>,
     /// Profile-filtered recording list refresh — called after transcription completes.
     push_recordings: Rc<dyn Fn()>,
+    /// Reconcile a page's handwritten checkboxes into tasks (ephemeris-fmt.11).
+    sync_note_tasks: SyncNoteTasksFn,
     /// Linux: separate digitiser (PineNote pen) via `/dev/input` — not wl_touch.
     #[cfg(target_os = "linux")]
     pen_source: Option<EvdevPenSource>,
@@ -5935,9 +6089,10 @@ impl WinitHandler {
         if let Err(e) = cache.save(&self.data_dir, note_id, doc_page) {
             tracing::warn!("Failed to save recognition cache for note {note_id}: {e}");
         }
-        let completed = cache.completed_text();
-        let display = cache.display_text();
+        let completed = cache.completed_markdown();
+        let rows = see_text_rows(&cache, Some(&completed));
         let see_text_open = self.ui.clone_component().get_note_see_text();
+        (self.sync_note_tasks)(note_id, doc_page, &cache);
         self.bg_recog.store(note_id, doc_page, cache);
         if let Some(note) = self.notes.borrow_mut().iter_mut().find(|n| n.id == note_id) {
             note.updated_at = now_secs();
@@ -5950,7 +6105,7 @@ impl WinitHandler {
         // Update See-text overlay in place when open (pending markers); otherwise
         // leave Slint alone mid-ink to avoid UI damage.
         if see_text_open {
-            self.ui.set_note_text_content(&display);
+            self.ui.set_see_text_rows(&rows);
         }
         // Vault export waits for leave-note or the 10‑minute batch — never per stroke.
         self.vault_export.mark(note_id);
@@ -6207,10 +6362,21 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
             }
         }
         if let Ok(mut guard) = self.bg_recog.result.lock() {
-            if let Some(job) = guard.take() {
+            if let Some(mut job) = guard.take() {
                 drop(guard);
-                let completed = job.cache.completed_text();
-                let display = job.cache.display_text();
+                // See-text edits saved while the job ran must not be clobbered.
+                if let Some(current) = self.bg_recog.current(job.note_id, job.doc_page) {
+                    if job.cache.adopt_corrections_from(&current) {
+                        if let Err(e) = job.cache.save(&self.data_dir, job.note_id, job.doc_page) {
+                            tracing::warn!(
+                                "Failed to save recognition cache for note {}: {e}",
+                                job.note_id
+                            );
+                        }
+                    }
+                }
+                let completed = job.cache.completed_markdown();
+                let rows = see_text_rows(&job.cache, Some(&completed));
                 self.bg_recog
                     .store(job.note_id, job.doc_page, job.cache.clone());
                 let mut did_persist = false;
@@ -6230,6 +6396,7 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
                     }
                 }
                 if did_persist {
+                    (self.sync_note_tasks)(job.note_id, job.doc_page, &job.cache);
                     save_notes_index_and_sync_vault(
                         &self.data_dir,
                         &self.notes.borrow(),
@@ -6249,7 +6416,7 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
                     .parse::<u32>()
                     .ok();
                 if see_text_open && active_id == Some(job.note_id) {
-                    self.ui.set_note_text_content(&display);
+                    self.ui.set_see_text_rows(&rows);
                     self.ui.request_screen_change();
                     if let Some(d) = &self.display {
                         d.request_redraw();
@@ -7664,7 +7831,7 @@ fn build_note_list(
             let text_hit = n
                 .text_content
                 .as_deref()
-                .map(|t| t.to_lowercase().contains(&q))
+                .map(|t| strip_inline_markdown(t).to_lowercase().contains(&q))
                 .unwrap_or(false);
             title_hit || text_hit
         })
@@ -8169,6 +8336,56 @@ fn switch_note_doc_page(
     set_note_doc_page_chrome(ui, note);
 }
 
+/// Persists local + handwritten-checkbox tasks (`tasks_local.json`, ephemeris-rjz).
+struct TaskPersist {
+    path: PathBuf,
+    /// Note-task ink_seen / user_edited bookkeeping (see `NoteTaskState`).
+    state: RefCell<ephemeris_core::NoteTaskState>,
+    /// Last JSON written, so unchanged state costs no disk write.
+    last: RefCell<String>,
+}
+
+impl TaskPersist {
+    fn new(data_dir: &Path) -> Self {
+        Self {
+            path: local_tasks_path(data_dir),
+            state: RefCell::default(),
+            last: RefCell::default(),
+        }
+    }
+
+    /// Note tasks the user ticked/edited must survive erasing their ink.
+    fn mark_edited(&self, task: &Task) {
+        if task.source == ephemeris_core::NOTE_TASK_SOURCE {
+            self.state.borrow_mut().user_edited.insert(task.id);
+        }
+    }
+
+    /// Write the store if it differs from the last write (atomic rename).
+    fn save(&self, tasks: &[Task]) {
+        let json =
+            ephemeris_core::LocalTaskStore::from_tasks(tasks, &self.state.borrow()).to_json();
+        if json.is_empty() || json == *self.last.borrow() {
+            return;
+        }
+        let tmp = self.path.with_extension("json.tmp");
+        let res = std::fs::write(&tmp, &json).and_then(|_| std::fs::rename(&tmp, &self.path));
+        match res {
+            Ok(()) => *self.last.borrow_mut() = json,
+            Err(e) => tracing::warn!("Failed to save local tasks: {e}"),
+        }
+    }
+}
+
+fn local_tasks_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("tasks_local.json")
+}
+
+fn load_local_task_store(data_dir: &Path) -> Option<ephemeris_core::LocalTaskStore> {
+    let json = std::fs::read_to_string(local_tasks_path(data_dir)).ok()?;
+    ephemeris_core::LocalTaskStore::from_json(&json)
+}
+
 fn notes_index_path(data_dir: &Path) -> PathBuf {
     data_dir.join("notes_index.json")
 }
@@ -8293,6 +8510,7 @@ fn build_vault_note_export(
     // Prefer freshly recognised text over a cached See-text snapshot so export
     // tracks newly added ink. Use the note's current document page (not always 0).
     let mut recognised_text: Option<String> = None;
+    let mut recognised_markdown: Option<String> = None;
     if let Some((w, h, gray)) = load_note_page_n(data_dir, note.id, note.doc_page) {
         let raster = ephemeris_pal::display::PixelBuf {
             width: w,
@@ -8308,23 +8526,28 @@ fn build_vault_note_export(
         };
         let strokes = load_note_page_strokes(data_dir, note.id, note.doc_page).unwrap_or_default();
         let cascade = build_cascading_transcriber(config);
-        // Prefer strokes → vector lines; fall back to page bin when stroke list empty.
+        // Ink pages go through the per-line recognition cache so the export keeps
+        // line formatting and only re-recognises changed lines; raster-only pages
+        // fall back to a fresh page transcription.
         let spans = if strokes.is_empty() {
-            cascade.transcribe_page(&[], input.width, input.height, &input.data)
+            cascade
+                .transcribe_page(&[], input.width, input.height, &input.data)
+                .unwrap_or_else(|e| {
+                    tracing::debug!("Transcription for note {} skipped: {e}", note.id);
+                    Vec::new()
+                })
         } else {
-            cascade.transcribe_page(&strokes, 0, 0, &[])
-        }
-        .unwrap_or_else(|e| {
-            tracing::debug!("Transcription for note {} skipped: {e}", note.id);
-            Vec::new()
-        });
+            let cache = recognise_page_cache(config, data_dir, note, &strokes, &cascade);
+            recognised_markdown = Some(cache.completed_markdown()).filter(|m| !m.is_empty());
+            cache.to_spans()
+        };
         let fresh = RasterOcrTranscriber::spans_to_text(&spans);
         if !fresh.is_empty() {
             recognised_text = Some(fresh);
         }
         let searchable_text = recognised_text
             .clone()
-            .or_else(|| note.text_content.clone());
+            .or_else(|| note.text_content.as_ref().map(|t| strip_inline_markdown(t)));
         // Yellow highlighter in PDF: pass Highlighter strokes so export can
         // multiply-blend classic marker yellow over the gray8 canvas (mono
         // e-ink UI stays gray; colour PDF / colour e-ink viewers show yellow).
@@ -8371,9 +8594,36 @@ fn build_vault_note_export(
         note_title: note.title.clone(),
         note_id: note.id,
         created_at: note.created_at,
-        text_content: recognised_text.or_else(|| note.text_content.clone()),
+        text_content: recognised_markdown
+            .or(recognised_text)
+            .or_else(|| note.text_content.clone()),
         pdf_vault_rel,
     }
+}
+
+/// Bring a page's recognition cache up to date with `strokes` (recognising only
+/// changed lines) and persist it.
+fn recognise_page_cache(
+    config: &Config,
+    data_dir: &Path,
+    note: &AppNote,
+    strokes: &[ephemeris_core::Stroke],
+    cascade: &CascadingTranscriber,
+) -> PageRecognitionCache {
+    let version = recognition_model_version_for(config);
+    let ruling = template_ruling_pitch(note.paper_template);
+    let mut cache = PageRecognitionCache::load(data_dir, note.id, note.doc_page)
+        .unwrap_or_else(|| PageRecognitionCache::new(&version));
+    cache.sync_strokes(strokes, ruling, &version);
+    if cache.has_pending() {
+        let _ = cache.recognise_pending(strokes, ruling, &|| false, |line, idx| {
+            cascade.transcribe_line(line, idx)
+        });
+        if let Err(e) = cache.save(data_dir, note.id, note.doc_page) {
+            tracing::warn!("Failed to save recognition cache for note {}: {e}", note.id);
+        }
+    }
+    cache
 }
 
 fn sync_notes_export_to_vault(
@@ -8433,6 +8683,100 @@ fn sync_notes_export_to_vault(
     }
 }
 
+/// Shared handles for the See-text line editor callbacks.
+#[derive(Clone)]
+struct SeeTextEditCtx {
+    ui: Rc<EphemerisUi>,
+    bg: Rc<BackgroundRecogQueue>,
+    data_dir: PathBuf,
+    notes: Rc<RefCell<Vec<AppNote>>>,
+    notebooks: Rc<RefCell<Vec<AppNotebook>>>,
+    note_id_seq: Rc<Cell<u32>>,
+    notebook_id_seq: Rc<Cell<u32>>,
+    config: Rc<RefCell<Config>>,
+    vault_export: Rc<VaultExportQueue>,
+}
+
+impl SeeTextEditCtx {
+    /// Apply `edit` to cache line `idx` of the active note page, then persist
+    /// the cache, refresh `note.text_content`, the notes index and the vault
+    /// export (same path as a finished background recognition), and re-push
+    /// the See-text rows.
+    fn apply(
+        &self,
+        idx: i32,
+        edit: impl FnOnce(&mut ephemeris_core::recognition_cache::PageRecognitionCache, usize),
+    ) {
+        let Ok(idx) = usize::try_from(idx) else {
+            return;
+        };
+        let Ok(note_id) = self
+            .ui
+            .clone_component()
+            .get_active_note_id()
+            .to_string()
+            .parse::<u32>()
+        else {
+            return;
+        };
+        let Some(doc_page) = self
+            .notes
+            .borrow()
+            .iter()
+            .find(|n| n.id == note_id)
+            .map(|n| n.doc_page)
+        else {
+            return;
+        };
+        let version = recognition_model_version_for(&self.config.borrow());
+        let mut cache = self
+            .bg
+            .get_or_load(&self.data_dir, note_id, doc_page, &version);
+        if idx >= cache.lines.len() {
+            return;
+        }
+        edit(&mut cache, idx);
+        if let Err(e) = cache.save(&self.data_dir, note_id, doc_page) {
+            tracing::warn!("Failed to save recognition cache for note {note_id}: {e}");
+        }
+        let completed = cache.completed_markdown();
+        let rows = see_text_rows(&cache, Some(&completed));
+        self.bg.store(note_id, doc_page, cache);
+        if let Some(note) = self.notes.borrow_mut().iter_mut().find(|n| n.id == note_id) {
+            note.text_content = if completed.is_empty() {
+                None
+            } else {
+                Some(completed)
+            };
+            note.updated_at = now_secs();
+        }
+        save_notes_index_and_sync_vault(
+            &self.data_dir,
+            &self.notes.borrow(),
+            &self.notebooks.borrow(),
+            self.note_id_seq.get(),
+            self.notebook_id_seq.get(),
+            &self.config.borrow(),
+            &self.vault_export,
+        );
+        self.vault_export.mark(note_id);
+        self.ui.set_see_text_rows(&rows);
+        self.ui.request_screen_change();
+    }
+}
+
+/// See-text rows: from the live cache lines, else from stored markdown.
+fn see_text_rows(
+    cache: &ephemeris_core::recognition_cache::PageRecognitionCache,
+    stored_markdown: Option<&str>,
+) -> Vec<ephemeris_core::see_text::SeeTextRow> {
+    if cache.lines.is_empty() {
+        ephemeris_core::see_text::rows_from_markdown(stored_markdown.unwrap_or_default())
+    } else {
+        ephemeris_core::see_text::rows_from_cache(cache)
+    }
+}
+
 /// Push see-text content for the active note into the UI.
 fn push_note_text_for_active(ui: &ephemeris_ui::EphemerisUi, notes: &[AppNote], active_id: &str) {
     let text = notes
@@ -8440,7 +8784,7 @@ fn push_note_text_for_active(ui: &ephemeris_ui::EphemerisUi, notes: &[AppNote], 
         .find(|n| n.id.to_string() == active_id)
         .and_then(|n| n.text_content.clone())
         .unwrap_or_default();
-    ui.set_note_text_content(&text);
+    ui.set_see_text_rows(&ephemeris_core::see_text::rows_from_markdown(&text));
     ui.set_note_see_text(false);
 }
 
