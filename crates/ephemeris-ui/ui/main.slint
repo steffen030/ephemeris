@@ -3053,7 +3053,8 @@ export component EphemerisPage inherits Window {
     drawing-dropdown := Rectangle {
         visible: root.drawing-menu-open && root.is-canvas-context;
         x: parent.width - 192px; y: 60px;
-        width: 184px; height: 268px;
+        // Last row (See text) ends at y 282; +6px bottom padding like the top.
+        width: 184px; height: 288px;
         background: EinkTheme.chrome-bg;
         border-width: 2px; border-color: EinkTheme.chrome-border;
         border-radius: 6px;
