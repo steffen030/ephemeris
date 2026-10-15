@@ -844,7 +844,9 @@ pub(crate) fn wire_canvas(
                     if session.port_drag.borrow().is_some() {
                         return;
                     }
-                    if let Some((t0, px, py, _)) = session.press_start.borrow().clone() {
+                    // Bind first: an if-let scrutinee's Ref lives through the body.
+                    let press = session.press_start.borrow().clone();
+                    if let Some((t0, px, py, _)) = press {
                         if (x - px).abs() > LONG_PRESS_SLOP || (y - py).abs() > LONG_PRESS_SLOP {
                             *session.press_start.borrow_mut() = Some((t0, px, py, None));
                         }
@@ -909,7 +911,8 @@ pub(crate) fn wire_canvas(
                     }
 
                     // Long-press → multi-select.
-                    if let Some((t0, px, py, Some(id))) = session.press_start.borrow().clone() {
+                    let press = session.press_start.borrow().clone();
+                    if let Some((t0, px, py, Some(id))) = press {
                         let held = now_ms().saturating_sub(t0);
                         let still =
                             (x - px).abs() <= LONG_PRESS_SLOP && (y - py).abs() <= LONG_PRESS_SLOP;
