@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.18](https://github.com/steffen030/ephemeris/compare/v0.1.17...v0.1.18) (2026-10-15)
+
+
+### Features
+
+* handwriting formatting — detection, See-text editor, markdown export (ephemeris-fmt) ([#48](https://github.com/steffen030/ephemeris/issues/48)) ([f475f3c](https://github.com/steffen030/ephemeris/commit/f475f3c9af7b2be2b991b8bf0dcaa072b44c77a4))
+* **notes:** yellow PDF highlighter + iconized burger menu (ephemeris-cev) ([#47](https://github.com/steffen030/ephemeris/issues/47)) ([0aaae30](https://github.com/steffen030/ephemeris/commit/0aaae305a258e4f4adb3f00285b740ba10d622bc))
+* **ui:** polish note chrome and task open/source-note UX (ephemeris-8f2) ([#45](https://github.com/steffen030/ephemeris/issues/45)) ([43077e3](https://github.com/steffen030/ephemeris/commit/43077e36861978d92f19a42bb43e3d852973eb11))
+
 ## [0.1.17](https://github.com/steffen030/ephemeris/compare/v0.1.16...v0.1.17) (2026-10-14)
 
 
