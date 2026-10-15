@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.23](https://github.com/steffen030/ephemeris/compare/v0.1.22...v0.1.23) (2026-10-15)
+
+
+### Bug Fixes
+
+* **canvas:** connect crash, readable cards, title chip, groups, multi-select ([abd4a62](https://github.com/steffen030/ephemeris/commit/abd4a62e69110658950afa2e95663095a9254be2))
+
 ## [0.1.22](https://github.com/steffen030/ephemeris/compare/v0.1.21...v0.1.22) (2026-10-15)
 
 
