@@ -23,9 +23,15 @@ pub struct Viewport {
 impl Viewport {
     pub fn from_view(view: &CanvasView, screen_w: u32, screen_h: u32, doc: &CanvasDoc) -> Self {
         let scale = match view.zoom {
-            CanvasZoomPreset::OneHundred => 1.0,
             CanvasZoomPreset::Fit => fit_scale(doc, screen_w, screen_h),
-            CanvasZoomPreset::FocusSelected => 1.0,
+            CanvasZoomPreset::OneHundred | CanvasZoomPreset::FocusSelected => {
+                let s = if view.scale.is_finite() && view.scale > 0.0 {
+                    view.scale
+                } else {
+                    1.0
+                };
+                s.clamp(MIN_BOARD_SCALE, MAX_BOARD_SCALE)
+            }
         };
         Self {
             origin_x: view.x,
@@ -49,6 +55,10 @@ impl Viewport {
     }
 }
 
+/// Pinch / continuous zoom clamps (board space → screen).
+pub const MIN_BOARD_SCALE: f32 = 0.25;
+pub const MAX_BOARD_SCALE: f32 = 4.0;
+
 fn fit_scale(doc: &CanvasDoc, screen_w: u32, screen_h: u32) -> f32 {
     let Some((min_x, min_y, max_x, max_y)) = content_bounds(doc) else {
         return 1.0;
@@ -57,7 +67,31 @@ fn fit_scale(doc: &CanvasDoc, screen_w: u32, screen_h: u32) -> f32 {
     let bh = (max_y - min_y).max(1.0) + 80.0;
     let sx = screen_w as f32 / bw;
     let sy = screen_h as f32 / bh;
-    sx.min(sy).clamp(0.25, 2.0)
+    sx.min(sy).clamp(MIN_BOARD_SCALE, MAX_BOARD_SCALE)
+}
+
+/// Zoom the view around a screen-space point by `factor` (e.g. 1.05 = +5%).
+///
+/// Converts Fit/Focus presets into a continuous scale first so pinch feels smooth.
+pub fn zoom_view_at(
+    view: &mut CanvasView,
+    doc: &CanvasDoc,
+    screen_w: u32,
+    screen_h: u32,
+    factor: f32,
+    screen_x: f32,
+    screen_y: f32,
+) {
+    if !factor.is_finite() || factor <= 0.0 {
+        return;
+    }
+    let vp = Viewport::from_view(view, screen_w, screen_h, doc);
+    let (bx, by) = vp.screen_to_board(screen_x, screen_y);
+    let new_scale = (vp.scale * factor).clamp(MIN_BOARD_SCALE, MAX_BOARD_SCALE);
+    view.zoom = CanvasZoomPreset::OneHundred;
+    view.scale = new_scale;
+    view.x = bx - screen_x / new_scale;
+    view.y = by - screen_y / new_scale;
 }
 
 fn content_bounds(doc: &CanvasDoc) -> Option<(f32, f32, f32, f32)> {
@@ -96,6 +130,7 @@ pub fn view_for_fit(doc: &CanvasDoc, screen_w: u32, screen_h: u32) -> CanvasView
         x: ox,
         y: oy,
         zoom: CanvasZoomPreset::Fit,
+        scale,
     }
 }
 
@@ -108,6 +143,7 @@ pub fn view_for_focus(doc: &CanvasDoc, node_id: &str, screen_w: u32, screen_h: u
             x: cx - screen_w as f32 * 0.5,
             y: cy - screen_h as f32 * 0.5,
             zoom: CanvasZoomPreset::FocusSelected,
+            scale: 1.0,
         };
     }
     CanvasView::default()
@@ -183,20 +219,61 @@ fn side_anchor(n: &CanvasNode, side: NodeSide) -> (f32, f32) {
     }
 }
 
+/// Options for board overview rasterization.
+#[derive(Debug, Clone, Copy)]
+pub struct BoardDrawOpts<'a> {
+    pub selected_ids: &'a [String],
+    pub connect_from: Option<&'a str>,
+    /// Draw mid-side connection ports (single selection).
+    pub show_ports: bool,
+    /// Optional ink thumbnails keyed by node id: (w, h, gray8).
+    pub ink_previews: &'a std::collections::HashMap<String, (u32, u32, Vec<u8>)>,
+}
+
+/// Screen-space hit radius for connection ports (logical px).
+pub const PORT_HIT_RADIUS: f32 = 22.0;
+
+/// Hit-test a connection port on `node_id` (mid-side circles).
+pub fn hit_port(
+    doc: &CanvasDoc,
+    vp: &Viewport,
+    sx: f32,
+    sy: f32,
+    node_id: &str,
+    radius_screen: f32,
+) -> Option<NodeSide> {
+    let n = doc.find_node(node_id)?;
+    let sides = [
+        NodeSide::Top,
+        NodeSide::Right,
+        NodeSide::Bottom,
+        NodeSide::Left,
+    ];
+    let mut best: Option<(NodeSide, f32)> = None;
+    for side in sides {
+        let (bx, by) = side_anchor(n, side);
+        let (px, py) = vp.board_to_screen(bx, by);
+        let d = ((sx - px).powi(2) + (sy - py).powi(2)).sqrt();
+        if d <= radius_screen && best.map(|(_, bd)| d < bd).unwrap_or(true) {
+            best = Some((side, d));
+        }
+    }
+    best.map(|(s, _)| s)
+}
+
 /// Render the board into a gray8 buffer (`width * height` bytes).
 pub fn render_board(
     doc: &CanvasDoc,
     vp: &Viewport,
     width: u32,
     height: u32,
-    selected_id: Option<&str>,
-    connect_from: Option<&str>,
+    opts: &BoardDrawOpts<'_>,
 ) -> Vec<u8> {
     let mut buf = vec![WHITE; (width * height) as usize];
     // Groups first (bottom).
     for n in &doc.nodes {
         if matches!(n, CanvasNode::Group(_)) {
-            draw_node(&mut buf, width, height, vp, n, selected_id, connect_from);
+            draw_node(&mut buf, width, height, vp, n, opts);
         }
     }
     // Edges under cards.
@@ -220,10 +297,51 @@ pub fn render_board(
     }
     for n in &doc.nodes {
         if !matches!(n, CanvasNode::Group(_)) {
-            draw_node(&mut buf, width, height, vp, n, selected_id, connect_from);
+            draw_node(&mut buf, width, height, vp, n, opts);
+        }
+    }
+    // Ports on top when a single card is selected.
+    if opts.show_ports {
+        if let Some(id) = opts.selected_ids.first() {
+            if let Some(n) = doc.find_node(id) {
+                draw_ports(&mut buf, width, height, vp, n);
+            }
         }
     }
     buf
+}
+
+fn draw_ports(buf: &mut [u8], width: u32, height: u32, vp: &Viewport, n: &CanvasNode) {
+    let r = (8.0 * vp.scale).clamp(6.0, 14.0) as i32;
+    for side in [
+        NodeSide::Top,
+        NodeSide::Right,
+        NodeSide::Bottom,
+        NodeSide::Left,
+    ] {
+        let (bx, by) = side_anchor(n, side);
+        let (sx, sy) = vp.board_to_screen(bx, by);
+        fill_circle(buf, width, height, sx as i32, sy as i32, r, BLACK);
+        fill_circle(buf, width, height, sx as i32, sy as i32, r - 2, WHITE);
+    }
+}
+
+fn fill_circle(buf: &mut [u8], w: u32, h: u32, cx: i32, cy: i32, r: i32, color: u8) {
+    if r <= 0 {
+        return;
+    }
+    let r2 = r * r;
+    for dy in -r..=r {
+        for dx in -r..=r {
+            if dx * dx + dy * dy <= r2 {
+                let x = cx + dx;
+                let y = cy + dy;
+                if x >= 0 && y >= 0 && x < w as i32 && y < h as i32 {
+                    buf[(y as u32 * w + x as u32) as usize] = color;
+                }
+            }
+        }
+    }
 }
 
 fn draw_node(
@@ -232,15 +350,15 @@ fn draw_node(
     height: u32,
     vp: &Viewport,
     n: &CanvasNode,
-    selected_id: Option<&str>,
-    connect_from: Option<&str>,
+    opts: &BoardDrawOpts<'_>,
 ) {
     let (sx, sy) = vp.board_to_screen(n.x() as f32, n.y() as f32);
     let sw = (n.width() as f32 * vp.scale) as i32;
     let sh = (n.height() as f32 * vp.scale) as i32;
     let x0 = sx as i32;
     let y0 = sy as i32;
-    let selected = selected_id == Some(n.id()) || connect_from == Some(n.id());
+    let selected =
+        opts.selected_ids.iter().any(|id| id == n.id()) || opts.connect_from == Some(n.id());
     let fill = WHITE;
     let border = if selected { SELECT } else { BLACK };
     let border_w = if selected { 3 } else { 2 };
@@ -254,14 +372,26 @@ fn draw_node(
         }
         CanvasNode::Text(t) => {
             fill_rect(buf, width, height, x0, y0, sw, sh, fill);
-            draw_rect_outline(buf, width, height, x0, y0, sw, sh, border, border_w, false);
-            let preview = if t.text.trim().is_empty() {
-                "Handwritten"
+            if let Some((iw, ih, px)) = opts.ink_previews.get(n.id()) {
+                blit_ink_preview(
+                    buf,
+                    width,
+                    height,
+                    x0 + 2,
+                    y0 + 2,
+                    sw - 4,
+                    sh - 4,
+                    *iw,
+                    *ih,
+                    px,
+                );
+            } else if t.text.trim().is_empty() {
+                blit_label(buf, width, height, x0 + 8, y0 + 8, "Empty");
             } else {
-                t.text.lines().next().unwrap_or("Text")
-            };
-            blit_label(buf, width, height, x0 + 8, y0 + 8, "Text");
-            blit_label(buf, width, height, x0 + 8, y0 + 28, preview);
+                let preview = t.text.lines().next().unwrap_or("");
+                blit_label(buf, width, height, x0 + 8, y0 + 8, preview);
+            }
+            draw_rect_outline(buf, width, height, x0, y0, sw, sh, border, border_w, false);
         }
         CanvasNode::File(f) => {
             fill_rect(buf, width, height, x0, y0, sw, sh, fill);
@@ -274,6 +404,45 @@ fn draw_node(
             draw_rect_outline(buf, width, height, x0, y0, sw, sh, border, border_w, false);
             blit_label(buf, width, height, x0 + 8, y0 + 8, "Link");
             blit_label(buf, width, height, x0 + 8, y0 + 28, &l.url);
+        }
+    }
+}
+
+/// Nearest-neighbour downsample of gray8 ink into a card rect.
+#[allow(clippy::too_many_arguments)]
+fn blit_ink_preview(
+    buf: &mut [u8],
+    bw: u32,
+    bh: u32,
+    x0: i32,
+    y0: i32,
+    dw: i32,
+    dh: i32,
+    iw: u32,
+    ih: u32,
+    pixels: &[u8],
+) {
+    if dw <= 0 || dh <= 0 || iw == 0 || ih == 0 {
+        return;
+    }
+    let expect = (iw as usize).saturating_mul(ih as usize);
+    if pixels.len() < expect {
+        return;
+    }
+    for dy in 0..dh {
+        let sy = (dy as u32 * ih) / dh as u32;
+        for dx in 0..dw {
+            let sx = (dx as u32 * iw) / dw as u32;
+            let src = pixels[(sy * iw + sx) as usize];
+            // Only stamp dark ink so white page doesn't fight the card fill.
+            if src > 220 {
+                continue;
+            }
+            let x = x0 + dx;
+            let y = y0 + dy;
+            if x >= 0 && y >= 0 && x < bw as i32 && y < bh as i32 {
+                buf[(y as u32 * bw + x as u32) as usize] = src;
+            }
         }
     }
 }
@@ -515,7 +684,15 @@ mod tests {
             origin_y: 0.0,
             scale: 1.0,
         };
-        let buf = render_board(&doc, &vp, 800, 600, None, None);
+        let ids: [String; 0] = [];
+        let previews = std::collections::HashMap::new();
+        let opts = BoardDrawOpts {
+            selected_ids: &ids,
+            connect_from: None,
+            show_ports: false,
+            ink_previews: &previews,
+        };
+        let buf = render_board(&doc, &vp, 800, 600, &opts);
         assert_eq!(buf.len(), 800 * 600);
         assert!(buf.iter().any(|&p| p < 255));
     }
@@ -525,5 +702,41 @@ mod tests {
         assert_eq!(snap_grid(23, 20), 20);
         assert_eq!(snap_grid(28, 20), 20);
         assert_eq!(snap_grid(30, 20), 40);
+    }
+
+    #[test]
+    fn zoom_view_at_keeps_anchor_and_clamps() {
+        let mut doc = CanvasDoc::default();
+        let _ = doc.add_text_card(0, 0);
+        let mut view = CanvasView {
+            x: 0.0,
+            y: 0.0,
+            zoom: CanvasZoomPreset::OneHundred,
+            scale: 1.0,
+        };
+        let sx = 200.0;
+        let sy = 150.0;
+        let (bx0, by0) = Viewport::from_view(&view, 800, 600, &doc).screen_to_board(sx, sy);
+        zoom_view_at(&mut view, &doc, 800, 600, 2.0, sx, sy);
+        assert!((view.scale - 2.0).abs() < 1e-4);
+        assert_eq!(view.zoom, CanvasZoomPreset::OneHundred);
+        let (bx1, by1) = Viewport::from_view(&view, 800, 600, &doc).screen_to_board(sx, sy);
+        assert!((bx0 - bx1).abs() < 1e-3);
+        assert!((by0 - by1).abs() < 1e-3);
+
+        zoom_view_at(&mut view, &doc, 800, 600, 100.0, sx, sy);
+        assert!((view.scale - MAX_BOARD_SCALE).abs() < 1e-4);
+    }
+
+    #[test]
+    fn zoom_view_at_leaves_fit_for_continuous_scale() {
+        let mut doc = CanvasDoc::default();
+        let _ = doc.add_text_card(0, 0);
+        let mut view = view_for_fit(&doc, 800, 600);
+        assert_eq!(view.zoom, CanvasZoomPreset::Fit);
+        let before = Viewport::from_view(&view, 800, 600, &doc).scale;
+        zoom_view_at(&mut view, &doc, 800, 600, 1.1, 400.0, 300.0);
+        assert_eq!(view.zoom, CanvasZoomPreset::OneHundred);
+        assert!((view.scale - before * 1.1).abs() < 1e-3);
     }
 }

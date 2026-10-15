@@ -933,7 +933,7 @@ impl App {
         }
         ui.clear_strokes_dirty();
 
-        // ── Obsidian Canvas (spatial boards) ───────────────────────────────────
+        // ── Obsidian Canvas (spatial boards) — wired after profile_mgr Rc ──────
         let canvas_session = Rc::new(crate::canvas_app::CanvasSession::load());
         *canvas_session.profile_filter.borrow_mut() = active_profile_filter.borrow().clone();
         let canvas_focus_page = notes
@@ -943,14 +943,6 @@ impl App {
             .max()
             .map(|m| m + 1)
             .unwrap_or(0);
-        crate::canvas_app::wire_canvas(
-            ui.clone(),
-            canvas_session,
-            config.clone(),
-            connections.clone(),
-            active_profile_filter.clone(),
-            canvas_focus_page,
-        );
 
         // ── Microphone detection & recordings ─────────────────────────────────
         let device_has_mic = has_microphone();
@@ -1003,6 +995,16 @@ impl App {
 
         // ── Profile list ──────────────────────────────────────────────────────
         let profile_mgr = Rc::new(RefCell::new(profile_mgr));
+
+        crate::canvas_app::wire_canvas(
+            ui.clone(),
+            canvas_session.clone(),
+            config.clone(),
+            connections.clone(),
+            active_profile_filter.clone(),
+            profile_mgr.clone(),
+            canvas_focus_page,
+        );
 
         // Track which profile IDs have notes_in_all = true (for note filtering).
         let notes_in_all_profiles: Rc<RefCell<HashSet<String>>> = {
@@ -1335,6 +1337,8 @@ impl App {
             let cfg2 = config.clone();
             let push_recs_switch = push_recordings.clone();
             let push_nbs_switch = push_notebooks.clone();
+            let canvas_switch = canvas_session.clone();
+            let ui_canvas = ui.clone();
             ui.on_profile_changed(move |id| {
                 let id_str = id.to_string();
                 *filter_rc.borrow_mut() = id_str.clone();
@@ -1352,6 +1356,8 @@ impl App {
                 set_active_profile_icon(&ui2, &mgr2, &id_str);
                 push_recs_switch();
                 push_nbs_switch();
+                *canvas_switch.profile_filter.borrow_mut() = filter_str;
+                crate::canvas_app::refresh_browser(&ui_canvas, &canvas_switch);
             });
         }
 
@@ -1582,8 +1588,19 @@ impl App {
 
         // ── Nav rail: Home ────────────────────────────────────────────────────
         {
+            let ui_rc = ui.clone();
             let ui2 = ui.clone_component();
+            let canvas_leave = canvas_session.clone();
+            let cfg_leave = config.clone();
+            let conns_leave = connections.clone();
             ui.on_nav_overview_tapped(move || {
+                crate::canvas_app::leave_canvas_session(
+                    &ui_rc,
+                    &canvas_leave,
+                    &cfg_leave,
+                    &conns_leave.borrow(),
+                    false,
+                );
                 ui2.set_show_task_view(false);
                 ui2.set_show_settings(false);
                 ui2.set_show_filebrowser(false);
@@ -1608,6 +1625,9 @@ impl App {
             let data_dir_nav = data_dir.clone();
             let vault_leave = vault_export.clone();
             let writes_leave = local_page_writes.clone();
+            let canvas_leave = canvas_session.clone();
+            let cfg_leave = config.clone();
+            let conns_leave = connections.clone();
             ui.on_nav_notes_tapped(move || {
                 // Save + queue vault export before leaving the canvas.
                 leave_note_canvas(
@@ -1617,6 +1637,13 @@ impl App {
                     ui2.get_active_note_id().as_str(),
                     &vault_leave,
                     &writes_leave,
+                );
+                crate::canvas_app::leave_canvas_session(
+                    &ui_rc,
+                    &canvas_leave,
+                    &cfg_leave,
+                    &conns_leave.borrow(),
+                    false,
                 );
                 active_nb_nav.set(0);
                 ui2.set_notes_search_query("".into());
@@ -2087,13 +2114,7 @@ impl App {
                 } else {
                     filter_nn.borrow().clone()
                 };
-                if pf.is_empty() {
-                    // All mode (or unassigned folder) — ask which profile first.
-                    ui2.set_create_picker_intent("note".into());
-                    ui2.set_show_create_profile_picker(true);
-                } else {
-                    ui2.invoke_create_profile_picked("note".into(), pf.as_str().into());
-                }
+                begin_create_with_profile(&ui2, "note", &pf);
             });
         }
 
@@ -2390,6 +2411,9 @@ impl App {
             let data_leave = data_dir.clone();
             let vault_leave = vault_export.clone();
             let writes_leave = local_page_writes.clone();
+            let canvas_leave = canvas_session.clone();
+            let cfg_leave = config.clone();
+            let conns_leave = connections.clone();
             ui.on_nav_calendar_tapped(move || {
                 leave_note_canvas(
                     &ui_rc,
@@ -2398,6 +2422,13 @@ impl App {
                     ui2.get_active_note_id().as_str(),
                     &vault_leave,
                     &writes_leave,
+                );
+                crate::canvas_app::leave_canvas_session(
+                    &ui_rc,
+                    &canvas_leave,
+                    &cfg_leave,
+                    &conns_leave.borrow(),
+                    false,
                 );
                 let sv = cal_sub_view2.get();
                 refresh(cal_year2.get(), cal_month2.get(), cal_day2.get(), sv);
@@ -2777,6 +2808,9 @@ impl App {
             let data_leave = data_dir.clone();
             let vault_leave = vault_export.clone();
             let writes_leave = local_page_writes.clone();
+            let canvas_leave = canvas_session.clone();
+            let cfg_leave = config.clone();
+            let conns_leave = connections.clone();
             ui.on_nav_rec_tapped(move || {
                 leave_note_canvas(
                     &ui_rc,
@@ -2785,6 +2819,13 @@ impl App {
                     ui2.get_active_note_id().as_str(),
                     &vault_leave,
                     &writes_leave,
+                );
+                crate::canvas_app::leave_canvas_session(
+                    &ui_rc,
+                    &canvas_leave,
+                    &cfg_leave,
+                    &conns_leave.borrow(),
+                    false,
                 );
                 push_recs_nav();
                 ui2.set_show_start_page(false);
@@ -3217,6 +3258,9 @@ impl App {
             let data_leave = data_dir.clone();
             let vault_leave = vault_export.clone();
             let writes_leave = local_page_writes.clone();
+            let canvas_leave = canvas_session.clone();
+            let cfg_leave = config.clone();
+            let conns_leave = connections.clone();
             ui.on_nav_tasks_tapped(move || {
                 leave_note_canvas(
                     &ui_rc,
@@ -3225,6 +3269,13 @@ impl App {
                     ui2.get_active_note_id().as_str(),
                     &vault_leave,
                     &writes_leave,
+                );
+                crate::canvas_app::leave_canvas_session(
+                    &ui_rc,
+                    &canvas_leave,
+                    &cfg_leave,
+                    &conns_leave.borrow(),
+                    false,
                 );
                 {
                     let cfg = cfg2.borrow();
@@ -4311,11 +4362,22 @@ impl App {
 
         // ── Settings → open ───────────────────────────────────────────────────
         {
+            let ui_rc = ui.clone();
             let ui2 = ui.clone_component();
             let cfg2 = config.clone();
             let push_so = push_connections.clone();
             let default_pid = default_conn_profile.clone();
+            let canvas_leave = canvas_session.clone();
+            let cfg_leave = config.clone();
+            let conns_leave = connections.clone();
             ui.on_settings_open(move || {
+                crate::canvas_app::leave_canvas_session(
+                    &ui_rc,
+                    &canvas_leave,
+                    &cfg_leave,
+                    &conns_leave.borrow(),
+                    false,
+                );
                 // Ensure Connect has a concrete profile selected (never "All").
                 let connect_pid = {
                     let current = ui2.get_connect_profile_id().to_string();
@@ -4427,6 +4489,9 @@ impl App {
             let data_leave = data_dir.clone();
             let vault_leave = vault_export.clone();
             let writes_leave = local_page_writes.clone();
+            let canvas_leave = canvas_session.clone();
+            let cfg_leave = config.clone();
+            let conns_leave = connections.clone();
             ui.on_search_open(move || {
                 // Persist ink + queue vault export, then hide the canvas so
                 // strokes cannot bleed through search via min() compositing.
@@ -4437,6 +4502,13 @@ impl App {
                     ui2.get_active_note_id().as_str(),
                     &vault_leave,
                     &writes_leave,
+                );
+                crate::canvas_app::leave_canvas_session(
+                    &ui_rc,
+                    &canvas_leave,
+                    &cfg_leave,
+                    &conns_leave.borrow(),
+                    false,
                 );
                 // Show search immediately — do not block the transition on a
                 // full vault walk when the FTS index is already warm.
@@ -5501,6 +5573,7 @@ impl App {
             let cfg2 = config.clone();
             let vault_ex = vault_export.clone();
             let anchor_rc = current_note_anchor.clone();
+            let canvas_create_session = canvas_session.clone();
             ui.on_create_profile_picked(move |intent, profile_id| {
                 let profile_id = profile_id.to_string();
                 match intent.as_str() {
@@ -5593,6 +5666,32 @@ impl App {
                             &vault_ex,
                         );
                     }
+                    "canvas" => {
+                        if profile_id.is_empty() {
+                            tracing::warn!(
+                                "Ignoring canvas create with empty profile (All is not a target)"
+                            );
+                            return;
+                        }
+                        crate::canvas_app::create_canvas_with_profile(
+                            &ui_rc,
+                            &canvas_create_session,
+                            &profile_id,
+                        );
+                    }
+                    "canvas-folder" => {
+                        if profile_id.is_empty() {
+                            tracing::warn!(
+                                "Ignoring canvas folder create with empty profile (All is not a target)"
+                            );
+                            return;
+                        }
+                        crate::canvas_app::create_canvas_folder_with_profile(
+                            &ui_rc,
+                            &canvas_create_session,
+                            &profile_id,
+                        );
+                    }
                     _ => {}
                 }
             });
@@ -5683,6 +5782,10 @@ impl App {
             chrome_was_covering: false,
             chrome_swipe_start: None,
             last_kiosk_check: Instant::now(),
+            canvas_session: canvas_session.clone(),
+            board_fingers: HashMap::new(),
+            board_pinch_last_dist: None,
+            board_pinching: false,
         };
 
         event_loop.run_app(&mut handler)?;
@@ -5712,6 +5815,24 @@ fn probe_window_size() -> (u32, u32) {
 }
 
 // ── Winit ApplicationHandler ──────────────────────────────────────────────────
+
+fn board_finger_distance(fingers: &HashMap<u64, (f32, f32)>) -> Option<f32> {
+    let mut iter = fingers.values();
+    let (x0, y0) = *iter.next()?;
+    let (x1, y1) = *iter.next()?;
+    Some(((x1 - x0).hypot(y1 - y0)).max(0.0))
+}
+
+fn board_finger_midpoint(fingers: &HashMap<u64, (f32, f32)>) -> (f32, f32) {
+    let mut iter = fingers.values();
+    let Some(&(x0, y0)) = iter.next() else {
+        return (0.0, 0.0);
+    };
+    let Some(&(x1, y1)) = iter.next() else {
+        return (x0, y0);
+    };
+    ((x0 + x1) * 0.5, (y0 + y1) * 0.5)
+}
 
 /// Distinguishes pen digitiser, finger touch, and desktop mouse for ink gating
 /// and page-swipe eligibility.
@@ -5833,9 +5954,93 @@ struct WinitHandler {
     chrome_swipe_start: Option<f32>,
     /// Throttle for the kiosk geometry watchdog.
     last_kiosk_check: Instant,
+    /// Obsidian Canvas session — pinch zoom when the board is open.
+    canvas_session: Rc<crate::canvas_app::CanvasSession>,
+    /// Active finger contacts on the board (`touch.id` → UI logical pos).
+    board_fingers: HashMap<u64, (f32, f32)>,
+    /// Last inter-finger distance while pinching (UI px).
+    board_pinch_last_dist: Option<f32>,
+    /// Two-finger pinch in progress — suppress single-pointer pan/tap.
+    board_pinching: bool,
 }
 
 impl WinitHandler {
+    /// Two-finger pinch on the Canvas board overview (UI logical coords).
+    fn handle_board_touch(
+        &mut self,
+        id: u64,
+        phase: winit::event::TouchPhase,
+        lx: f32,
+        ly: f32,
+        pressure: f32,
+    ) {
+        use winit::event::TouchPhase;
+        match phase {
+            TouchPhase::Started => {
+                self.board_fingers.insert(id, (lx, ly));
+                if self.board_fingers.len() >= 2 {
+                    if !self.board_pinching {
+                        // End any single-finger pan/tap before zooming.
+                        self.handle_pointer_release(lx, ly, 0);
+                        crate::canvas_app::cancel_board_pointer_gesture(&self.canvas_session);
+                        self.board_pinching = true;
+                    }
+                    self.board_pinch_last_dist = board_finger_distance(&self.board_fingers);
+                } else {
+                    self.pointer_source = PointerSource::Finger;
+                    self.page_swipe_allowed.set(true);
+                    self.handle_pointer_press(lx, ly, pressure, 0);
+                }
+            }
+            TouchPhase::Moved => {
+                if self.board_fingers.contains_key(&id) {
+                    self.board_fingers.insert(id, (lx, ly));
+                }
+                if self.board_pinching && self.board_fingers.len() >= 2 {
+                    if let Some(dist) = board_finger_distance(&self.board_fingers) {
+                        if let Some(last) = self.board_pinch_last_dist {
+                            if last > 2.0 && dist > 2.0 {
+                                let factor = dist / last;
+                                let (mx, my) = board_finger_midpoint(&self.board_fingers);
+                                crate::canvas_app::apply_board_zoom_factor(
+                                    &self.ui,
+                                    &self.canvas_session,
+                                    factor,
+                                    mx,
+                                    my,
+                                );
+                                if let Some(d) = &self.display {
+                                    d.request_redraw();
+                                }
+                            }
+                        }
+                        self.board_pinch_last_dist = Some(dist);
+                    }
+                } else if !self.board_pinching {
+                    self.pointer_source = PointerSource::Finger;
+                    self.handle_pointer_move(lx, ly, pressure, 0);
+                }
+            }
+            TouchPhase::Ended | TouchPhase::Cancelled => {
+                self.board_fingers.remove(&id);
+                if self.board_pinching {
+                    if self.board_fingers.len() < 2 {
+                        self.board_pinching = false;
+                        self.board_pinch_last_dist = None;
+                        self.canvas_session.save_doc();
+                        // Remaining finger must lift before pan resumes.
+                    }
+                } else {
+                    self.handle_pointer_release(lx, ly, 0);
+                }
+                if self.board_fingers.is_empty() {
+                    self.board_pinching = false;
+                    self.board_pinch_last_dist = None;
+                }
+            }
+        }
+    }
+
     /// Map a physical window position into UI logical coordinates.
     ///
     /// Normalises against the current physical window size so maximized /
@@ -6714,6 +6919,8 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
 
             // PineNote / Wayland: finger contacts arrive as Touch. The EMR pen
             // is handled separately via evdev on Linux (`drain_pen_events`).
+            // On the Canvas board, two fingers → pinch zoom (Slint only sees one
+            // pointer, so we recognize the gesture here).
             WindowEvent::Touch(touch) => {
                 use winit::event::TouchPhase;
                 let (lx, ly) = self.map_to_ui(touch.location);
@@ -6722,19 +6929,65 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
                     .map(|f| f.normalized() as f32)
                     .unwrap_or(0.8)
                     .clamp(0.05, 1.0);
-                match touch.phase {
-                    TouchPhase::Started => {
-                        self.pointer_source = PointerSource::Finger;
-                        self.page_swipe_allowed.set(true);
-                        self.handle_pointer_press(lx, ly, pressure, 0);
+                let board_open = {
+                    let page = self.ui.clone_component();
+                    page.get_show_canvas_board() && !page.get_canvas_focus_active()
+                };
+                if board_open {
+                    self.handle_board_touch(touch.id, touch.phase, lx, ly, pressure);
+                } else {
+                    self.board_fingers.clear();
+                    self.board_pinch_last_dist = None;
+                    self.board_pinching = false;
+                    match touch.phase {
+                        TouchPhase::Started => {
+                            self.pointer_source = PointerSource::Finger;
+                            self.page_swipe_allowed.set(true);
+                            self.handle_pointer_press(lx, ly, pressure, 0);
+                        }
+                        TouchPhase::Moved => {
+                            self.pointer_source = PointerSource::Finger;
+                            self.handle_pointer_move(lx, ly, pressure, 0);
+                        }
+                        TouchPhase::Ended | TouchPhase::Cancelled => {
+                            self.handle_pointer_release(lx, ly, 0);
+                        }
                     }
-                    TouchPhase::Moved => {
-                        self.pointer_source = PointerSource::Finger;
-                        self.handle_pointer_move(lx, ly, pressure, 0);
+                }
+            }
+
+            // macOS trackpad pinch (same continuous scale as finger pinch).
+            WindowEvent::PinchGesture { delta, phase, .. } => {
+                use winit::event::TouchPhase;
+                if !delta.is_finite() {
+                    return;
+                }
+                let page = self.ui.clone_component();
+                if !page.get_show_canvas_board() || page.get_canvas_focus_active() {
+                    return;
+                }
+                let factor = (1.0 + delta) as f32;
+                if factor > 0.0 {
+                    let (uw, uh) = self.ui.size();
+                    let (cx, cy) = self.cursor_pos;
+                    let (sx, sy) = if cx > 1.0 || cy > 1.0 {
+                        (cx, cy)
+                    } else {
+                        (uw as f32 * 0.5, uh as f32 * 0.5)
+                    };
+                    crate::canvas_app::apply_board_zoom_factor(
+                        &self.ui,
+                        &self.canvas_session,
+                        factor,
+                        sx,
+                        sy,
+                    );
+                    if let Some(d) = &self.display {
+                        d.request_redraw();
                     }
-                    TouchPhase::Ended | TouchPhase::Cancelled => {
-                        self.handle_pointer_release(lx, ly, 0);
-                    }
+                }
+                if matches!(phase, TouchPhase::Ended | TouchPhase::Cancelled) {
+                    self.canvas_session.save_doc();
                 }
             }
 
@@ -7780,7 +8033,23 @@ fn count_child_folders(
         .count() as i32
 }
 
-fn profile_badge_for(
+/// Empty profile (All aggregator) → show create-profile picker; else create now.
+/// Shared by Notes / Canvas / Recordings create taps.
+pub(crate) fn begin_create_with_profile(
+    page: &ephemeris_ui::EphemerisPage,
+    intent: &str,
+    profile_id: &str,
+) {
+    if profile_id.is_empty() {
+        page.set_create_picker_intent(intent.into());
+        page.set_show_create_profile_picker(true);
+    } else {
+        page.invoke_create_profile_picked(intent.into(), profile_id.into());
+    }
+}
+
+/// Shared All-aggregator origin badge for Notes / Canvas / Recordings rows.
+pub(crate) fn profile_badge_for(
     profile_id: &str,
     show_in_all: bool,
     mgr: &ephemeris_core::profile_manager::ProfileManager,

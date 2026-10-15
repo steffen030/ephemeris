@@ -58,7 +58,9 @@ pub struct CanvasIndex {
     pub canvases: Vec<AppCanvasMeta>,
 }
 
-/// Zoom presets for e-ink (no continuous pinch).
+/// Zoom presets for the board chrome (Fit / 100% / Focus).
+/// Continuous pinch updates [`CanvasView::scale`] while leaving the preset at
+/// `OneHundred` (or converting from Fit on first pinch).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum CanvasZoomPreset {
@@ -66,6 +68,10 @@ pub enum CanvasZoomPreset {
     #[default]
     OneHundred,
     FocusSelected,
+}
+
+fn default_view_scale() -> f32 {
+    1.0
 }
 
 /// Saved board viewport.
@@ -76,6 +82,10 @@ pub struct CanvasView {
     pub y: f32,
     #[serde(default)]
     pub zoom: CanvasZoomPreset,
+    /// Screen pixels per board unit when `zoom` is not `Fit`.
+    /// Updated by pinch / trackpad; presets reset it (100% → 1.0).
+    #[serde(default = "default_view_scale")]
+    pub scale: f32,
 }
 
 impl Default for CanvasView {
@@ -84,6 +94,7 @@ impl Default for CanvasView {
             x: -40.0,
             y: -40.0,
             zoom: CanvasZoomPreset::OneHundred,
+            scale: 1.0,
         }
     }
 }
