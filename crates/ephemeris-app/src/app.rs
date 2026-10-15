@@ -3243,6 +3243,9 @@ impl App {
             });
         }
 
+        // When true, md-viewer Back returns to Tasks instead of Search.
+        let md_viewer_return_tasks: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+
         // ── Edit requested → populate + show dialog ───────────────────────────
         {
             let tasks2 = tasks.clone();
@@ -3274,7 +3277,56 @@ impl App {
                     ui2.set_task_dialog_waiting(
                         t.waiting_for.clone().unwrap_or_default().as_str().into(),
                     );
+                    ui2.set_task_dialog_has_source_note(
+                        t.source_ref.as_ref().is_some_and(|r| !r.is_empty()),
+                    );
                     ui2.set_task_dialog_visible(true);
+                }
+            });
+        }
+
+        // ── View Obsidian source note for a task (md-viewer modal) ────────────
+        {
+            let tasks2 = tasks.clone();
+            let ui_rc = ui.clone();
+            let ui2 = ui.clone_component();
+            let cfg2 = config.clone();
+            let conns2 = connections.clone();
+            let ret = md_viewer_return_tasks.clone();
+            ui.on_task_view_source_note(move |id| {
+                let ts = tasks2.borrow();
+                let Some(t) = ts.iter().find(|t| t.id.0.to_string() == id) else {
+                    return;
+                };
+                let Some(source_ref) = t.source_ref.as_deref().filter(|r| !r.is_empty()) else {
+                    tracing::warn!("Task {id} has no source_ref");
+                    return;
+                };
+                let rel = match source_ref.rsplit_once(':') {
+                    Some((path, _)) => path,
+                    None => source_ref,
+                };
+                let Some(vault) = resolve_vault_path(&cfg2.borrow(), &conns2.borrow()) else {
+                    tracing::warn!("Cannot open task source note: no vault path");
+                    return;
+                };
+                match VaultFtsIndex::read_vault_file(&vault, rel) {
+                    Ok(md) => {
+                        let title = Path::new(rel)
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("Note")
+                            .to_string();
+                        let body = markdown_to_plain(&md);
+                        let blocks = markdown_to_blocks(&md);
+                        ui_rc.set_md_viewer(&title, &body, rel);
+                        ui_rc.set_md_viewer_blocks(&blocks);
+                        ui2.set_task_dialog_visible(false);
+                        ui2.set_show_search(false);
+                        ret.set(true);
+                        ui2.set_show_md_viewer(true);
+                    }
+                    Err(e) => tracing::warn!("Failed to open task source note {rel}: {e}"),
                 }
             });
         }
@@ -4071,6 +4123,80 @@ impl App {
             });
         }
 
+        // ── Page indicator buttons (burger menu; same flip rules as edge swipe) ─
+        {
+            let ui_rc = ui.clone();
+            let ui2 = ui.clone_component();
+            let notes2 = notes.clone();
+            let notebooks2 = notebooks.clone();
+            let note_seq2 = note_id_seq.clone();
+            let nb_seq2 = notebook_id_seq.clone();
+            let data_dir2 = data_dir.clone();
+            let vault_ex = vault_export.clone();
+            ui.on_page_next_tapped(move || {
+                // Menu-open disables `is_canvas_active`; indicator is only shown then.
+                if !ui_rc.is_note_canvas_page() {
+                    return;
+                }
+                let active = ui2.get_active_note_id().to_string();
+                let Ok(note_id) = active.parse::<u32>() else {
+                    return;
+                };
+                let mut ns = notes2.borrow_mut();
+                let Some(note) = ns.iter_mut().find(|n| n.id == note_id) else {
+                    return;
+                };
+                let target = note.doc_page + 1;
+                switch_note_doc_page(&ui_rc, &data_dir2, note, target, true);
+                drop(ns);
+                save_notes_index(
+                    &data_dir2,
+                    &notes2.borrow(),
+                    &notebooks2.borrow(),
+                    note_seq2.get(),
+                    nb_seq2.get(),
+                );
+                vault_ex.mark(note_id);
+            });
+        }
+        {
+            let ui_rc = ui.clone();
+            let ui2 = ui.clone_component();
+            let notes2 = notes.clone();
+            let notebooks2 = notebooks.clone();
+            let note_seq2 = note_id_seq.clone();
+            let nb_seq2 = notebook_id_seq.clone();
+            let data_dir2 = data_dir.clone();
+            let vault_ex = vault_export.clone();
+            ui.on_page_prev_tapped(move || {
+                if !ui_rc.is_note_canvas_page() {
+                    return;
+                }
+                let active = ui2.get_active_note_id().to_string();
+                let Ok(note_id) = active.parse::<u32>() else {
+                    return;
+                };
+                let mut ns = notes2.borrow_mut();
+                let Some(note) = ns.iter_mut().find(|n| n.id == note_id) else {
+                    return;
+                };
+                if note.doc_page == 0 {
+                    return;
+                }
+                let target = note.doc_page - 1;
+                switch_note_doc_page(&ui_rc, &data_dir2, note, target, false);
+                drop(ns);
+                save_notes_index(
+                    &data_dir2,
+                    &notes2.borrow(),
+                    &notebooks2.borrow(),
+                    note_seq2.get(),
+                    nb_seq2.get(),
+                );
+                vault_ex.mark(note_id);
+            });
+        }
+
         // ── Ring dismiss ──────────────────────────────────────────────────────
         {
             let ui2 = ui.clone_component();
@@ -4451,6 +4577,7 @@ impl App {
             let conns2 = connections.clone();
             let notes2 = notes.clone();
             let filter_rc = active_profile_filter.clone();
+            let ret = md_viewer_return_tasks.clone();
             ui.on_search_result_tapped(move |id, source| {
                 match source.as_str() {
                     "vault" => {
@@ -4471,6 +4598,7 @@ impl App {
                                 ui_rc.set_md_viewer(&title, &body, &id);
                                 ui_rc.set_md_viewer_blocks(&blocks);
                                 ui2.set_show_search(false);
+                                ret.set(false);
                                 ui2.set_show_md_viewer(true);
                             }
                             Err(e) => tracing::warn!("Failed to open vault note {id}: {e}"),
@@ -4520,12 +4648,19 @@ impl App {
             });
         }
 
-        // ── MD viewer back → search ───────────────────────────────────────────
+        // ── MD viewer back → search (or Tasks when opened from a task) ────────
         {
             let ui2 = ui.clone_component();
+            let ret = md_viewer_return_tasks.clone();
             ui.on_md_viewer_back(move || {
                 ui2.set_show_md_viewer(false);
-                ui2.set_show_search(true);
+                if ret.get() {
+                    ret.set(false);
+                    ui2.set_show_task_view(true);
+                    ui2.set_nav_section(2); // Tasks
+                } else {
+                    ui2.set_show_search(true);
+                }
             });
         }
 
@@ -5734,7 +5869,11 @@ impl WinitHandler {
             return;
         }
         if let Some(start_y) = self.chrome_swipe_start {
-            if !self.chrome_peeking && kiosk_enabled() && ly - start_y >= CHROME_SWIPE_MIN_DY {
+            if matches!(self.pointer_source, PointerSource::Pen) {
+                // Pen must never complete a panel-reveal gesture.
+                self.chrome_swipe_start = None;
+            } else if !self.chrome_peeking && kiosk_enabled() && ly - start_y >= CHROME_SWIPE_MIN_DY
+            {
                 self.chrome_swipe_start = None;
                 self.begin_chrome_peek();
                 return;
@@ -5816,7 +5955,13 @@ impl WinitHandler {
             return;
         }
 
-        if !self.chrome_peeking && kiosk_enabled() && ly <= CHROME_SWIPE_EDGE_Y {
+        // Finger/mouse only — pen near the top edge must not pull the Wayland
+        // panel (Mutter overview / GNOME top bar) while writing.
+        if !self.chrome_peeking
+            && kiosk_enabled()
+            && ly <= CHROME_SWIPE_EDGE_Y
+            && !matches!(self.pointer_source, PointerSource::Pen)
+        {
             self.chrome_swipe_start = Some(ly);
         } else {
             self.chrome_swipe_start = None;
@@ -8077,6 +8222,23 @@ fn scale_spans(
     spans
 }
 
+/// Scale stroke geometry from logical ink space onto the page-bin raster.
+fn scale_strokes_to_page(strokes: &mut [ephemeris_core::Stroke], from: (u32, u32), to: (u32, u32)) {
+    if from == to || from.0 == 0 || from.1 == 0 {
+        return;
+    }
+    let sx = to.0 as f32 / from.0 as f32;
+    let sy = to.1 as f32 / from.1 as f32;
+    let s_avg = (sx + sy) * 0.5;
+    for stroke in strokes {
+        stroke.base_width *= s_avg;
+        for p in &mut stroke.points {
+            p.x *= sx;
+            p.y *= sy;
+        }
+    }
+}
+
 fn read_page_bin(path: &Path) -> Option<(u32, u32, Vec<u8>)> {
     let data = std::fs::read(path).ok()?;
     if data.len() >= 12 && &data[0..4] == PAGE_BIN_MAGIC {
@@ -8386,6 +8548,16 @@ fn build_vault_note_export(
         let searchable_text = recognised_text
             .clone()
             .or_else(|| note.text_content.as_ref().map(|t| strip_inline_markdown(t)));
+        // Yellow highlighter in PDF: pass Highlighter strokes so export can
+        // multiply-blend classic marker yellow over the gray8 canvas (mono
+        // e-ink UI stays gray; colour PDF / colour e-ink viewers show yellow).
+        // Strokes live in logical ink space; scale onto the page-bin raster.
+        let mut highlight_strokes: Vec<_> = strokes
+            .iter()
+            .filter(|s| s.tool == Tool::Highlighter)
+            .cloned()
+            .collect();
+        scale_strokes_to_page(&mut highlight_strokes, (input.width, input.height), (w, h));
         let opts = PdfExportOptions {
             title: note.title.clone(),
             searchable_text,
@@ -8393,6 +8565,11 @@ fn build_vault_note_export(
                 vec![]
             } else {
                 vec![scale_spans(spans, (input.width, input.height), (w, h))]
+            },
+            page_highlight_strokes: if highlight_strokes.is_empty() {
+                vec![]
+            } else {
+                vec![highlight_strokes]
             },
         };
         match export_raster_pages_to_pdf(&[page], &pdf_abs, &opts) {
@@ -9920,24 +10097,27 @@ fn push_full_task_list_comp(
         Rc::new(slint::VecModel::from(
             entries
                 .iter()
-                .map(|(id, title, pl, pi, dl, ov, done, profile_id, lane)| {
-                    let (show_profile, profile_icon_char, has_custom, custom_icon) =
-                        profile_badge_for(profile_id, show_badges, mgr);
-                    ephemeris_ui::TaskViewEntry {
-                        id: id.as_str().into(),
-                        title: title.as_str().into(),
-                        priority_label: pl.as_str().into(),
-                        priority_int: *pi,
-                        due_label: dl.as_str().into(),
-                        overdue: *ov,
-                        done: *done,
-                        lane_label: lane.as_str().into(),
-                        show_profile,
-                        profile_icon_char: profile_icon_char.as_str().into(),
-                        has_custom_profile_icon: has_custom,
-                        custom_profile_icon: custom_icon,
-                    }
-                })
+                .map(
+                    |(id, title, pl, pi, dl, ov, done, profile_id, lane, has_source)| {
+                        let (show_profile, profile_icon_char, has_custom, custom_icon) =
+                            profile_badge_for(profile_id, show_badges, mgr);
+                        ephemeris_ui::TaskViewEntry {
+                            id: id.as_str().into(),
+                            title: title.as_str().into(),
+                            priority_label: pl.as_str().into(),
+                            priority_int: *pi,
+                            due_label: dl.as_str().into(),
+                            overdue: *ov,
+                            done: *done,
+                            lane_label: lane.as_str().into(),
+                            has_source_note: *has_source,
+                            show_profile,
+                            profile_icon_char: profile_icon_char.as_str().into(),
+                            has_custom_profile_icon: has_custom,
+                            custom_profile_icon: custom_icon,
+                        }
+                    },
+                )
                 .collect::<Vec<_>>(),
         ))
         .into(),
@@ -9981,7 +10161,7 @@ fn filter_tasks_by_query(tasks: &[Task], query: &str) -> Vec<Task> {
 /// Completed tasks older than this are hidden from the "all" filter.
 const CLOSED_TASK_RETENTION_SECS: u64 = 14 * 86_400;
 
-/// Slint task-list row: id, title, priority label, priority int, due, overdue, done, profile, lane.
+/// Slint task-list row: id, title, priority label, priority int, due, overdue, done, profile, lane, has_source_note.
 type TaskListRow = (
     String,
     String,
@@ -9992,6 +10172,7 @@ type TaskListRow = (
     bool,
     String,
     String,
+    bool,
 );
 
 /// True when `ts` falls on the same local calendar day as `now`.
@@ -10034,6 +10215,7 @@ fn build_full_task_list(tasks: &[Task], now: u64, filter: &str, sort: &str) -> V
             let pi = priority_to_int(t.priority);
             let pl = priority_label(t.priority);
             let (dl, ov) = format_due(t.due, now);
+            let has_source = t.source_ref.as_ref().is_some_and(|r| !r.is_empty());
             (
                 t.id.0.to_string(),
                 strip_inline_markdown(&t.title),
@@ -10044,6 +10226,7 @@ fn build_full_task_list(tasks: &[Task], now: u64, filter: &str, sort: &str) -> V
                 t.done,
                 t.profile_id.0.to_string(),
                 resolve_lane(t, "next"),
+                has_source,
             )
         })
         .collect();

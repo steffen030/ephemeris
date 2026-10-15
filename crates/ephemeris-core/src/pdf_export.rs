@@ -1,8 +1,14 @@
-//! PDF export of note pages (ephemeris-97x.1 / 97x.5).
+//! PDF export of note pages (ephemeris-97x.1 / 97x.5 / ephemeris-cev).
 //!
 //! Renders grayscale canvas rasters (and optionally vector strokes) into a
 //! multi-page PDF. When transcription spans are provided, they are embedded as
 //! an invisible selectable text layer (PDF text rendering mode 3).
+//!
+//! Highlighter strokes are painted as a classic yellow marker multiply over the
+//! RGB page so exports match highlighter-pen expectation on colour displays.
+//! On mono e-ink the live canvas stays mid-gray; colour e-ink panels that can
+//! show yellow would see this only if the device path rendered colour (PDF
+//! viewers and colour e-ink always show the yellow export).
 
 use crate::model::{Color, Stroke, Tool};
 use crate::transcriber::TextSpan;
@@ -14,6 +20,14 @@ use printpdf::{
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
+
+/// Classic highlighter-pen yellow (≈ Stabilo / Post-it marker).
+pub const HIGHLIGHTER_YELLOW: Color = Color {
+    r: 255,
+    g: 230,
+    b: 80,
+    a: 255,
+};
 
 /// One page of raster ink (8-bpp grayscale, 0 = black, 255 = white).
 #[derive(Debug, Clone)]
@@ -31,10 +45,23 @@ pub struct PdfExportOptions {
     pub searchable_text: Option<String>,
     /// Optional per-page positioned spans (from [`crate::Transcriber`]).
     pub page_spans: Vec<Vec<TextSpan>>,
+    /// Optional per-page highlighter strokes. When present, the gray8 page is
+    /// promoted to RGB and these strokes are multiply-blended in
+    /// [`HIGHLIGHTER_YELLOW`] so exported PDFs look like a yellow marker.
+    pub page_highlight_strokes: Vec<Vec<Stroke>>,
 }
 
 /// Stable content hash for incremental export skip (ephemeris-97x.2).
 pub fn raster_export_hash(pages: &[RasterPage], searchable_text: Option<&str>) -> String {
+    raster_export_hash_with_highlights(pages, searchable_text, &[])
+}
+
+/// Content hash including highlighter stroke geometry (yellow PDF layer).
+pub fn raster_export_hash_with_highlights(
+    pages: &[RasterPage],
+    searchable_text: Option<&str>,
+    highlight_pages: &[Vec<Stroke>],
+) -> String {
     let mut hasher = DefaultHasher::new();
     for page in pages {
         page.width.hash(&mut hasher);
@@ -42,6 +69,17 @@ pub fn raster_export_hash(pages: &[RasterPage], searchable_text: Option<&str>) -
         page.gray8.hash(&mut hasher);
     }
     searchable_text.unwrap_or("").hash(&mut hasher);
+    for strokes in highlight_pages {
+        for stroke in strokes {
+            stroke.base_width.to_bits().hash(&mut hasher);
+            stroke.points.len().hash(&mut hasher);
+            for p in &stroke.points {
+                p.x.to_bits().hash(&mut hasher);
+                p.y.to_bits().hash(&mut hasher);
+                p.pressure.to_bits().hash(&mut hasher);
+            }
+        }
+    }
     format!("{:016x}", hasher.finish())
 }
 
@@ -72,6 +110,9 @@ fn write_pdf_hash_sidecar(out_path: &Path, content_hash: &str) {
 ///
 /// When the content hash matches the previous export sidecar, returns `Ok(0)`
 /// without rewriting the file (incremental skip).
+///
+/// When [`PdfExportOptions::page_highlight_strokes`] contains highlighter
+/// strokes for a page, that page is embedded as RGB with yellow multiply marks.
 pub fn export_raster_pages_to_pdf(
     pages: &[RasterPage],
     out_path: &Path,
@@ -81,7 +122,11 @@ pub fn export_raster_pages_to_pdf(
         return Err(crate::AppError::InvalidInput("pdf export: no pages".into()));
     }
 
-    let hash = raster_export_hash(pages, opts.searchable_text.as_deref());
+    let hash = raster_export_hash_with_highlights(
+        pages,
+        opts.searchable_text.as_deref(),
+        &opts.page_highlight_strokes,
+    );
     if pdf_export_is_current(out_path, &hash) {
         return Ok(0);
     }
@@ -101,7 +146,14 @@ pub fn export_raster_pages_to_pdf(
             None
         };
         let spans = opts.page_spans.get(i).map(|s| s.as_slice()).unwrap_or(&[]);
-        let ops = build_raster_page_ops(&mut doc, page, page_w_mm, page_h_mm, full_text, spans)?;
+        let highlights = opts
+            .page_highlight_strokes
+            .get(i)
+            .map(|s| s.as_slice())
+            .unwrap_or(&[]);
+        let ops = build_raster_page_ops(
+            &mut doc, page, page_w_mm, page_h_mm, full_text, spans, highlights,
+        )?;
         pdf_pages.push(PdfPage::new(page_w_mm, page_h_mm, ops));
     }
 
@@ -180,6 +232,7 @@ fn build_raster_page_ops(
     page_h_mm: Mm,
     full_text: Option<&str>,
     spans: &[TextSpan],
+    highlight_strokes: &[Stroke],
 ) -> crate::Result<Vec<Op>> {
     let expected = (raster.width as usize).saturating_mul(raster.height as usize);
     if raster.gray8.len() < expected {
@@ -189,12 +242,33 @@ fn build_raster_page_ops(
         )));
     }
 
-    let image = RawImage {
-        pixels: RawImageData::U8(raster.gray8[..expected].to_vec()),
-        width: raster.width as usize,
-        height: raster.height as usize,
-        data_format: RawImageFormat::R8,
-        tag: Vec::new(),
+    let highlights: Vec<&Stroke> = highlight_strokes
+        .iter()
+        .filter(|s| s.tool == Tool::Highlighter && !s.points.is_empty())
+        .collect();
+
+    let image = if highlights.is_empty() {
+        RawImage {
+            pixels: RawImageData::U8(raster.gray8[..expected].to_vec()),
+            width: raster.width as usize,
+            height: raster.height as usize,
+            data_format: RawImageFormat::R8,
+            tag: Vec::new(),
+        }
+    } else {
+        let rgb = gray8_to_rgb_with_yellow_highlights(
+            &raster.gray8[..expected],
+            raster.width,
+            raster.height,
+            &highlights,
+        );
+        RawImage {
+            pixels: RawImageData::U8(rgb),
+            width: raster.width as usize,
+            height: raster.height as usize,
+            data_format: RawImageFormat::RGB8,
+            tag: Vec::new(),
+        }
     };
     let image_id = doc.add_image(&image);
 
@@ -219,6 +293,141 @@ fn build_raster_page_ops(
         spans,
     ));
     Ok(ops)
+}
+
+/// Promote gray8 → RGB and multiply-blend highlighter coverage in yellow.
+///
+/// Live canvas stays mid-gray for mono e-ink; PDF (and colour viewers /
+/// colour e-ink) get a typical yellow marker look while black ink stays dark
+/// under the multiply.
+pub fn gray8_to_rgb_with_yellow_highlights(
+    gray8: &[u8],
+    width: u32,
+    height: u32,
+    highlights: &[&Stroke],
+) -> Vec<u8> {
+    let n = (width as usize).saturating_mul(height as usize);
+    let mut rgb = Vec::with_capacity(n.saturating_mul(3));
+    for &g in gray8.iter().take(n) {
+        rgb.push(g);
+        rgb.push(g);
+        rgb.push(g);
+    }
+    if highlights.is_empty() || width == 0 || height == 0 {
+        return rgb;
+    }
+
+    let mut coverage = vec![0.0f32; n];
+    for stroke in highlights {
+        stamp_highlighter_coverage(&mut coverage, width, height, stroke);
+    }
+
+    let yr = HIGHLIGHTER_YELLOW.r as f32;
+    let yg = HIGHLIGHTER_YELLOW.g as f32;
+    let yb = HIGHLIGHTER_YELLOW.b as f32;
+    for (i, cov) in coverage.iter().copied().enumerate() {
+        if cov <= 0.0 {
+            continue;
+        }
+        let c = cov.clamp(0.0, 1.0);
+        let o = i * 3;
+        // Multiply blend: base * lerp(1, yellow/255, coverage).
+        let fr = 1.0 - c + c * (yr / 255.0);
+        let fg = 1.0 - c + c * (yg / 255.0);
+        let fb = 1.0 - c + c * (yb / 255.0);
+        rgb[o] = (rgb[o] as f32 * fr).round().clamp(0.0, 255.0) as u8;
+        rgb[o + 1] = (rgb[o + 1] as f32 * fg).round().clamp(0.0, 255.0) as u8;
+        rgb[o + 2] = (rgb[o + 2] as f32 * fb).round().clamp(0.0, 255.0) as u8;
+    }
+    rgb
+}
+
+fn stamp_highlighter_coverage(coverage: &mut [f32], width: u32, height: u32, stroke: &Stroke) {
+    let points = &stroke.points;
+    if points.is_empty() {
+        return;
+    }
+    if points.len() == 1 {
+        let p = &points[0];
+        stamp_capsule_coverage(
+            coverage,
+            width,
+            height,
+            p.x,
+            p.y,
+            half_width(stroke.base_width, p.pressure),
+            p.x,
+            p.y,
+            half_width(stroke.base_width, p.pressure),
+        );
+        return;
+    }
+    for w in points.windows(2) {
+        let (a, b) = (&w[0], &w[1]);
+        stamp_capsule_coverage(
+            coverage,
+            width,
+            height,
+            a.x,
+            a.y,
+            half_width(stroke.base_width, a.pressure),
+            b.x,
+            b.y,
+            half_width(stroke.base_width, b.pressure),
+        );
+    }
+}
+
+#[inline]
+fn half_width(base_width: f32, pressure: f32) -> f32 {
+    // Match default WidthConfig loosely: width ≈ base * (0.5 + 0.5*pressure).
+    let w = base_width.max(0.5) * (0.5 + 0.5 * pressure.clamp(0.0, 1.0));
+    w * 0.5
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stamp_capsule_coverage(
+    coverage: &mut [f32],
+    width: u32,
+    height: u32,
+    ax: f32,
+    ay: f32,
+    hw_a: f32,
+    bx: f32,
+    by: f32,
+    hw_b: f32,
+) {
+    let pad = hw_a.max(hw_b) + 1.0;
+    let min_x = (ax.min(bx) - pad).floor().max(0.0) as i64;
+    let min_y = (ay.min(by) - pad).floor().max(0.0) as i64;
+    let max_x = ((ax.max(bx) + pad).ceil() as i64).min(width as i64 - 1);
+    let max_y = ((ay.max(by) + pad).ceil() as i64).min(height as i64 - 1);
+    if max_x < min_x || max_y < min_y {
+        return;
+    }
+    let dx = bx - ax;
+    let dy = by - ay;
+    let len_sq = dx * dx + dy * dy;
+    let inv_len_sq = if len_sq < 1e-8 { 0.0 } else { 1.0 / len_sq };
+    let stride = width as usize;
+
+    for py in min_y..=max_y {
+        let cy = py as f32 + 0.5;
+        let row = py as usize * stride;
+        for px in min_x..=max_x {
+            let cx = px as f32 + 0.5;
+            let t = (((cx - ax) * dx + (cy - ay) * dy) * inv_len_sq).clamp(0.0, 1.0);
+            let qx = ax + t * dx;
+            let qy = ay + t * dy;
+            let dist = ((cx - qx).powi(2) + (cy - qy).powi(2)).sqrt();
+            let hw = hw_a + (hw_b - hw_a) * t;
+            let cov = (hw + 0.5 - dist).clamp(0.0, 1.0);
+            if cov > 0.0 {
+                let i = row + px as usize;
+                coverage[i] = coverage[i].max(cov);
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -252,7 +461,7 @@ fn build_stroke_page_ops(
                 }
             })
             .collect();
-        let (r, g, b) = color_to_rgb(stroke.color);
+        let (r, g, b) = stroke_pdf_rgb(stroke);
         let width_pt = Pt(stroke.base_width.max(0.5) * sx * 2.83465); // mm→approx via scale
         ops.push(Op::SetOutlineColor {
             col: PdfColor::Rgb(Rgb::new(r, g, b, None)),
@@ -270,6 +479,13 @@ fn build_stroke_page_ops(
         page_w_mm, page_h_mm, canvas_w, canvas_h, full_text, spans,
     ));
     ops
+}
+
+fn stroke_pdf_rgb(stroke: &Stroke) -> (f32, f32, f32) {
+    if stroke.tool == Tool::Highlighter {
+        return color_to_rgb(HIGHLIGHTER_YELLOW);
+    }
+    color_to_rgb(stroke.color)
 }
 
 fn embed_text_ops(
@@ -359,6 +575,7 @@ pub fn pdf_has_text_show_ops(pdf_bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{Color, Point, Tool};
     use crate::transcriber::TextSpan;
     use tempfile::TempDir;
 
@@ -382,6 +599,7 @@ mod tests {
                 title: "Test".into(),
                 searchable_text: Some("machine readable hello".into()),
                 page_spans: vec![],
+                page_highlight_strokes: vec![],
             },
         )
         .unwrap();
@@ -411,6 +629,7 @@ mod tests {
                 title: "Spans".into(),
                 searchable_text: None,
                 page_spans: spans,
+                page_highlight_strokes: vec![],
             },
         )
         .unwrap();
@@ -421,7 +640,6 @@ mod tests {
 
     #[test]
     fn export_strokes_produces_pdf() {
-        use crate::model::{Color, Point, Tool};
         let tmp = TempDir::new().unwrap();
         let out = tmp.path().join("strokes.pdf");
         let mut stroke = Stroke::new(Tool::Pen, Color::BLACK, 2.0);
@@ -443,6 +661,68 @@ mod tests {
     }
 
     #[test]
+    fn yellow_highlight_tint_preserves_black_ink() {
+        let mut page = blank_page(40, 20);
+        // Simulate mid-gray highlighter already baked into gray8 + black ink.
+        for x in 5..35 {
+            for y in 8..12 {
+                page.gray8[(y * 40 + x) as usize] = 160;
+            }
+        }
+        page.gray8[(10 * 40 + 20) as usize] = 0; // black pen on top
+
+        let mut hi = Stroke::new(Tool::Highlighter, Color::BLACK, 8.0);
+        hi.points = vec![
+            Point::new(5.0, 10.0, 1.0, 0.0, 0),
+            Point::new(35.0, 10.0, 1.0, 0.0, 10),
+        ];
+        let rgb = gray8_to_rgb_with_yellow_highlights(&page.gray8, page.width, page.height, &[&hi]);
+        // White far from stroke stays white.
+        assert_eq!(&rgb[0..3], &[255, 255, 255]);
+        // Black ink pixel stays near-black under multiply.
+        let bi = ((10 * 40 + 20) * 3) as usize;
+        assert!(rgb[bi] < 40 && rgb[bi + 1] < 40 && rgb[bi + 2] < 40);
+        // A highlighted white-ish neighbour picks up yellow (G and B drop vs R).
+        let yi = ((10 * 40 + 10) * 3) as usize;
+        assert!(rgb[yi] > rgb[yi + 2], "yellow: R should exceed B");
+        assert!(rgb[yi + 1] > rgb[yi + 2], "yellow: G should exceed B");
+    }
+
+    #[test]
+    fn export_with_highlights_writes_rgb_pdf() {
+        let tmp = TempDir::new().unwrap();
+        let out = tmp.path().join("hi.pdf");
+        let pages = vec![blank_page(60, 40)];
+        let mut hi = Stroke::new(Tool::Highlighter, Color::BLACK, 10.0);
+        hi.points = vec![
+            Point::new(5.0, 20.0, 1.0, 0.0, 0),
+            Point::new(55.0, 20.0, 1.0, 0.0, 10),
+        ];
+        let n = export_raster_pages_to_pdf(
+            &pages,
+            &out,
+            &PdfExportOptions {
+                title: "Hi".into(),
+                searchable_text: None,
+                page_spans: vec![],
+                page_highlight_strokes: vec![vec![hi]],
+            },
+        )
+        .unwrap();
+        assert_eq!(n, 1);
+        let bytes = std::fs::read(&out).unwrap();
+        assert!(bytes.starts_with(b"%PDF"));
+        // DeviceRGB / colour space should appear for the yellow page.
+        let as_str = String::from_utf8_lossy(&bytes);
+        assert!(
+            as_str.contains("DeviceRGB")
+                || as_str.contains("/CS")
+                || bytes.windows(3).any(|w| w == b"RGB"),
+            "expected colour PDF embedding for yellow highlighter"
+        );
+    }
+
+    #[test]
     fn incremental_export_skips_unchanged() {
         let tmp = TempDir::new().unwrap();
         let out = tmp.path().join("incr.pdf");
@@ -451,6 +731,7 @@ mod tests {
             title: "Incr".into(),
             searchable_text: Some("stable".into()),
             page_spans: vec![],
+            page_highlight_strokes: vec![],
         };
         assert_eq!(export_raster_pages_to_pdf(&pages, &out, &opts).unwrap(), 1);
         let first = std::fs::metadata(&out).unwrap().modified().unwrap();
