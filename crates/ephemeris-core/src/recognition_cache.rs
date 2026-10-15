@@ -680,6 +680,35 @@ pub fn lower_thread_nice_priority() {
     }
 }
 
+/// Create RTen's global inference pool from a low-priority thread, one core short.
+///
+/// RTen sizes its rayon pool to every physical core and creates it lazily from
+/// whichever thread first runs a model; the workers then run at that thread's
+/// priority. On the 4-core PineNote that let background HTR starve the UI
+/// thread and the evdev pen reader (lag, dropped strokes, Mutter's "not
+/// responding" dialog). Rayon workers inherit the creating thread's nice level,
+/// so build the pool here, before any model runs. Call once at startup, before
+/// other threads exist (sets `RTEN_NUM_THREADS` unless the user did).
+#[cfg(feature = "htr")]
+pub fn init_background_inference_pool() {
+    if std::env::var_os("RTEN_NUM_THREADS").is_none() {
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        std::env::set_var(
+            "RTEN_NUM_THREADS",
+            cores.saturating_sub(1).max(1).to_string(),
+        );
+    }
+    let init = std::thread::Builder::new()
+        .name("rten-pool-init".into())
+        .spawn(|| {
+            lower_thread_nice_priority();
+            let _ = rten::thread_pool();
+        });
+    if let Ok(handle) = init {
+        let _ = handle.join();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

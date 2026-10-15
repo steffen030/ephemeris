@@ -15,14 +15,18 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, UNIX_EPOCH};
 
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{unbounded, Receiver, Sender};
 use evdev::{AbsoluteAxisCode, Device, EventSummary, KeyCode, PropType};
 
 use super::stylus_map::{digitizer_to_window, window_to_ui};
 use super::wake_coalesce::WakeCoalesce;
 use super::{InputEvent, PenSample};
 
-const CHANNEL_CAPACITY: usize = 256;
+/// Hover samples are dropped once this many events are queued (UI thread busy).
+///
+/// Contact events (down/move/up/button) are never dropped: the channel is
+/// unbounded, so a stalled UI thread delays ink but cannot lose strokes.
+const HOVER_BACKLOG_LIMIT: usize = 64;
 
 /// Live geometry the pen coordinates should be mapped into.
 ///
@@ -94,7 +98,7 @@ impl EvdevPenSource {
     pub fn spawn(target: Arc<PenTarget>, wake: Option<PenWake>) -> Option<Self> {
         let path = find_pen_device()?;
         let path_log = path.display().to_string();
-        let (tx, rx) = bounded(CHANNEL_CAPACITY);
+        let (tx, rx) = unbounded();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_w = Arc::clone(&stop);
         let wake_coalesce = Arc::new(WakeCoalesce::new());
@@ -201,7 +205,10 @@ fn emit(
     wake_coalesce: &WakeCoalesce,
     event: InputEvent,
 ) {
-    if tx.try_send(event).is_ok() {
+    if matches!(event, InputEvent::Hover { .. }) && tx.len() >= HOVER_BACKLOG_LIMIT {
+        return;
+    }
+    if tx.send(event).is_ok() {
         if let Some(w) = wake {
             wake_coalesce.request(|| w());
         }
@@ -406,5 +413,62 @@ fn sample(
         tilt: 0.0,
         in_range: true,
         t_us,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pen(x: f32) -> PenSample {
+        PenSample {
+            x,
+            y: 0.0,
+            pressure: 0.5,
+            tilt: 0.0,
+            in_range: true,
+            t_us: 0,
+        }
+    }
+
+    #[test]
+    fn backlog_drops_hover_but_never_contact_events() {
+        let (tx, rx) = unbounded();
+        let wake_coalesce = WakeCoalesce::new();
+        let total = HOVER_BACKLOG_LIMIT * 4;
+        emit(&tx, &None, &wake_coalesce, InputEvent::PenDown(pen(0.0)));
+        for i in 0..total {
+            emit(
+                &tx,
+                &None,
+                &wake_coalesce,
+                InputEvent::PenMove(pen(i as f32)),
+            );
+            emit(
+                &tx,
+                &None,
+                &wake_coalesce,
+                InputEvent::Hover {
+                    x: 0.0,
+                    y: 0.0,
+                    t_us: 0,
+                },
+            );
+        }
+        emit(&tx, &None, &wake_coalesce, InputEvent::PenUp(pen(0.0)));
+
+        let events: Vec<InputEvent> = rx.try_iter().collect();
+        let moves = events
+            .iter()
+            .filter(|e| matches!(e, InputEvent::PenMove(_)))
+            .count();
+        let hovers = events
+            .iter()
+            .filter(|e| matches!(e, InputEvent::Hover { .. }))
+            .count();
+        assert!(matches!(events.first(), Some(InputEvent::PenDown(_))));
+        assert!(matches!(events.last(), Some(InputEvent::PenUp(_))));
+        assert_eq!(moves, total);
+        assert!(hovers < total);
     }
 }
