@@ -20,6 +20,7 @@ pub mod refresh;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 pub mod store;
+pub use store::StrokePage;
 pub mod text_format;
 
 pub use action::{Action, ActionMap, ActionRouter, CanvasPoint, DefaultActionMap, RouterOutput};
@@ -60,7 +61,10 @@ pub fn init_tracing() {
 #[cfg(feature = "caldav")]
 pub mod caldav;
 pub mod calendar_cache;
+pub mod canvas_render;
+pub mod canvas_store;
 pub mod htr_eval;
+pub mod json_canvas;
 pub mod layout_detect;
 pub mod line_htr;
 pub mod local_task_store;
@@ -69,6 +73,7 @@ pub mod note_search;
 pub mod note_tasks;
 pub mod obsidian;
 pub mod pdf_export;
+pub mod png_gray8;
 pub mod prioritizer;
 pub mod profile_manager;
 pub mod recognition_cache;
@@ -89,7 +94,20 @@ pub use aggregation::AggregationService;
 #[cfg(feature = "caldav")]
 pub use caldav::{default_sync_window, CalDavCalendar, CalDavClient, CalDavConfig};
 pub use calendar_cache::CalendarCache;
+pub use canvas_render::{
+    hit_side, hit_test, render_board, snap_grid, view_for_fit, view_for_focus, Viewport,
+};
+pub use canvas_store::{
+    canvas_data_dir, card_page_path, card_strokes_path, card_text_path, delete_canvas_files,
+    load_canvas_doc, load_canvas_index, load_card_page_pixels, load_card_strokes, load_card_text,
+    save_canvas_doc, save_canvas_index, save_card_page_pixels, save_card_strokes, save_card_text,
+    AppCanvasFolder, AppCanvasMeta, CanvasDoc, CanvasIndex, CanvasView, CanvasZoomPreset,
+};
 pub use ink_layout::{classify_mark_strokes, split_page_ink, MarkKind, MarkStroke, PageInk};
+pub use json_canvas::{
+    new_canvas_id, BackgroundStyle, CanvasColor, CanvasEdge, CanvasNode, EdgeEnd, FileNode,
+    GroupNode, JsonCanvas, LinkNode, NodeSide, TextNode,
+};
 pub use layout_detect::{detect_line_formats, DetectedLine, LayoutLine};
 pub use line_htr::{
     prepare_line_htr_input, split_ink_line_bands, ImageLineBand, LineHtrInput, DE_HTR_V2_ALPHABET,
@@ -112,6 +130,7 @@ pub use pdf_export::{
     pdf_export_is_current, raster_export_hash, raster_export_hash_with_highlights,
     PdfExportOptions, RasterPage, HIGHLIGHTER_YELLOW,
 };
+pub use png_gray8::gray8_to_png;
 pub use prioritizer::{rank_tasks, task_score};
 #[cfg(feature = "htr")]
 pub use recognition_cache::init_background_inference_pool;
@@ -153,8 +172,10 @@ pub use user_lexicon::{
     USER_LEXICON_REFRESH_INTERVAL,
 };
 pub use vault_export::{
-    export_note_markdown, notebook_export_dir, notebook_export_rel, path_under_export_subdir,
-    sync_notes_to_vault, VaultNoteExport, DEFAULT_EXPORT_SUBDIR, NOTES_EXPORT_FOLDER,
+    canvas_export_dir, canvas_export_rel, export_canvas_json, export_note_markdown,
+    notebook_export_dir, notebook_export_rel, path_under_export_subdir, sync_canvases_to_vault,
+    sync_notes_to_vault, VaultCanvasExport, VaultNoteExport, CANVAS_EXPORT_FOLDER,
+    DEFAULT_EXPORT_SUBDIR, NOTES_EXPORT_FOLDER,
 };
 pub use vault_git::{
     commit_and_push as vault_git_commit_and_push, is_git_repo, pull as vault_git_pull,
