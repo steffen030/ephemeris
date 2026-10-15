@@ -290,6 +290,8 @@ export struct CanvasEntry {
     id: string,
     title: string,
     date-label: string,
+    has-preview: bool,
+    preview: image,
     /// Show owning-profile badge (All aggregator view).
     show-profile: bool,
     profile-icon-char: string,
@@ -516,6 +518,15 @@ export component EphemerisPage inherits Window {
     callback canvas-rename-request(string, string); // kind, id
     callback canvas-rename-confirm(string, string, string); // kind, id, title
     callback canvas-rename-cancel();
+    in-out property <string> canvas-search-query: "";
+    callback canvas-search-changed(string);
+    callback canvas-folder-quick-new(string);
+    callback canvas-folder-delete-tapped(string);
+    callback canvas-delete-tapped(string);
+    callback canvas-move-confirm(string, string); // canvas id, folder id ("0" = root)
+    callback canvas-folder-delete-confirm(string);
+    /// All canvas folders (move dialog), as NotebookEntry for the shared dialog.
+    in property <[NotebookEntry]> canvas-move-folder-list: [];
     in-out property <bool> show-search: false;
     in-out property <bool> show-md-viewer: false;
 
@@ -760,6 +771,8 @@ export component EphemerisPage inherits Window {
 
     // ── Folder delete confirmation ────────────────────────────────────────
     in-out property <bool> notebook-delete-visible: false;
+    /// "note" | "canvas" — the folder delete dialog is shared by both browsers.
+    in-out property <string> notebook-delete-kind: "note";
     in-out property <string> notebook-delete-id: "";
     in-out property <string> notebook-delete-title: "";
     in-out property <string> notebook-delete-message: "";
@@ -786,6 +799,8 @@ export component EphemerisPage inherits Window {
     // ── Note move dialog ──────────────────────────────────────────────────
     in-out property <bool> note-move-visible: false;
     in-out property <string> note-move-note-id: "";
+    /// "note" | "canvas" — the move dialog is shared by both browsers.
+    in-out property <string> note-move-kind: "note";
 
     callback note-move-confirm(string, string);
     callback note-move-cancel();
@@ -2255,6 +2270,7 @@ export component EphemerisPage inherits Window {
                                     TouchArea {
                                         width: parent.width; height: parent.height;
                                         clicked => {
+                                            root.note-move-kind = "note";
                                             root.note-move-note-id = note.id;
                                             root.note-move-visible = true;
                                         }
@@ -3844,6 +3860,8 @@ export component EphemerisPage inherits Window {
 
 
     // ── Canvas browser (folders + canvases) ───────────────────────────────
+    // Mirrors the Notes browser (notebook-list-view): same header, search,
+    // row actions and gallery — keep the two in sync.
     canvas-browser-view := Rectangle {
         visible: root.show-canvas-folder-list || root.show-canvas-list;
         x: root.nav-w; y: 0;
@@ -3851,15 +3869,18 @@ export component EphemerisPage inherits Window {
         height: parent.height;
         background: EinkTheme.canvas-bg;
         clip: true;
+
+        // 3-up on PineNote portrait; preview pane matches board frame (~3∶4).
         property <int> gallery-cols: 3;
         property <length> gallery-gap: 8px;
         property <length> gallery-col-w: (self.width - gallery-gap * (gallery-cols + 1)) / gallery-cols;
-        property <length> gallery-preview-h: gallery-col-w * 3 / 4;
+        property <length> gallery-preview-h: gallery-col-w * 4 / 3;
         property <length> gallery-caption-h: 40px;
         property <length> gallery-row-h: gallery-preview-h + gallery-caption-h + gallery-gap;
 
         VerticalLayout {
             padding: 0px; spacing: 0px;
+
             Rectangle {
                 height: 44px;
                 background: EinkTheme.canvas-bg;
@@ -3867,161 +3888,423 @@ export component EphemerisPage inherits Window {
                     padding-left: 8px; padding-right: 8px;
                     padding-top: 6px; padding-bottom: 6px;
                     spacing: 6px;
-                    Rectangle {
+
+                    if !root.canvas-at-root: Rectangle {
                         width: 40px; height: 32px;
                         background: EinkTheme.btn-bg;
-                        border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                        border-radius: 4px; border-width: 2px;
+                        border-color: EinkTheme.btn-border;
                         Text {
-                            text: Icons.back; font-family: "Material Icons"; font-size: 20px;
-                            color: EinkTheme.btn-fg;
+                            text: Icons.back;
+                            font-family: "Material Icons";
+                            font-size: 20px; color: EinkTheme.btn-fg;
                             horizontal-alignment: center; vertical-alignment: center;
                             width: parent.width; height: parent.height;
                         }
-                        TouchArea { clicked => { root.canvas-browser-back-tapped(); } }
+                        TouchArea {
+                            width: parent.width; height: parent.height;
+                            clicked => { root.canvas-browser-back-tapped(); }
+                        }
                     }
+
                     Text {
                         text: root.canvas-browser-title;
-                        font-size: 15px; font-weight: 700; color: EinkTheme.btn-fg;
-                        vertical-alignment: center; horizontal-stretch: 1; overflow: elide;
+                        font-size: 15px; font-weight: 700;
+                        color: EinkTheme.btn-fg;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        overflow: elide;
                     }
+
+                    // Sort cycle: edited → title → created
                     Rectangle {
-                        width: 48px; height: 32px;
+                        width: 64px; height: 32px;
                         background: EinkTheme.btn-bg;
-                        border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
-                        Text {
-                            text: root.canvas-sort-mode == "title" ? "A-Z"
-                                : (root.canvas-sort-mode == "created" ? "New" : "Edit");
-                            font-size: 11px; color: EinkTheme.btn-fg;
-                            horizontal-alignment: center; vertical-alignment: center;
+                        border-radius: 4px; border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        HorizontalLayout {
+                            padding-left: 4px; padding-right: 4px;
+                            spacing: 2px; alignment: center;
+                            Text {
+                                text: Icons.sort;
+                                font-family: "Material Icons";
+                                font-size: 16px; color: EinkTheme.btn-fg;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                text: root.canvas-sort-mode == "title" ? "A-Z"
+                                    : (root.canvas-sort-mode == "created" ? "New" : "Edit");
+                                font-size: 10px; color: EinkTheme.btn-fg;
+                                vertical-alignment: center;
+                            }
                         }
-                        TouchArea { clicked => { root.canvas-sort-toggled(); } }
+                        TouchArea {
+                            width: parent.width; height: parent.height;
+                            clicked => { root.canvas-sort-toggled(); }
+                        }
                     }
+
+                    // List / gallery toggle — text label so meaning is clear on eink
                     Rectangle {
-                        width: 48px; height: 32px;
+                        width: 56px; height: 32px;
                         background: EinkTheme.btn-bg;
-                        border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                        border-radius: 4px; border-width: 2px;
+                        border-color: EinkTheme.btn-border;
                         Text {
                             text: root.canvas-view-mode == "gallery" ? "List" : "Grid";
-                            font-size: 11px; color: EinkTheme.btn-fg;
+                            font-size: 12px; color: EinkTheme.btn-fg;
                             horizontal-alignment: center; vertical-alignment: center;
                         }
-                        TouchArea { clicked => { root.canvas-view-mode-toggled(); } }
+                        TouchArea {
+                            width: parent.width; height: parent.height;
+                            clicked => { root.canvas-view-mode-toggled(); }
+                        }
                     }
+
                     Rectangle {
                         width: 72px; height: 32px;
                         background: EinkTheme.btn-bg;
-                        border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
-                        Text { text: "+ Folder"; font-size: 12px; color: EinkTheme.btn-fg;
-                               horizontal-alignment: center; vertical-alignment: center; }
-                        TouchArea { clicked => { root.canvas-folder-new-tapped(); } }
+                        border-radius: 4px; border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        Text {
+                            text: "+ Folder";
+                            font-size: 12px; color: EinkTheme.btn-fg;
+                            horizontal-alignment: center; vertical-alignment: center;
+                        }
+                        TouchArea {
+                            width: parent.width; height: parent.height;
+                            clicked => { root.canvas-folder-new-tapped(); }
+                        }
                     }
+
                     Rectangle {
                         width: 72px; height: 32px;
                         background: EinkTheme.btn-active-bg;
-                        border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
-                        Text { text: "+ Canvas"; font-size: 12px; color: EinkTheme.btn-active-fg;
-                               horizontal-alignment: center; vertical-alignment: center; }
-                        TouchArea { clicked => { root.canvas-new-tapped(); } }
+                        border-radius: 4px; border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        Text {
+                            text: "+ Canvas";
+                            font-size: 12px; color: EinkTheme.btn-active-fg;
+                            horizontal-alignment: center; vertical-alignment: center;
+                        }
+                        TouchArea {
+                            width: parent.width; height: parent.height;
+                            clicked => { root.canvas-new-tapped(); }
+                        }
                     }
                 }
             }
+
+            // Search within current folder
+            Rectangle {
+                height: 40px;
+                background: EinkTheme.canvas-bg;
+                HorizontalLayout {
+                    padding-left: 8px; padding-right: 8px;
+                    padding-top: 4px; padding-bottom: 4px;
+                    spacing: 6px;
+                    Text {
+                        text: Icons.search;
+                        font-family: "Material Icons";
+                        font-size: 18px; color: EinkTheme.text-secondary;
+                        vertical-alignment: center; width: 24px;
+                    }
+                    Rectangle {
+                        horizontal-stretch: 1; height: 32px;
+                        background: EinkTheme.btn-bg;
+                        border-radius: 4px; border-width: 1px;
+                        border-color: EinkTheme.chrome-border;
+                        Text {
+                            visible: root.canvas-search-query == "";
+                            x: 8px; y: 0;
+                            width: parent.width - 16px; height: parent.height;
+                            text: "Search canvases in this folder…";
+                            font-size: 13px; color: EinkTheme.text-secondary;
+                            vertical-alignment: center;
+                        }
+                        TextInput {
+                            x: 8px; y: 0;
+                            width: parent.width - 16px; height: parent.height;
+                            font-size: 13px; color: EinkTheme.btn-fg;
+                            text <=> root.canvas-search-query;
+                            edited => { root.canvas-search-changed(self.text); }
+                            accepted => { root.canvas-search-changed(self.text); }
+                        }
+                    }
+                }
+            }
+
             Rectangle { height: 2px; background: EinkTheme.chrome-border; }
+
+            // Scrollable folder + canvas content
             Flickable {
-                content-height: folders-col.preferred-height
-                    + (root.canvas-view-mode == "gallery"
-                        ? (((root.canvas-list.length + canvas-browser-view.gallery-cols - 1)
-                            / canvas-browser-view.gallery-cols) * canvas-browser-view.gallery-row-h)
-                        : (root.canvas-list.length * 56px))
-                    + 24px;
-                VerticalLayout {
-                    padding: 8px; spacing: 4px;
-                    folders-col := VerticalLayout {
-                        spacing: 4px;
-                        for f in root.canvas-folder-list: Rectangle {
-                            height: 52px;
-                            background: EinkTheme.btn-bg;
-                            border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
-                            HorizontalLayout {
-                                padding-left: 10px; padding-right: 10px; spacing: 8px;
-                                Text {
-                                    text: Icons.folder; font-family: "Material Icons"; font-size: 22px;
-                                    color: EinkTheme.btn-fg; vertical-alignment: center;
-                                }
-                                if f.show-profile: ProfileIcon {
-                                    icon-char: f.profile-icon-char;
-                                    has-custom: f.has-custom-profile-icon;
-                                    custom-icon: f.custom-profile-icon;
-                                    size: 18px; fg: EinkTheme.text-secondary;
-                                }
+                vertical-stretch: 1;
+                content-width: canvas-browser-view.width;
+                content-height: canvas-scroll-col.preferred-height;
+
+                canvas-scroll-col := VerticalLayout {
+                    spacing: 0px; padding: 0px;
+                    width: canvas-browser-view.width;
+
+                    // ── Folders at this level ─────────────────────────────
+                    for nb[i] in root.canvas-folder-list: Rectangle {
+                        height: 56px;
+                        width: canvas-browser-view.width;
+                        background: EinkTheme.canvas-bg;
+
+                        HorizontalLayout {
+                            padding-left: 12px; padding-right: 8px;
+                            padding-top: 8px; padding-bottom: 8px;
+                            spacing: 6px;
+
+                            Text {
+                                text: Icons.folder;
+                                font-family: "Material Icons";
+                                font-size: 22px; color: EinkTheme.btn-fg;
+                                vertical-alignment: center;
+                                width: 28px;
+                            }
+
+                            if nb.show-profile: ProfileIcon {
+                                icon-char: nb.profile-icon-char;
+                                has-custom: nb.has-custom-profile-icon;
+                                custom-icon: nb.custom-profile-icon;
+                                size: 20px; fg: EinkTheme.text-secondary;
+                            }
+
+                            Rectangle {
+                                horizontal-stretch: 1;
+                                background: transparent;
+
                                 VerticalLayout {
-                                    alignment: center; spacing: 2px; horizontal-stretch: 1;
-                                    Text { text: f.title; font-size: 14px; font-weight: 600; color: EinkTheme.btn-fg; overflow: elide; }
+                                    spacing: 2px; alignment: center;
+
                                     Text {
-                                        text: "Open folder";
+                                        text: nb.title;
+                                        font-size: 15px; color: EinkTheme.btn-fg;
+                                        overflow: elide;
+                                    }
+                                    Text {
+                                        text: nb.canvas-count + " canvas" + (nb.canvas-count == 1 ? "" : "es")
+                                            + (nb.folder-count > 0
+                                                ? (" · " + nb.folder-count + " folder" + (nb.folder-count == 1 ? "" : "s"))
+                                                : "");
                                         font-size: 11px; color: EinkTheme.text-secondary;
                                     }
                                 }
+                                TouchArea {
+                                    width: parent.width; height: parent.height;
+                                    clicked => { root.canvas-folder-tapped(nb.id); }
+                                }
                             }
-                            TouchArea { clicked => { root.canvas-folder-tapped(f.id); } }
+
                             Rectangle {
-                                x: parent.width - 44px; y: 8px; width: 36px; height: 36px;
+                                width: 36px;
                                 background: transparent;
                                 Text {
-                                    text: Icons.edit; font-family: "Material Icons"; font-size: 18px;
-                                    color: EinkTheme.btn-fg;
-                                    horizontal-alignment: center; vertical-alignment: center;
-                                    width: parent.width; height: parent.height;
+                                    text: Icons.note-add;
+                                    font-family: "Material Icons";
+                                    font-size: 22px;
+                                    color: EinkTheme.text-secondary;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                    width: parent.width;
+                                    height: parent.height;
                                 }
-                                TouchArea { clicked => { root.canvas-rename-request("folder", f.id); } }
+                                TouchArea {
+                                    width: parent.width; height: parent.height;
+                                    clicked => { root.canvas-folder-quick-new(nb.id); }
+                                }
+                            }
+
+                            Rectangle {
+                                width: 36px;
+                                background: transparent;
+                                Text {
+                                    text: Icons.rename;
+                                    font-family: "Material Icons";
+                                    font-size: 20px;
+                                    color: EinkTheme.text-secondary;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                    width: parent.width;
+                                    height: parent.height;
+                                }
+                                TouchArea {
+                                    width: parent.width; height: parent.height;
+                                    clicked => { root.canvas-rename-request("folder", nb.id); }
+                                }
+                            }
+
+                            Rectangle {
+                                width: 36px;
+                                background: transparent;
+                                Text {
+                                    text: Icons.delete;
+                                    font-family: "Material Icons";
+                                    font-size: 20px;
+                                    color: EinkTheme.text-secondary;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                    width: parent.width;
+                                    height: parent.height;
+                                }
+                                TouchArea {
+                                    width: parent.width; height: parent.height;
+                                    clicked => { root.canvas-folder-delete-tapped(nb.id); }
+                                }
                             }
                         }
+
+                        Rectangle {
+                            x: 0; y: parent.height - 1px;
+                            width: parent.width; height: 1px;
+                            background: EinkTheme.chrome-border; opacity: 0.3;
+                        }
                     }
-                    if root.canvas-view-mode != "gallery": canvases-col := VerticalLayout {
-                        spacing: 4px;
-                        for c in root.canvas-list: Rectangle {
-                            height: 52px;
-                            background: transparent;
+
+                    // ── Canvases: list view ──────────────────────────────────
+                    if root.canvas-view-mode != "gallery": VerticalLayout {
+                        spacing: 0px; padding: 0px;
+                        width: canvas-browser-view.width;
+                        for cv[i] in root.canvas-list: Rectangle {
+                            height: 56px;
+                            width: canvas-browser-view.width;
+                            background: EinkTheme.canvas-bg;
+
                             HorizontalLayout {
-                                padding-left: 10px; padding-right: 10px; spacing: 8px;
-                                Text {
-                                    text: Icons.grid-view; font-family: "Material Icons"; font-size: 22px;
-                                    color: EinkTheme.btn-fg; vertical-alignment: center;
+                                padding-left: 12px; padding-right: 8px;
+                                padding-top: 8px; padding-bottom: 8px;
+                                spacing: 6px;
+
+                                Rectangle {
+                                    width: 40px; height: 40px;
+                                    background: EinkTheme.btn-bg;
+                                    border-radius: 3px; border-width: 1px;
+                                    border-color: EinkTheme.chrome-border;
+                                    clip: true;
+                                    Image {
+                                        visible: cv.has-preview;
+                                        source: cv.preview;
+                                        width: parent.width; height: parent.height;
+                                        image-fit: cover;
+                                    }
+                                    Text {
+                                        visible: !cv.has-preview;
+                                        text: Icons.grid-view;
+                                        font-family: "Material Icons";
+                                        font-size: 18px; color: EinkTheme.text-secondary;
+                                        horizontal-alignment: center; vertical-alignment: center;
+                                        width: parent.width; height: parent.height;
+                                    }
                                 }
-                                if c.show-profile: ProfileIcon {
-                                    icon-char: c.profile-icon-char;
-                                    has-custom: c.has-custom-profile-icon;
-                                    custom-icon: c.custom-profile-icon;
+
+                                if cv.show-profile: ProfileIcon {
+                                    icon-char: cv.profile-icon-char;
+                                    has-custom: cv.has-custom-profile-icon;
+                                    custom-icon: cv.custom-profile-icon;
                                     size: 18px; fg: EinkTheme.text-secondary;
                                 }
-                                VerticalLayout {
-                                    alignment: center; spacing: 2px; horizontal-stretch: 1;
-                                    Text { text: c.title; font-size: 14px; font-weight: 600; color: EinkTheme.btn-fg; overflow: elide; }
-                                    Text { text: c.date-label; font-size: 11px; color: EinkTheme.text-secondary; }
+
+                                Rectangle {
+                                    horizontal-stretch: 1;
+                                    background: transparent;
+
+                                    VerticalLayout {
+                                        spacing: 4px; alignment: center;
+                                        Text {
+                                            text: cv.title;
+                                            font-size: 14px; color: EinkTheme.btn-fg;
+                                            overflow: elide;
+                                        }
+                                        Text {
+                                            text: cv.date-label;
+                                            font-size: 11px; color: EinkTheme.text-secondary;
+                                        }
+                                    }
+                                    TouchArea {
+                                        width: parent.width; height: parent.height;
+                                        clicked => { root.canvas-tapped(cv.id); }
+                                    }
+                                }
+
+                                Rectangle {
+                                    width: 36px; height: 36px;
+                                    background: EinkTheme.btn-bg;
+                                    border-radius: 4px; border-width: 1px;
+                                    border-color: EinkTheme.btn-border;
+                                    Text {
+                                        text: Icons.move;
+                                        font-family: "Material Icons";
+                                        font-size: 18px; color: EinkTheme.btn-fg;
+                                        horizontal-alignment: center; vertical-alignment: center;
+                                        width: parent.width; height: parent.height;
+                                    }
+                                    TouchArea {
+                                        width: parent.width; height: parent.height;
+                                        clicked => {
+                                            root.note-move-kind = "canvas";
+                                            root.note-move-note-id = cv.id;
+                                            root.note-move-visible = true;
+                                        }
+                                    }
+                                }
+
+                                Rectangle {
+                                    width: 36px; height: 36px;
+                                    background: EinkTheme.btn-bg;
+                                    border-radius: 4px; border-width: 1px;
+                                    border-color: EinkTheme.btn-border;
+                                    Text {
+                                        text: Icons.rename;
+                                        font-family: "Material Icons";
+                                        font-size: 18px; color: EinkTheme.btn-fg;
+                                        horizontal-alignment: center; vertical-alignment: center;
+                                        width: parent.width; height: parent.height;
+                                    }
+                                    TouchArea {
+                                        width: parent.width; height: parent.height;
+                                        clicked => { root.canvas-rename-request("canvas", cv.id); }
+                                    }
+                                }
+
+                                Rectangle {
+                                    width: 36px; height: 36px;
+                                    background: EinkTheme.btn-bg;
+                                    border-radius: 4px; border-width: 1px;
+                                    border-color: EinkTheme.btn-border;
+                                    Text {
+                                        text: Icons.delete;
+                                        font-family: "Material Icons";
+                                        font-size: 18px; color: EinkTheme.btn-fg;
+                                        horizontal-alignment: center; vertical-alignment: center;
+                                        width: parent.width; height: parent.height;
+                                    }
+                                    TouchArea {
+                                        width: parent.width; height: parent.height;
+                                        clicked => { root.canvas-delete-tapped(cv.id); }
+                                    }
                                 }
                             }
-                            TouchArea { clicked => { root.canvas-tapped(c.id); } }
+
                             Rectangle {
-                                x: parent.width - 44px; y: 8px; width: 36px; height: 36px;
-                                background: transparent;
-                                Text {
-                                    text: Icons.edit; font-family: "Material Icons"; font-size: 18px;
-                                    color: EinkTheme.btn-fg;
-                                    horizontal-alignment: center; vertical-alignment: center;
-                                    width: parent.width; height: parent.height;
-                                }
-                                TouchArea { clicked => { root.canvas-rename-request("canvas", c.id); } }
-                            }
-                            Rectangle {
-                                x: 0; y: parent.height - 1px; width: parent.width; height: 1px;
-                                background: EinkTheme.chrome-border; opacity: 0.4;
+                                x: 0; y: parent.height - 1px;
+                                width: parent.width; height: 1px;
+                                background: EinkTheme.chrome-border; opacity: 0.3;
                             }
                         }
                     }
+
+                    // ── Canvases: gallery view ───────────────────────────────
                     if root.canvas-view-mode == "gallery": Rectangle {
+                        width: canvas-browser-view.width;
                         height: ((root.canvas-list.length + canvas-browser-view.gallery-cols - 1)
                                 / canvas-browser-view.gallery-cols)
-                            * canvas-browser-view.gallery-row-h;
-                        for c[i] in root.canvas-list: Rectangle {
+                            * canvas-browser-view.gallery-row-h
+                            + (root.canvas-list.length == 0 ? 80px : 8px);
+                        background: EinkTheme.canvas-bg;
+
+                        for cv[i] in root.canvas-list: Rectangle {
                             x: canvas-browser-view.gallery-gap
                                 + Math.mod(i, canvas-browser-view.gallery-cols)
                                     * (canvas-browser-view.gallery-col-w + canvas-browser-view.gallery-gap);
@@ -4031,50 +4314,117 @@ export component EphemerisPage inherits Window {
                             width: canvas-browser-view.gallery-col-w;
                             height: canvas-browser-view.gallery-preview-h
                                 + canvas-browser-view.gallery-caption-h;
-                            border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
-                            background: EinkTheme.btn-bg;
+                            background: EinkTheme.canvas-bg;
+                            border-radius: 6px;
+                            border-width: 2px;
+                            border-color: EinkTheme.chrome-border;
+                            clip: true;
+
                             VerticalLayout {
-                                spacing: 0px;
+                                padding: 0px; spacing: 0px;
+
                                 Rectangle {
                                     height: canvas-browser-view.gallery-preview-h;
-                                    background: EinkTheme.canvas-bg;
+                                    background: EinkTheme.btn-bg;
+                                    clip: true;
+                                    Image {
+                                        visible: cv.has-preview;
+                                        source: cv.preview;
+                                        width: parent.width; height: parent.height;
+                                        image-fit: contain;
+                                    }
                                     Text {
-                                        text: Icons.grid-view; font-family: "Material Icons"; font-size: 36px;
-                                        color: EinkTheme.btn-fg;
+                                        visible: !cv.has-preview;
+                                        text: Icons.grid-view;
+                                        font-family: "Material Icons";
+                                        font-size: 36px; color: EinkTheme.text-secondary;
                                         horizontal-alignment: center; vertical-alignment: center;
                                         width: parent.width; height: parent.height;
                                     }
-                                    if c.show-profile: Rectangle {
+                                    if cv.show-profile: Rectangle {
                                         x: 6px; y: 6px; width: 22px; height: 22px;
                                         background: EinkTheme.canvas-bg;
                                         border-radius: 11px;
                                         border-width: 1px; border-color: EinkTheme.chrome-border;
                                         ProfileIcon {
-                                            icon-char: c.profile-icon-char;
-                                            has-custom: c.has-custom-profile-icon;
-                                            custom-icon: c.custom-profile-icon;
+                                            icon-char: cv.profile-icon-char;
+                                            has-custom: cv.has-custom-profile-icon;
+                                            custom-icon: cv.custom-profile-icon;
                                             size: 16px; fg: EinkTheme.btn-fg;
                                         }
                                     }
+                                    TouchArea {
+                                        width: parent.width; height: parent.height;
+                                        clicked => { root.canvas-tapped(cv.id); }
+                                    }
                                 }
+
                                 Rectangle {
                                     height: canvas-browser-view.gallery-caption-h;
-                                    VerticalLayout {
-                                        padding-left: 6px; padding-right: 6px; padding-top: 4px;
-                                        spacing: 1px;
-                                        Text { text: c.title; font-size: 12px; font-weight: 600; color: EinkTheme.btn-fg; overflow: elide; }
-                                        Text { text: c.date-label; font-size: 10px; color: EinkTheme.text-secondary; overflow: elide; }
+                                    background: EinkTheme.canvas-bg;
+                                    HorizontalLayout {
+                                        padding-left: 6px; padding-right: 2px;
+                                        spacing: 2px;
+                                        VerticalLayout {
+                                            horizontal-stretch: 1;
+                                            spacing: 0px; alignment: center;
+                                            Text {
+                                                text: cv.title;
+                                                font-size: 11px; font-weight: 600;
+                                                color: EinkTheme.btn-fg;
+                                                overflow: elide;
+                                            }
+                                            Text {
+                                                text: cv.date-label;
+                                                font-size: 9px; color: EinkTheme.text-secondary;
+                                                overflow: elide;
+                                            }
+                                        }
+                                        Rectangle {
+                                            width: 28px; height: 28px;
+                                            background: transparent;
+                                            Text {
+                                                text: Icons.rename;
+                                                font-family: "Material Icons";
+                                                font-size: 16px; color: EinkTheme.btn-fg;
+                                                horizontal-alignment: center; vertical-alignment: center;
+                                                width: parent.width; height: parent.height;
+                                            }
+                                            TouchArea {
+                                                width: parent.width; height: parent.height;
+                                                clicked => { root.canvas-rename-request("canvas", cv.id); }
+                                            }
+                                        }
+                                        Rectangle {
+                                            width: 28px; height: 28px;
+                                            background: transparent;
+                                            Text {
+                                                text: Icons.delete;
+                                                font-family: "Material Icons";
+                                                font-size: 16px; color: EinkTheme.btn-fg;
+                                                horizontal-alignment: center; vertical-alignment: center;
+                                                width: parent.width; height: parent.height;
+                                            }
+                                            TouchArea {
+                                                width: parent.width; height: parent.height;
+                                                clicked => { root.canvas-delete-tapped(cv.id); }
+                                            }
+                                        }
                                     }
                                 }
                             }
-                            TouchArea { clicked => { root.canvas-tapped(c.id); } }
                         }
                     }
+
                     if root.canvas-folder-list.length == 0 && root.canvas-list.length == 0: Rectangle {
-                        height: 64px;
+                        height: 80px;
+                        width: canvas-browser-view.width;
+                        background: EinkTheme.canvas-bg;
                         Text {
-                            text: "No canvases yet — tap + Canvas";
-                            font-size: 13px; color: EinkTheme.text-secondary;
+                            text: root.canvas-search-query != ""
+                                ? "No canvases match this search"
+                                : "Empty — tap + Canvas or + Folder";
+                            font-size: 14px; color: EinkTheme.text-secondary;
                             horizontal-alignment: center; vertical-alignment: center;
                         }
                     }
@@ -4120,30 +4470,7 @@ export component EphemerisPage inherits Window {
                 }
             }
         }
-        // Title chrome above board pointer (Notes-like).
-        if !root.canvas-focus-active: Rectangle {
-            x: 12px; y: 8px; width: parent.width - 120px; height: 40px;
-            background: EinkTheme.chrome-bg;
-            border-radius: 6px; border-width: 2px; border-color: EinkTheme.btn-border;
-            HorizontalLayout {
-                padding-left: 10px; padding-right: 6px; spacing: 6px;
-                Text {
-                    text: root.canvas-board-title;
-                    font-size: 15px; font-weight: 700; color: EinkTheme.btn-fg;
-                    vertical-alignment: center; horizontal-stretch: 1; overflow: elide;
-                }
-                Rectangle {
-                    width: 36px; height: 32px; background: transparent;
-                    Text {
-                        text: Icons.edit; font-family: "Material Icons"; font-size: 18px;
-                        color: EinkTheme.btn-fg;
-                        horizontal-alignment: center; vertical-alignment: center;
-                        width: parent.width; height: parent.height;
-                    }
-                    TouchArea { clicked => { root.canvas-rename-request("board", ""); } }
-                }
-            }
-        }
+        // Title lives in the burger dropdown only (tap there to rename).
     }
 
     // Multi-select strip
@@ -4376,26 +4703,30 @@ export component EphemerisPage inherits Window {
             opacity: 0.55;
             TouchArea { }
         }
-        // Modal frame
-        Rectangle {
-            x: 24px; y: 56px;
-            width: parent.width - 48px; height: parent.height - 112px;
-            background: transparent;
+        // Modal card: opaque so the board never shows through the writing
+        // area. Geometry mirrors CANVAS_FOCUS_* in lib.rs (pen ink gate).
+        focus-card := Rectangle {
+            x: 56px; y: 72px;
+            width: parent.width - 112px; height: parent.height - 72px - 104px;
+            background: EinkTheme.canvas-bg;
             border-width: 3px; border-color: EinkTheme.btn-border; border-radius: 8px;
         }
-        Rectangle {
-            x: parent.width - 96px; y: 8px; width: 88px; height: 44px;
-            background: EinkTheme.btn-active-bg;
-            border-radius: 6px; border-width: 2px; border-color: EinkTheme.btn-border;
-            Text { text: "Done"; font-size: 14px; font-weight: 700; color: EinkTheme.btn-active-fg;
-                   horizontal-alignment: center; vertical-alignment: center; }
-            TouchArea { clicked => { root.canvas-focus-done(); } }
-        }
         Text {
-            x: 28px; y: 14px; width: parent.width - 140px; height: 32px;
+            x: focus-card.x + 4px; y: 24px; width: parent.width - 180px; height: 32px;
             text: root.page-title;
             font-size: 14px; font-weight: 700; color: EinkTheme.btn-fg; overflow: elide;
             vertical-alignment: center;
+        }
+        // Done sits under the card (bottom-right), clear of the drawing burger.
+        Rectangle {
+            x: focus-card.x + focus-card.width - 120px;
+            y: focus-card.y + focus-card.height + 24px;
+            width: 120px; height: 52px;
+            background: EinkTheme.btn-active-bg;
+            border-radius: 6px; border-width: 2px; border-color: EinkTheme.btn-border;
+            Text { text: "Done"; font-size: 15px; font-weight: 700; color: EinkTheme.btn-active-fg;
+                   horizontal-alignment: center; vertical-alignment: center; }
+            TouchArea { clicked => { root.canvas-focus-done(); } }
         }
     }
 
@@ -8487,7 +8818,11 @@ export component EphemerisPage inherits Window {
                     }
                     TouchArea {
                         clicked => {
-                            root.note-move-confirm(root.note-move-note-id, "0");
+                            if (root.note-move-kind == "canvas") {
+                                root.canvas-move-confirm(root.note-move-note-id, "0");
+                            } else {
+                                root.note-move-confirm(root.note-move-note-id, "0");
+                            }
                         }
                     }
                     Rectangle {
@@ -8497,7 +8832,7 @@ export component EphemerisPage inherits Window {
                     }
                 }
 
-                for nb[i] in root.notebook-list: Rectangle {
+                for nb[i] in (root.note-move-kind == "canvas" ? root.canvas-move-folder-list : root.notebook-list): Rectangle {
                     height: 48px;
                     background: EinkTheme.canvas-bg;
 
@@ -8514,7 +8849,11 @@ export component EphemerisPage inherits Window {
                     }
                     TouchArea {
                         clicked => {
-                            root.note-move-confirm(root.note-move-note-id, nb.id);
+                            if (root.note-move-kind == "canvas") {
+                                root.canvas-move-confirm(root.note-move-note-id, nb.id);
+                            } else {
+                                root.note-move-confirm(root.note-move-note-id, nb.id);
+                            }
                         }
                     }
                     Rectangle {
@@ -8688,7 +9027,11 @@ export component EphemerisPage inherits Window {
                             width: parent.width; height: parent.height;
                             clicked => {
                                 root.notebook-delete-visible = false;
-                                root.notebook-delete-confirm(root.notebook-delete-id);
+                                if (root.notebook-delete-kind == "canvas") {
+                                    root.canvas-folder-delete-confirm(root.notebook-delete-id);
+                                } else {
+                                    root.notebook-delete-confirm(root.notebook-delete-id);
+                                }
                             }
                         }
                     }

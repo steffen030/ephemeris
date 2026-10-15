@@ -6009,9 +6009,7 @@ impl WinitHandler {
                                     mx,
                                     my,
                                 );
-                                if let Some(d) = &self.display {
-                                    d.request_redraw();
-                                }
+                                self.request_redraw_coalesced();
                             }
                         }
                         self.board_pinch_last_dist = Some(dist);
@@ -6028,6 +6026,8 @@ impl WinitHandler {
                         self.board_pinching = false;
                         self.board_pinch_last_dist = None;
                         self.canvas_session.save_doc();
+                        crate::canvas_app::refresh_board_now(&self.ui, &self.canvas_session);
+                        self.request_redraw_coalesced();
                         // Remaining finger must lift before pan resumes.
                     }
                 } else {
@@ -6982,12 +6982,12 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
                         sx,
                         sy,
                     );
-                    if let Some(d) = &self.display {
-                        d.request_redraw();
-                    }
+                    self.request_redraw_coalesced();
                 }
                 if matches!(phase, TouchPhase::Ended | TouchPhase::Cancelled) {
                     self.canvas_session.save_doc();
+                    crate::canvas_app::refresh_board_now(&self.ui, &self.canvas_session);
+                    self.request_redraw_coalesced();
                 }
             }
 
@@ -8284,7 +8284,7 @@ fn note_preview_image(data_dir: &Path, note_id: u32) -> (bool, slint::Image) {
     note_preview_from_gray(w, h, &gray)
 }
 
-fn note_preview_from_gray(w: u32, h: u32, gray: &[u8]) -> (bool, slint::Image) {
+pub(crate) fn note_preview_from_gray(w: u32, h: u32, gray: &[u8]) -> (bool, slint::Image) {
     if w == 0 || h == 0 || gray.len() < (w * h) as usize {
         return (false, slint::Image::default());
     }

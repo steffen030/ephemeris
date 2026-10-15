@@ -308,6 +308,8 @@ pub struct CanvasListItem {
     pub id: String,
     pub title: String,
     pub date_label: String,
+    pub has_preview: bool,
+    pub preview: slint::Image,
     pub show_profile: bool,
     pub profile_icon_char: String,
     pub has_custom_profile_icon: bool,
@@ -350,6 +352,12 @@ const BURGER_W: u32 = 44;
 const BURGER_H: u32 = 44;
 const BURGER_RIGHT_PAD: u32 = 8; // parent.width - 52
 const BURGER_Y: u32 = 8;
+
+/// Canvas text-card focus modal card (mirrors `focus-card` in `main.slint`).
+/// Pen ink only starts inside the card so strokes never land on the veil.
+const CANVAS_FOCUS_INSET_X: u32 = 56;
+const CANVAS_FOCUS_TOP: u32 = 72;
+const CANVAS_FOCUS_BOTTOM: u32 = 104;
 
 /// Bottom-right page X/Y + prev/next chip (`note-page-indicator` in `main.slint`).
 const PAGE_INDICATOR_W: u32 = 158;
@@ -928,6 +936,13 @@ impl EphemerisUi {
         let yi = y as u32;
         if xi >= self.width || yi >= self.height {
             return false;
+        }
+        if self.component.get_canvas_focus_active() {
+            let x1 = self.width.saturating_sub(CANVAS_FOCUS_INSET_X);
+            let y1 = self.height.saturating_sub(CANVAS_FOCUS_BOTTOM);
+            if xi < CANVAS_FOCUS_INSET_X || xi >= x1 || yi < CANVAS_FOCUS_TOP || yi >= y1 {
+                return false;
+            }
         }
         // Nav rail owns the left strip.
         if xi < NAV_W {
@@ -1989,6 +2004,8 @@ impl EphemerisUi {
                 id: slint::SharedString::from(e.id.as_str()),
                 title: slint::SharedString::from(e.title.as_str()),
                 date_label: slint::SharedString::from(e.date_label.as_str()),
+                has_preview: e.has_preview,
+                preview: e.preview.clone(),
                 show_profile: e.show_profile,
                 profile_icon_char: slint::SharedString::from(e.profile_icon_char.as_str()),
                 has_custom_profile_icon: e.has_custom_profile_icon,
@@ -2009,17 +2026,12 @@ impl EphemerisUi {
     }
 
     pub fn set_canvas_board_gray8(&self, width: u32, height: u32, gray: &[u8]) {
-        let mut rgba = vec![255u8; (width * height * 4) as usize];
-        let n = (width * height) as usize;
-        for i in 0..n.min(gray.len()) {
-            let g = gray[i];
-            rgba[i * 4] = g;
-            rgba[i * 4 + 1] = g;
-            rgba[i * 4 + 2] = g;
-            rgba[i * 4 + 3] = 255;
+        // Expand straight into the Slint buffer — no intermediate RGBA Vec
+        // (board re-renders during drag / pinch on PineNote).
+        let mut buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(width, height);
+        for (px, &g) in buf.make_mut_slice().iter_mut().zip(gray) {
+            *px = slint::Rgba8Pixel::new(g, g, g, 255);
         }
-        let buf =
-            slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&rgba, width, height);
         self.component
             .set_canvas_board_image(slint::Image::from_rgba8(buf));
     }
@@ -2119,6 +2131,59 @@ impl EphemerisUi {
 
     pub fn on_canvas_rename_cancel<F: FnMut() + 'static>(&self, handler: F) {
         self.component.on_canvas_rename_cancel(handler);
+    }
+
+    /// All canvas folders for the shared move-to-folder dialog.
+    pub fn set_canvas_move_folder_list(&self, folders: &[FolderListItem]) {
+        let items: Vec<NotebookEntry> = folders.iter().map(folder_list_item_to_entry).collect();
+        self.component
+            .set_canvas_move_folder_list(std::rc::Rc::new(slint::VecModel::from(items)).into());
+    }
+
+    pub fn get_canvas_search_query(&self) -> String {
+        self.component.get_canvas_search_query().to_string()
+    }
+
+    pub fn set_canvas_search_query(&self, q: &str) {
+        self.component
+            .set_canvas_search_query(slint::SharedString::from(q));
+    }
+
+    pub fn on_canvas_search_changed<F: FnMut(String) + 'static>(&self, mut handler: F) {
+        self.component
+            .on_canvas_search_changed(move |q| handler(q.to_string()));
+    }
+
+    pub fn on_canvas_folder_quick_new<F: FnMut(String) + 'static>(&self, mut handler: F) {
+        self.component
+            .on_canvas_folder_quick_new(move |id| handler(id.to_string()));
+    }
+
+    pub fn on_canvas_folder_delete_tapped<F: FnMut(String) + 'static>(&self, mut handler: F) {
+        self.component
+            .on_canvas_folder_delete_tapped(move |id| handler(id.to_string()));
+    }
+
+    pub fn on_canvas_folder_delete_confirm<F: FnMut(String) + 'static>(&self, mut handler: F) {
+        self.component
+            .on_canvas_folder_delete_confirm(move |id| handler(id.to_string()));
+    }
+
+    pub fn on_canvas_delete_tapped<F: FnMut(String) + 'static>(&self, mut handler: F) {
+        self.component
+            .on_canvas_delete_tapped(move |id| handler(id.to_string()));
+    }
+
+    pub fn on_canvas_move_confirm<F: FnMut(String, String) + 'static>(&self, mut handler: F) {
+        self.component
+            .on_canvas_move_confirm(move |id, folder| handler(id.to_string(), folder.to_string()));
+    }
+
+    /// Folder delete confirm, shared with Notes (`kind` = "note" | "canvas").
+    pub fn show_folder_delete_confirm(&self, kind: &str, id: &str, title: &str, message: &str) {
+        self.show_notebook_delete_confirm(id, title, message);
+        self.component
+            .set_notebook_delete_kind(slint::SharedString::from(kind));
     }
 
     /// Register a closure called when the user confirms a note rename.
@@ -2257,6 +2322,7 @@ impl EphemerisUi {
     }
 
     pub fn show_notebook_delete_confirm(&self, id: &str, title: &str, message: &str) {
+        self.component.set_notebook_delete_kind("note".into());
         self.component
             .set_notebook_delete_id(slint::SharedString::from(id));
         self.component
@@ -3767,7 +3833,7 @@ fn render_background_in_rect(
         PageTemplate::Blank => {}
         PageTemplate::Lines => {
             let line_spacing = 28u32;
-            let line_color = 200u8;
+            let line_color = 176u8;
             let first = canvas_start
                 + y0.saturating_sub(canvas_start).div_ceil(line_spacing) * line_spacing;
             let mut row = first;
@@ -3783,7 +3849,7 @@ fn render_background_in_rect(
         }
         PageTemplate::Grid => {
             let spacing = 28u32;
-            let grid_color = 220u8;
+            let grid_color = 196u8;
             for row in y0..y1 {
                 let off = row as usize * stride;
                 if (row - canvas_start).is_multiple_of(spacing) {
@@ -3803,21 +3869,23 @@ fn render_background_in_rect(
             }
         }
         PageTemplate::Dot => {
+            // 3×3 dots: single-pixel 210 dots vanish on e-ink.
             let spacing = 28u32;
-            let dot_color = 210u8;
-            let first_row =
-                canvas_start + y0.saturating_sub(canvas_start).div_ceil(spacing) * spacing;
-            let mut row = first_row;
+            let dot_color = 150u8;
+            let dot = 3u32;
+            // Start one pitch early so a dot straddling y0 / x0 is still drawn.
+            let mut row = canvas_start
+                + y0.saturating_sub(canvas_start + dot - 1).div_ceil(spacing) * spacing;
             while row < y1 {
-                if row >= y0 {
-                    let off = row as usize * stride;
-                    let mut col = (x0 / spacing) * spacing;
-                    while col < x1 {
-                        if col >= x0 {
-                            pal_buf.data[off + col as usize] = dot_color;
+                let mut col = x0.saturating_sub(dot - 1).div_ceil(spacing) * spacing;
+                while col < x1 {
+                    for y in row.max(y0)..(row + dot).min(y1) {
+                        let off = y as usize * stride;
+                        for x in col.max(x0)..(col + dot).min(x1) {
+                            pal_buf.data[off + x as usize] = dot_color;
                         }
-                        col = col.saturating_add(spacing);
                     }
+                    col = col.saturating_add(spacing);
                 }
                 row = row.saturating_add(spacing);
             }

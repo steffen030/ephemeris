@@ -2,32 +2,51 @@
 
 use ephemeris_core::profile_manager::ProfileManager;
 use ephemeris_core::{
-    canvas_data_dir, export_canvas_json, gray8_to_png, hit_port, hit_side, hit_test,
-    load_canvas_doc, load_canvas_index, load_card_page_pixels, load_card_strokes, load_card_text,
-    new_canvas_id, render_board, save_canvas_doc, save_canvas_index, save_card_page_pixels,
-    save_card_strokes, save_card_text, snap_grid, view_for_fit, view_for_focus, zoom_view_at,
-    AppCanvasFolder, AppCanvasMeta, BoardDrawOpts, CanvasDoc, CanvasEdge, CanvasIndex, CanvasNode,
-    CanvasZoomPreset, Config, EdgeEnd, NodeSide, PageRecognitionCache, StrokePage, TextNode,
-    VaultCanvasExport, Viewport, DEFAULT_EXPORT_SUBDIR, PORT_HIT_RADIUS, RECOGNITION_CACHE_FORMAT,
+    canvas_data_dir, delete_canvas_files, export_canvas_json, gray8_to_png, hit_port, hit_side,
+    hit_test, load_canvas_doc, load_canvas_index, load_card_page_pixels, load_card_strokes,
+    load_card_text, new_canvas_id, render_board, save_canvas_doc, save_canvas_index,
+    save_card_page_pixels, save_card_strokes, save_card_text, snap_grid, view_for_fit,
+    view_for_focus, zoom_view_at, AppCanvasFolder, AppCanvasMeta, BoardDrawOpts, CanvasDoc,
+    CanvasEdge, CanvasIndex, CanvasNode, CanvasZoomPreset, Config, EdgeEnd, NodeSide,
+    PageRecognitionCache, StrokePage, TextNode, VaultCanvasExport, Viewport, DEFAULT_EXPORT_SUBDIR,
+    PORT_HIT_RADIUS, RECOGNITION_CACHE_FORMAT,
 };
-use ephemeris_ui::{CanvasFolderListItem, CanvasListItem, EphemerisUi};
+use ephemeris_ui::{CanvasFolderListItem, CanvasListItem, EphemerisUi, FolderListItem};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::app::{
-    begin_create_with_profile, profile_badge_for, recognition_model_version_for, AppConnection,
+    begin_create_with_profile, note_preview_from_gray, profile_badge_for,
+    recognition_model_version_for, AppConnection,
 };
 
 const GRID: i32 = 20;
 const CONNECT_MARGIN: f32 = 48.0;
 const LONG_PRESS_MS: u64 = 480;
 const LONG_PRESS_SLOP: f32 = 14.0;
+/// Min interval between board re-renders while a drag / pinch is in flight.
+/// Each render is a full-panel raster + e-ink refresh; rendering every touch
+/// sample stalls the PineNote UI thread until GNOME offers force-quit.
+const BOARD_GESTURE_FRAME: Duration = Duration::from_millis(120);
 
 /// `(t_ms, x, y, hit_node_id)` for long-press / drag start.
 type BoardPressStart = (u64, f32, f32, Option<String>);
+
+/// Move-tool drag: screen start point + each dragged node's original position.
+type MoveOrigin = ((f32, f32), Vec<(String, i32, i32)>);
+
+/// Ink thumbnails keyed by node id: `(w, h, gray8)`.
+type InkPreviews = HashMap<String, (u32, u32, Vec<u8>)>;
+
+/// Browser thumbnails keyed by canvas id: `(updated_at, has_preview, image)`.
+type BrowserThumbs = HashMap<u32, (u64, bool, slint::Image)>;
+
+/// Board raster size for browser thumbnails (portrait, like the board).
+const THUMB_W: u32 = 300;
+const THUMB_H: u32 = 400;
 
 pub(crate) struct CanvasSession {
     pub data_dir: PathBuf,
@@ -46,6 +65,12 @@ pub(crate) struct CanvasSession {
     pub press_start: RefCell<Option<BoardPressStart>>,
     pub long_press_consumed: Cell<bool>,
     pub move_dragging: Cell<bool>,
+    pub move_origin: RefCell<Option<MoveOrigin>>,
+    /// Card ink thumbnails for `ink_previews_canvas` (loaded once, not per frame).
+    ink_previews: RefCell<InkPreviews>,
+    ink_previews_canvas: Cell<Option<u32>>,
+    last_board_render: Cell<Option<Instant>>,
+    browser_thumbs: RefCell<BrowserThumbs>,
     pub sort_mode: RefCell<String>,
     pub view_mode: RefCell<String>,
     pub profile_filter: Rc<RefCell<String>>,
@@ -136,6 +161,11 @@ impl CanvasSession {
             press_start: RefCell::new(None),
             long_press_consumed: Cell::new(false),
             move_dragging: Cell::new(false),
+            move_origin: RefCell::new(None),
+            ink_previews: RefCell::new(HashMap::new()),
+            ink_previews_canvas: Cell::new(None),
+            last_board_render: Cell::new(None),
+            browser_thumbs: RefCell::new(HashMap::new()),
             sort_mode: RefCell::new("edited".into()),
             view_mode: RefCell::new("list".into()),
             profile_filter: Rc::new(RefCell::new(String::new())),
@@ -378,6 +408,140 @@ pub(crate) fn wire_canvas(
             page.set_nav_section(2);
             page.set_show_canvas_list(false);
             page.set_show_canvas_folder_list(true);
+            ui_rc.set_canvas_search_query("");
+            push_browser(&ui_rc, &session);
+        });
+    }
+
+    {
+        let ui_rc = ui.clone();
+        let session = session.clone();
+        ui.on_canvas_search_changed(move |_q| push_browser(&ui_rc, &session));
+    }
+
+    {
+        let ui_rc = ui.clone();
+        let session = session.clone();
+        ui.on_canvas_folder_quick_new(move |id| {
+            let Ok(fid) = id.parse::<u32>() else {
+                return;
+            };
+            let folder_profile = session
+                .index
+                .borrow()
+                .folders
+                .iter()
+                .find(|f| f.id == fid)
+                .map(|f| f.profile_id.clone())
+                .unwrap_or_default();
+            let profile = if folder_profile.is_empty() {
+                session.create_target_profile()
+            } else {
+                folder_profile
+            };
+            session.active_folder_id.set(fid);
+            if profile.is_empty() {
+                // All aggregator + unowned folder: ask which profile, like + Canvas.
+                begin_create_with_profile(&ui_rc.clone_component(), "canvas", &profile);
+            } else {
+                create_canvas_with_profile(&ui_rc, &session, &profile);
+            }
+        });
+    }
+
+    {
+        let ui_rc = ui.clone();
+        let session = session.clone();
+        ui.on_canvas_delete_tapped(move |id| {
+            let Ok(cid) = id.parse::<u32>() else {
+                return;
+            };
+            session.index.borrow_mut().canvases.retain(|c| c.id != cid);
+            delete_canvas_files(&session.data_dir, cid);
+            session.browser_thumbs.borrow_mut().remove(&cid);
+            session.save_index();
+            push_browser(&ui_rc, &session);
+        });
+    }
+
+    {
+        let ui_rc = ui.clone();
+        let session = session.clone();
+        ui.on_canvas_folder_delete_tapped(move |id| {
+            let Ok(fid) = id.parse::<u32>() else {
+                return;
+            };
+            let idx = session.index.borrow();
+            let title = idx
+                .folders
+                .iter()
+                .find(|f| f.id == fid)
+                .map(|f| f.title.clone())
+                .unwrap_or_else(|| "Folder".to_string());
+            let doomed = canvas_folder_subtree(&idx, fid);
+            let canvas_count = idx
+                .canvases
+                .iter()
+                .filter(|c| c.folder_id.is_some_and(|f| doomed.contains(&f)))
+                .count();
+            let folder_count = doomed.len().saturating_sub(1);
+            drop(idx);
+            if canvas_count == 0 && folder_count == 0 {
+                delete_canvas_folder(&session, fid);
+                push_browser(&ui_rc, &session);
+                return;
+            }
+            let mut parts = Vec::new();
+            if canvas_count > 0 {
+                parts.push(format!(
+                    "{canvas_count} canvas{}",
+                    if canvas_count == 1 { "" } else { "es" }
+                ));
+            }
+            if folder_count > 0 {
+                parts.push(format!(
+                    "{folder_count} subfolder{}",
+                    if folder_count == 1 { "" } else { "s" }
+                ));
+            }
+            let message = format!(
+                "This will permanently delete {} and all contents.",
+                parts.join(" and ")
+            );
+            ui_rc.show_folder_delete_confirm("canvas", &id, &title, &message);
+        });
+    }
+
+    {
+        let ui_rc = ui.clone();
+        let session = session.clone();
+        ui.on_canvas_folder_delete_confirm(move |id| {
+            ui_rc.hide_notebook_delete_confirm();
+            if let Ok(fid) = id.parse::<u32>() {
+                delete_canvas_folder(&session, fid);
+                push_browser(&ui_rc, &session);
+            }
+        });
+    }
+
+    {
+        let ui_rc = ui.clone();
+        let session = session.clone();
+        ui.on_canvas_move_confirm(move |id, folder| {
+            ui_rc.clone_component().set_note_move_visible(false);
+            let (Ok(cid), Ok(fid)) = (id.parse::<u32>(), folder.parse::<u32>()) else {
+                return;
+            };
+            if let Some(c) = session
+                .index
+                .borrow_mut()
+                .canvases
+                .iter_mut()
+                .find(|c| c.id == cid)
+            {
+                c.folder_id = if fid == 0 { None } else { Some(fid) };
+            }
+            session.save_index();
             push_browser(&ui_rc, &session);
         });
     }
@@ -652,10 +816,21 @@ pub(crate) fn wire_canvas(
                                 sel.push(id);
                                 session.multi_select.set(false);
                             }
+                            let ids = sel.clone();
                             drop(sel);
                             session.sync_selection_ui(&ui_rc);
+                            let doc = session.doc.borrow();
+                            let origin = ids
+                                .into_iter()
+                                .filter_map(|id| {
+                                    let n = doc.find_node(&id)?;
+                                    let (nx, ny) = (n.x(), n.y());
+                                    Some((id, nx, ny))
+                                })
+                                .collect();
+                            drop(doc);
+                            *session.move_origin.borrow_mut() = Some(((x, y), origin));
                             session.move_dragging.set(true);
-                            session.pan_last.set(Some((x, y)));
                         }
                         // Empty space in Move: do not pan.
                     } else if !connect {
@@ -675,24 +850,21 @@ pub(crate) fn wire_canvas(
                         }
                     }
                     if session.move_dragging.get() {
-                        if let Some((lx, ly)) = session.pan_last.get() {
-                            let (bx0, by0) = vp.screen_to_board(lx, ly);
+                        // Total delta from drag start: snapping per-sample deltas
+                        // would round small finger moves back to the old cell.
+                        if let Some(((sx, sy), origin)) = session.move_origin.borrow().as_ref() {
+                            let (bx0, by0) = vp.screen_to_board(*sx, *sy);
                             let (bx1, by1) = vp.screen_to_board(x, y);
                             let dx = (bx1 - bx0) as i32;
                             let dy = (by1 - by0) as i32;
-                            let ids = session.selected_ids.borrow().clone();
                             let mut doc = session.doc.borrow_mut();
-                            for id in &ids {
+                            for (id, ox, oy) in origin {
                                 if let Some(n) = doc.find_node_mut(id) {
-                                    n.set_pos(
-                                        snap_grid(n.x() + dx, GRID),
-                                        snap_grid(n.y() + dy, GRID),
-                                    );
+                                    n.set_pos(snap_grid(ox + dx, GRID), snap_grid(oy + dy, GRID));
                                 }
                             }
                         }
-                        session.pan_last.set(Some((x, y)));
-                        refresh();
+                        refresh_board_throttled(&ui_rc, &session);
                     } else if let Some((lx, ly)) = session.pan_last.get() {
                         if pointer == "finger" || pointer == "mouse" {
                             let mut doc = session.doc.borrow_mut();
@@ -700,7 +872,7 @@ pub(crate) fn wire_canvas(
                             doc.view.y -= (y - ly) / vp.scale.max(0.01);
                             session.pan_last.set(Some((x, y)));
                             drop(doc);
-                            refresh();
+                            refresh_board_throttled(&ui_rc, &session);
                         }
                     }
                 }
@@ -731,6 +903,7 @@ pub(crate) fn wire_canvas(
                         }
                         session.pan_last.set(None);
                         session.move_dragging.set(false);
+                        *session.move_origin.borrow_mut() = None;
                         *session.press_start.borrow_mut() = None;
                         return;
                     }
@@ -754,9 +927,15 @@ pub(crate) fn wire_canvas(
                         }
                     }
                     *session.press_start.borrow_mut() = None;
-                    session.pan_last.set(None);
-                    session.move_dragging.set(false);
+                    let panned = session.pan_last.take().is_some();
+                    let moved = session.move_dragging.replace(false);
+                    let gesture = panned || moved;
+                    *session.move_origin.borrow_mut() = None;
                     session.save_doc();
+                    if gesture {
+                        // Present the final position skipped by throttling.
+                        refresh();
+                    }
                 }
                 "tap" => {
                     if session.long_press_consumed.replace(false) {
@@ -934,6 +1113,7 @@ pub(crate) fn wire_canvas(
 fn open_canvas(ui: &EphemerisUi, session: &CanvasSession, id: u32, refresh: &Rc<dyn Fn()>) {
     session.active_canvas_id.set(id);
     *session.doc.borrow_mut() = load_canvas_doc(&session.data_dir, id);
+    session.ink_previews_canvas.set(None);
     session.clear_selection();
     *session.connect_from.borrow_mut() = None;
     *session.port_drag.borrow_mut() = None;
@@ -964,12 +1144,15 @@ fn open_canvas(ui: &EphemerisUi, session: &CanvasSession, id: u32, refresh: &Rc<
 pub(crate) fn cancel_board_pointer_gesture(session: &CanvasSession) {
     session.pan_last.set(None);
     session.move_dragging.set(false);
+    *session.move_origin.borrow_mut() = None;
     session.long_press_consumed.set(false);
     *session.press_start.borrow_mut() = None;
     *session.port_drag.borrow_mut() = None;
 }
 
-/// Continuous zoom around a screen point (pinch / trackpad). Refreshes the board image.
+/// Continuous zoom around a screen point (pinch / trackpad). Refreshes the board
+/// image at most every [`BOARD_GESTURE_FRAME`]; call [`refresh_board_now`] when
+/// the gesture ends.
 pub(crate) fn apply_board_zoom_factor(
     ui: &EphemerisUi,
     session: &CanvasSession,
@@ -987,12 +1170,50 @@ pub(crate) fn apply_board_zoom_factor(
         zoom_view_at(&mut view, &doc, bw, bh, factor, screen_x, screen_y);
         doc.view = view;
     }
-    if let Some(refresh) = session.board_refresh.borrow().clone() {
-        refresh();
+    refresh_board_throttled(ui, session);
+}
+
+/// Render the board immediately (end of a throttled pinch / drag).
+pub(crate) fn refresh_board_now(ui: &EphemerisUi, session: &CanvasSession) {
+    refresh_board_image(ui, session);
+}
+
+/// Re-render unless the last board render was under [`BOARD_GESTURE_FRAME`] ago.
+fn refresh_board_throttled(ui: &EphemerisUi, session: &CanvasSession) {
+    if let Some(t) = session.last_board_render.get() {
+        if t.elapsed() < BOARD_GESTURE_FRAME {
+            return;
+        }
     }
+    refresh_board_image(ui, session);
+}
+
+/// Load card ink thumbnails once per canvas (disk I/O must stay off the
+/// per-frame path — the board re-renders on every drag / pinch frame).
+fn ensure_ink_previews(session: &CanvasSession) {
+    let canvas_id = session.active_canvas_id.get();
+    if session.ink_previews_canvas.get() == Some(canvas_id) {
+        return;
+    }
+    let doc = session.doc.borrow();
+    let mut previews = session.ink_previews.borrow_mut();
+    previews.clear();
+    for n in &doc.nodes {
+        if let CanvasNode::Text(t) = n {
+            if let Some((w, h, px)) = load_card_page_pixels(&session.data_dir, canvas_id, &t.id) {
+                // Skip blank pages (all near-white).
+                if px.iter().any(|&p| p < 220) {
+                    previews.insert(t.id.clone(), (w, h, px));
+                }
+            }
+        }
+    }
+    session.ink_previews_canvas.set(Some(canvas_id));
 }
 
 fn refresh_board_image(ui: &EphemerisUi, session: &CanvasSession) {
+    ensure_ink_previews(session);
+    session.last_board_render.set(Some(Instant::now()));
     let (bw, bh) = ui.canvas_size();
     let doc = session.doc.borrow();
     let vp = Viewport::from_view(&doc.view, bw, bh, &doc);
@@ -1003,18 +1224,7 @@ fn refresh_board_image(ui: &EphemerisUi, session: &CanvasSession) {
         .as_ref()
         .map(|(id, _)| id.clone());
     let show_ports = !session.multi_select.get() && selected.len() == 1;
-    let canvas_id = session.active_canvas_id.get();
-    let mut ink_previews: HashMap<String, (u32, u32, Vec<u8>)> = HashMap::new();
-    for n in &doc.nodes {
-        if let CanvasNode::Text(t) = n {
-            if let Some((w, h, px)) = load_card_page_pixels(&session.data_dir, canvas_id, &t.id) {
-                // Skip blank pages (all near-white).
-                if px.iter().any(|&p| p < 220) {
-                    ink_previews.insert(t.id.clone(), (w, h, px));
-                }
-            }
-        }
-    }
+    let ink_previews = session.ink_previews.borrow();
     let opts = BoardDrawOpts {
         selected_ids: &selected,
         connect_from: connect.as_deref(),
@@ -1022,8 +1232,86 @@ fn refresh_board_image(ui: &EphemerisUi, session: &CanvasSession) {
         ink_previews: &ink_previews,
     };
     let gray = render_board(&doc, &vp, bw, bh, &opts);
+    drop(ink_previews);
     drop(doc);
     ui.set_canvas_board_gray8(bw, bh, &gray);
+}
+
+/// `root` plus every nested child folder id.
+fn canvas_folder_subtree(idx: &CanvasIndex, root: u32) -> Vec<u32> {
+    let mut out = vec![root];
+    let mut i = 0;
+    while i < out.len() {
+        let parent = out[i];
+        out.extend(
+            idx.folders
+                .iter()
+                .filter(|f| f.parent_id == Some(parent))
+                .map(|f| f.id),
+        );
+        i += 1;
+    }
+    out
+}
+
+/// Delete a folder, its subfolders and every canvas inside them.
+fn delete_canvas_folder(session: &CanvasSession, fid: u32) {
+    let mut idx = session.index.borrow_mut();
+    let doomed = canvas_folder_subtree(&idx, fid);
+    let parent = idx
+        .folders
+        .iter()
+        .find(|f| f.id == fid)
+        .and_then(|f| f.parent_id)
+        .unwrap_or(0);
+    let doomed_canvases: Vec<u32> = idx
+        .canvases
+        .iter()
+        .filter(|c| c.folder_id.is_some_and(|f| doomed.contains(&f)))
+        .map(|c| c.id)
+        .collect();
+    idx.canvases.retain(|c| !doomed_canvases.contains(&c.id));
+    idx.folders.retain(|f| !doomed.contains(&f.id));
+    drop(idx);
+    for cid in &doomed_canvases {
+        delete_canvas_files(&session.data_dir, *cid);
+        session.browser_thumbs.borrow_mut().remove(cid);
+    }
+    if doomed.contains(&session.active_folder_id.get()) {
+        session.active_folder_id.set(parent);
+    }
+    session.save_index();
+}
+
+/// Board overview thumbnail for the browser, cached until the canvas changes.
+fn canvas_thumbnail(session: &CanvasSession, meta: &AppCanvasMeta) -> (bool, slint::Image) {
+    let stamp = meta.updated_at.max(meta.created_at);
+    if let Some((s, has, img)) = session.browser_thumbs.borrow().get(&meta.id) {
+        if *s == stamp {
+            return (*has, img.clone());
+        }
+    }
+    let doc = load_canvas_doc(&session.data_dir, meta.id);
+    let (has, img) = if doc.nodes.is_empty() {
+        (false, slint::Image::default())
+    } else {
+        let view = view_for_fit(&doc, THUMB_W, THUMB_H);
+        let vp = Viewport::from_view(&view, THUMB_W, THUMB_H, &doc);
+        let no_ink = HashMap::new();
+        let opts = BoardDrawOpts {
+            selected_ids: &[],
+            connect_from: None,
+            show_ports: false,
+            ink_previews: &no_ink,
+        };
+        let gray = render_board(&doc, &vp, THUMB_W, THUMB_H, &opts);
+        note_preview_from_gray(THUMB_W, THUMB_H, &gray)
+    };
+    session
+        .browser_thumbs
+        .borrow_mut()
+        .insert(meta.id, (stamp, has, img.clone()));
+    (has, img)
 }
 
 fn push_browser(ui: &EphemerisUi, session: &CanvasSession) {
@@ -1031,6 +1319,7 @@ fn push_browser(ui: &EphemerisUi, session: &CanvasSession) {
     let profile = session.profile_filter.borrow().clone();
     let sort = session.sort_mode.borrow().clone();
     let view = session.view_mode.borrow().clone();
+    let query = ui.get_canvas_search_query().trim().to_lowercase();
     let now = now_secs();
     let show_badges = profile.is_empty();
 
@@ -1100,15 +1389,19 @@ fn push_browser(ui: &EphemerisUi, session: &CanvasSession) {
         .iter()
         .filter(|c| c.folder_id.unwrap_or(0) == fid)
         .filter(|c| profile.is_empty() || c.profile_id.is_empty() || c.profile_id == profile)
+        .filter(|c| query.is_empty() || c.title.to_lowercase().contains(&query))
         .map(|c| {
             let (show_profile, profile_icon_char, has_custom_profile_icon, custom_profile_icon) =
                 badge_for(&c.profile_id);
+            let (has_preview, preview) = canvas_thumbnail(session, c);
             (
                 c.clone(),
                 CanvasListItem {
                     id: c.id.to_string(),
                     title: c.title.clone(),
                     date_label: format_canvas_date(c.updated_at.max(c.created_at), now),
+                    has_preview,
+                    preview,
                     show_profile,
                     profile_icon_char,
                     has_custom_profile_icon,
@@ -1123,6 +1416,25 @@ fn push_browser(ui: &EphemerisUi, session: &CanvasSession) {
         _ => canvases.sort_by_key(|a| std::cmp::Reverse(a.0.updated_at)),
     }
     let canvases: Vec<CanvasListItem> = canvases.into_iter().map(|(_, e)| e).collect();
+
+    // Move dialog: every folder visible under the current profile filter.
+    let mut move_targets: Vec<FolderListItem> = idx
+        .folders
+        .iter()
+        .filter(|f| profile.is_empty() || f.profile_id.is_empty() || f.profile_id == profile)
+        .map(|f| FolderListItem {
+            id: f.id.to_string(),
+            title: f.title.clone(),
+            note_count: 0,
+            folder_count: 0,
+            show_profile: false,
+            profile_icon_char: String::new(),
+            has_custom_profile_icon: false,
+            custom_profile_icon: slint::Image::default(),
+        })
+        .collect();
+    move_targets.sort_by_key(|f| f.title.to_lowercase());
+    ui.set_canvas_move_folder_list(&move_targets);
 
     ui.set_canvas_folder_list(&folders);
     ui.set_canvas_list(&canvases);
@@ -1281,6 +1593,7 @@ fn leave_focus_if_any(ui: &EphemerisUi, session: &CanvasSession, config: &Rc<Ref
     let (iw, ih) = ui.ink_canvas_size();
     let pixels = ui.get_committed_pixels();
     let _ = save_card_page_pixels(&session.data_dir, canvas_id, &node_id, iw, ih, &pixels);
+    session.ink_previews_canvas.set(None);
 
     let version = recognition_model_version_for(&config.borrow());
     let mut cache = load_card_text(&session.data_dir, canvas_id, &node_id)
