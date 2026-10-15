@@ -1657,15 +1657,13 @@ export component EphemerisPage inherits Window {
                         property <length> prio-w: 28px;
                         property <length> due-w: 56px;
                         property <length> note-w: item.has-source-note ? 32px : 0px;
-                        property <length> edit-w: 32px;
                         property <length> gap: 8px;
                         property <length> x-check: self.pad;
                         property <length> x-profile: self.pad + self.check-w + self.gap;
                         property <length> x-prio: self.x-profile + self.profile-w + (item.show-profile ? self.gap : 0px);
                         property <length> x-title: self.x-prio + self.prio-w + self.gap;
-                        property <length> x-edit: self.width - self.pad - self.edit-w;
-                        property <length> x-note: self.x-edit - (item.has-source-note ? self.gap + self.note-w : 0px);
-                        property <length> x-due: self.x-note - self.gap - self.due-w;
+                        property <length> x-note: self.width - self.pad - self.note-w;
+                        property <length> x-due: self.x-note - (item.has-source-note ? self.gap : 0px) - self.due-w;
                         property <length> title-w: self.x-due - self.x-title - self.gap;
 
                         Rectangle {
@@ -1763,16 +1761,6 @@ export component EphemerisPage inherits Window {
                             font-size: 18px; color: EinkTheme.text-secondary;
                             horizontal-alignment: center; vertical-alignment: center;
                             TouchArea { clicked => { root.task-view-source-note(item.id); } }
-                        }
-
-                        Text {
-                            x: x-edit; y: 0;
-                            width: edit-w; height: parent.height;
-                            text: Icons.edit;
-                            font-family: "Material Icons";
-                            font-size: 18px; color: EinkTheme.text-secondary;
-                            horizontal-alignment: center; vertical-alignment: center;
-                            TouchArea { clicked => { root.task-edit-requested(item.id); } }
                         }
 
                         Rectangle {
