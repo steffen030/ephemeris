@@ -8901,8 +8901,11 @@ fn build_vault_note_export(
 ) -> VaultNoteExport {
     let export_root = &config.vault_export_subdir;
     let note_safe = ephemeris_core::vault_export::sanitize_component(&note.title);
-    let pdf_abs = ephemeris_core::notebook_export_dir(vault, export_root, notebook_segments)
-        .join(format!("{note_safe}.pdf"));
+    let note_dir = ephemeris_core::notebook_export_dir(vault, export_root, notebook_segments);
+    // Keep notebook folders markdown-first: PDF + hash live under `_assets/`.
+    ephemeris_core::migrate_legacy_note_pdf(&note_dir, &note_safe);
+    let pdf_abs =
+        ephemeris_core::note_pdf_export_path(vault, export_root, notebook_segments, &note_safe);
 
     let mut pdf_ok = false;
     // Prefer freshly recognised text over a cached See-text snapshot so export
@@ -8977,10 +8980,10 @@ fn build_vault_note_export(
     }
 
     let pdf_vault_rel = if pdf_ok || pdf_abs.exists() {
-        Some(ephemeris_core::notebook_export_rel(
+        Some(ephemeris_core::note_pdf_export_rel(
             export_root,
             notebook_segments,
-            &format!("{note_safe}.pdf"),
+            &note_safe,
         ))
     } else {
         None

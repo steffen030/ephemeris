@@ -65,7 +65,7 @@ pub struct Config {
     pub vault_tasks_inbox: PathBuf,
 
     /// Vault-relative folder where exported notes are mirrored
-    /// (`{subdir}/{Notebook}/…/{Note}.md` + `.pdf`).
+    /// (`{subdir}/Notes/{Notebook}/…/{Note}.md` + `_assets/{Note}.pdf`).
     ///
     /// Example TOML: `vault_export_subdir = "Ephemeris"`
     #[serde(default = "default_vault_export_subdir")]
