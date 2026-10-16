@@ -104,6 +104,8 @@ export global Icons {
     out property <string> tool-highlight: "\u{E310}";  // highlight_baseline (marker)
     out property <string> tool-eraser:    "\u{E0BD}";  // auto_fix_off_baseline
     out property <string> tool-clear:     "\u{E1B9}";  // delete_baseline
+    out property <string> undo:           "\u{E166}";  // undo (Flutter Material Icons)
+    out property <string> redo:           "\u{E15A}";  // redo
     out property <string> line-weight:    "\u{E37E}";  // line_weight_baseline
     out property <string> paper-blank:    "\u{E0F9}";  // border_clear_baseline
     out property <string> paper-lined:    "\u{E0FB}";  // border_horizontal_baseline
@@ -843,6 +845,8 @@ export component EphemerisPage inherits Window {
     in-out property <int> settings-theme-idx: 0;
     // When true, note canvas ink accepts pen (and desktop mouse) only — not finger.
     in-out property <bool> settings-pen-only: true;
+    // Hold stylus still at end of a shape stroke to snap into clean geometry.
+    in-out property <bool> settings-smart-shapes: false;
     // New-note title template (`yyyy`/`mm`/`dd` + `{n}`).
     in-out property <string> settings-note-title-pattern: "yyyy-mm-dd Note {n}";
     /// Comma- or space-separated curated note tag suggestions.
@@ -1202,6 +1206,11 @@ export component EphemerisPage inherits Window {
     callback tool-selected(string);
     callback pen-width-selected(string);
     callback clear-page();
+    callback ink-undo();
+    callback ink-redo();
+    // Undo/redo affordance in the drawing menu (ephemeris-e1b).
+    in-out property <bool> can-undo: false;
+    in-out property <bool> can-redo: false;
 
     // ── Canvas ───────────────────────────────────────────────────────────
     canvas := Rectangle {
@@ -3323,8 +3332,8 @@ export component EphemerisPage inherits Window {
     drawing-dropdown := Rectangle {
         visible: root.drawing-menu-open && root.is-canvas-context;
         x: parent.width - 192px; y: 60px;
-        // Last row (See text) ends at y 324; +6px bottom padding like the top.
-        width: 184px; height: 330px;
+        // Last row (See text) ends at y 370; +6px bottom padding like the top.
+        width: 184px; height: 376px;
         background: EinkTheme.chrome-bg;
         border-width: 2px; border-color: EinkTheme.chrome-border;
         border-radius: 6px;
@@ -3422,9 +3431,51 @@ export component EphemerisPage inherits Window {
             TouchArea { clicked => { root.clear-page(); root.drawing-menu-open = false; } }
         }
 
+        // -- Undo / Redo
+        Rectangle {
+            x: 6px; y: 98px; width: 84px; height: 42px;
+            border-radius: 3px;
+            opacity: root.can-undo ? 1.0 : 0.35;
+            Text {
+                y: 2px; width: parent.width; height: 24px;
+                text: Icons.undo; font-family: "Material Icons"; font-size: 20px;
+                color: EinkTheme.btn-fg;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
+            Text {
+                y: 26px; width: parent.width; height: 14px;
+                text: "Undo"; font-size: 9px; color: EinkTheme.btn-fg;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
+            TouchArea {
+                enabled: root.can-undo;
+                clicked => { root.ink-undo(); root.drawing-menu-open = false; }
+            }
+        }
+        Rectangle {
+            x: 94px; y: 98px; width: 84px; height: 42px;
+            border-radius: 3px;
+            opacity: root.can-redo ? 1.0 : 0.35;
+            Text {
+                y: 2px; width: parent.width; height: 24px;
+                text: Icons.redo; font-family: "Material Icons"; font-size: 20px;
+                color: EinkTheme.btn-fg;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
+            Text {
+                y: 26px; width: parent.width; height: 14px;
+                text: "Redo"; font-size: 9px; color: EinkTheme.btn-fg;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
+            TouchArea {
+                enabled: root.can-redo;
+                clicked => { root.ink-redo(); root.drawing-menu-open = false; }
+            }
+        }
+
         // -- Pen width: Thin / Med / Thick (same glyph, scaled weight cue)
         Rectangle {
-            x: 6px; y: 98px; width: 54px; height: 36px;
+            x: 6px; y: 144px; width: 54px; height: 36px;
             background: root.active-pen-width == "thin" ? EinkTheme.btn-active-bg : transparent;
             border-radius: 3px;
             Text {
@@ -3448,7 +3499,7 @@ export component EphemerisPage inherits Window {
             } }
         }
         Rectangle {
-            x: 64px; y: 98px; width: 54px; height: 36px;
+            x: 64px; y: 144px; width: 54px; height: 36px;
             background: root.active-pen-width == "medium" ? EinkTheme.btn-active-bg : transparent;
             border-radius: 3px;
             Text {
@@ -3472,7 +3523,7 @@ export component EphemerisPage inherits Window {
             } }
         }
         Rectangle {
-            x: 122px; y: 98px; width: 56px; height: 36px;
+            x: 122px; y: 144px; width: 56px; height: 36px;
             background: root.active-pen-width == "thick" ? EinkTheme.btn-active-bg : transparent;
             border-radius: 3px;
             Text {
@@ -3497,11 +3548,11 @@ export component EphemerisPage inherits Window {
         }
 
         // Separator
-        Rectangle { x: 6px; y: 138px; width: 172px; height: 1px; background: EinkTheme.chrome-border; }
+        Rectangle { x: 6px; y: 184px; width: 172px; height: 1px; background: EinkTheme.chrome-border; }
 
         // -- Paper row 1: Blank / Lined --
         Rectangle {
-            x: 6px; y: 143px; width: 84px; height: 42px;
+            x: 6px; y: 189px; width: 84px; height: 42px;
             background: root.active-paper == "blank" ? EinkTheme.btn-active-bg : transparent;
             border-radius: 3px;
             Text {
@@ -3519,7 +3570,7 @@ export component EphemerisPage inherits Window {
             TouchArea { clicked => { root.active-paper = "blank"; root.paper-type-tapped("blank"); root.drawing-menu-open = false; } }
         }
         Rectangle {
-            x: 94px; y: 143px; width: 84px; height: 42px;
+            x: 94px; y: 189px; width: 84px; height: 42px;
             background: root.active-paper == "lined" ? EinkTheme.btn-active-bg : transparent;
             border-radius: 3px;
             Text {
@@ -3539,7 +3590,7 @@ export component EphemerisPage inherits Window {
 
         // -- Paper row 2: Dotted / Squared --
         Rectangle {
-            x: 6px; y: 189px; width: 84px; height: 42px;
+            x: 6px; y: 235px; width: 84px; height: 42px;
             background: root.active-paper == "dotted" ? EinkTheme.btn-active-bg : transparent;
             border-radius: 3px;
             Text {
@@ -3557,7 +3608,7 @@ export component EphemerisPage inherits Window {
             TouchArea { clicked => { root.active-paper = "dotted"; root.paper-type-tapped("dotted"); root.drawing-menu-open = false; } }
         }
         Rectangle {
-            x: 94px; y: 189px; width: 84px; height: 42px;
+            x: 94px; y: 235px; width: 84px; height: 42px;
             background: root.active-paper == "squared" ? EinkTheme.btn-active-bg : transparent;
             border-radius: 3px;
             Text {
@@ -3576,11 +3627,11 @@ export component EphemerisPage inherits Window {
         }
 
         // Separator
-        Rectangle { x: 6px; y: 235px; width: 172px; height: 1px; background: EinkTheme.chrome-border; }
+        Rectangle { x: 6px; y: 281px; width: 172px; height: 1px; background: EinkTheme.chrome-border; }
 
         // -- Tags (note metadata → vault frontmatter)
         Rectangle {
-            x: 6px; y: 240px; width: 172px; height: 42px;
+            x: 6px; y: 286px; width: 172px; height: 42px;
             background: transparent;
             border-radius: 3px;
             Text {
@@ -3605,11 +3656,11 @@ export component EphemerisPage inherits Window {
         }
 
         // Separator
-        Rectangle { x: 6px; y: 282px; width: 172px; height: 1px; background: EinkTheme.chrome-border; }
+        Rectangle { x: 6px; y: 328px; width: 172px; height: 1px; background: EinkTheme.chrome-border; }
 
         // -- See text toggle (OCR / transcribed layer)
         Rectangle {
-            x: 6px; y: 286px; width: 172px; height: 42px;
+            x: 6px; y: 332px; width: 172px; height: 42px;
             background: root.note-see-text ? EinkTheme.btn-active-bg : transparent;
             border-radius: 3px;
             Text {
@@ -6198,6 +6249,54 @@ export component EphemerisPage inherits Window {
                                            color: !root.settings-pen-only ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
                                            horizontal-alignment: center; vertical-alignment: center; }
                                     TouchArea { clicked => { root.settings-pen-only = false; } }
+                                }
+
+                                Rectangle { horizontal-stretch: 1; }
+                            }
+                        }
+
+                        Rectangle { height: 2px; background: EinkTheme.chrome-border; }
+
+                        Rectangle {
+                            height: 56px;
+                            background: EinkTheme.canvas-bg;
+                            HorizontalLayout {
+                                padding-left: 16px; padding-right: 16px;
+                                padding-top: 6px; padding-bottom: 6px;
+                                spacing: 12px;
+
+                                VerticalLayout {
+                                    spacing: 2px;
+                                    width: 160px;
+                                    Text {
+                                        text: "Smart shapes";
+                                        font-size: 14px; color: EinkTheme.btn-fg;
+                                        vertical-alignment: center;
+                                    }
+                                    Text {
+                                        text: "Hold tip to snap";
+                                        font-size: 11px; color: EinkTheme.text-secondary;
+                                    }
+                                }
+
+                                Rectangle {
+                                    width: 64px; height: 32px;
+                                    background: root.settings-smart-shapes ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+                                    border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                                    Text { text: "On"; font-size: 13px;
+                                           color: root.settings-smart-shapes ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                                           horizontal-alignment: center; vertical-alignment: center; }
+                                    TouchArea { clicked => { root.settings-smart-shapes = true; } }
+                                }
+
+                                Rectangle {
+                                    width: 64px; height: 32px;
+                                    background: !root.settings-smart-shapes ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+                                    border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                                    Text { text: "Off"; font-size: 13px;
+                                           color: !root.settings-smart-shapes ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                                           horizontal-alignment: center; vertical-alignment: center; }
+                                    TouchArea { clicked => { root.settings-smart-shapes = false; } }
                                 }
 
                                 Rectangle { horizontal-stretch: 1; }

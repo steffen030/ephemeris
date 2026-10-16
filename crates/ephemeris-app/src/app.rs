@@ -10,11 +10,12 @@ use ephemeris_core::{
     resolve_wiki_target, review_queue, search_events, search_local_notes, search_tasks,
     set_lane_tag, spawn_user_lexicon_refresh, strip_inline_markdown, sync_notes_to_vault,
     sync_tags_from_structured, to_agenda_entries, AgendaRange, BgRecogIdle, CalendarEvent,
-    CascadingTranscriber, Config, EngageFilter, EventId, LineImageHtrTranscriber,
-    MarkdownTaskExtractor, PageRecognitionCache, PdfExportOptions, ProfileId, RasterOcrTranscriber,
-    RasterPage, SearchHit, SharedHtrLexicon, StrokeHtrTranscriber, Task, TaskContext,
-    TaskContextKind, TaskId, TaskPriority, TaskProvider, UserLexiconSources, VaultFtsIndex,
-    VaultNoteExport, BG_RECOG_IDLE_DELAY, RECOGNITION_CACHE_FORMAT,
+    CascadingTranscriber, Config, EngageFilter, EventId, InkEdit, InkHistoryMap,
+    LineImageHtrTranscriber, MarkdownTaskExtractor, PageRecognitionCache, PdfExportOptions,
+    ProfileId, RasterOcrTranscriber, RasterPage, SearchHit, SharedHtrLexicon, StrokeHtrTranscriber,
+    Task, TaskContext, TaskContextKind, TaskId, TaskPriority, TaskProvider, UserLexiconSources,
+    VaultFtsIndex, VaultNoteExport, BG_RECOG_IDLE_DELAY, DEFAULT_INK_HISTORY_DEPTH,
+    RECOGNITION_CACHE_FORMAT,
 };
 #[cfg(target_os = "linux")]
 use ephemeris_pal::input::{EvdevPenSource, PenTarget};
@@ -68,6 +69,24 @@ const NAV_REC: i32 = 5;
 /// Coalesce local page `.bin` / strokes JSON writes so rapid strokes do not
 /// stall the UI thread on flash I/O. Leave-note still flushes synchronously.
 const LOCAL_PAGE_WRITE_DEBOUNCE: Duration = Duration::from_millis(400);
+
+/// Hold-still duration at end of a stroke before smart-shape snap (ephemeris-9co).
+const SHAPE_HOLD: Duration = Duration::from_millis(500);
+/// Max tip drift (logical px) while holding for a smart-shape snap.
+const SHAPE_HOLD_SLOP: f32 = 10.0;
+
+/// Min lasso path length (logical px) before a loop counts as a selection.
+const LASSO_MIN_PATH: f32 = 40.0;
+/// Tip inside selection bbox (inflated) starts a drag rather than a new lasso.
+const SELECT_HIT_PAD: f32 = 16.0;
+
+/// Pending drawing-menu / shortcut command processed on the UI thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingInkCmd {
+    Undo,
+    Redo,
+    Clear,
+}
 
 /// Completed background per-line recognition (drained on the UI thread).
 /// Main-thread handlers slower than this log a warning (ephemeris-ktg.22).
@@ -3296,28 +3315,34 @@ impl App {
                 ui2.set_ring_visible(false);
             });
         }
-        {
-            let ui_rc = ui.clone();
-            let ui2 = ui.clone_component();
-            ui.on_ring_clear(move || {
-                ui_rc.clear_ink();
-                ui2.set_ring_visible(false);
-            });
-        }
+        // Ring clear is wired with pending_ink_cmd (ephemeris-e1b) later.
 
         // ── Burger menu tool selection → ink engine ───────────────────────────
         {
             let ui_rc = ui.clone();
             let ui2 = ui.clone_component();
             ui.on_tool_selected(move |tool| {
-                let t = match tool.as_str() {
-                    "pen" => Tool::Pen,
-                    "highlighter" => Tool::Highlighter,
-                    "eraser" => Tool::Eraser,
-                    _ => return,
-                };
-                ui_rc.set_tool(t);
-                ui2.set_active_tool(tool.into());
+                match tool.as_str() {
+                    "pen" => {
+                        ui_rc.set_tool(Tool::Pen);
+                        ui2.set_active_tool("pen".into());
+                    }
+                    "highlighter" => {
+                        ui_rc.set_tool(Tool::Highlighter);
+                        ui2.set_active_tool("highlighter".into());
+                    }
+                    "eraser" => {
+                        ui_rc.set_tool(Tool::Eraser);
+                        ui2.set_active_tool("eraser".into());
+                    }
+                    "move" => {
+                        // Move/lasso is handled in the app pointer path — keep
+                        // the ink engine on Pen so a later tool switch is clean.
+                        ui_rc.set_tool(Tool::Pen);
+                        ui2.set_active_tool("move".into());
+                    }
+                    _ => {}
+                }
             });
         }
         // ── Burger Thin / Med / Thick → pen base_width ────────────────────────
@@ -4242,6 +4267,39 @@ impl App {
         // Shared modifier state: Ctrl held = ring mode, plain click = draw.
         // On the real eink device this maps to PenButton; Ctrl is the desktop stand-in.
         let ctrl_held: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let shift_held: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        // Note ink undo/redo stacks (ephemeris-e1b), keyed by (note_id, doc_page).
+        let ink_history: Rc<RefCell<InkHistoryMap>> =
+            Rc::new(RefCell::new(InkHistoryMap::new(DEFAULT_INK_HISTORY_DEPTH)));
+        let pending_ink_cmd: Rc<Cell<Option<PendingInkCmd>>> = Rc::new(Cell::new(None));
+
+        // ── Drawing menu Clear / Undo / Redo + ring clear (ephemeris-e1b) ─────
+        {
+            let ui2 = ui.clone_component();
+            let pending = pending_ink_cmd.clone();
+            ui.on_ring_clear(move || {
+                pending.set(Some(PendingInkCmd::Clear));
+                ui2.set_ring_visible(false);
+            });
+        }
+        {
+            let pending = pending_ink_cmd.clone();
+            ui.on_clear_page(move || {
+                pending.set(Some(PendingInkCmd::Clear));
+            });
+        }
+        {
+            let pending = pending_ink_cmd.clone();
+            ui.on_ink_undo(move || {
+                pending.set(Some(PendingInkCmd::Undo));
+            });
+        }
+        {
+            let pending = pending_ink_cmd.clone();
+            ui.on_ink_redo(move || {
+                pending.set(Some(PendingInkCmd::Redo));
+            });
+        }
 
         // True if the canvas's own TouchArea received the most recent pointer-down.
         // Because Slint only routes PointerPressed to the topmost element at the click
@@ -4515,6 +4573,7 @@ impl App {
                 let theme_idx = if cfg.theme == "dark" { 1 } else { 0 };
                 ui2.set_settings_theme_idx(theme_idx);
                 ui2.set_settings_pen_only(cfg.pen_only_drawing);
+                ui2.set_settings_smart_shapes(cfg.note_smart_shapes);
                 ui2.set_settings_note_title_pattern(cfg.note_title_pattern.as_str().into());
                 ui_rc.set_settings_note_suggested_tags(&cfg.note_suggested_tags.join(", "));
                 let vault = cfg
@@ -5206,6 +5265,7 @@ impl App {
                 let theme_idx = ui2.get_settings_theme_idx();
                 let theme = if theme_idx == 1 { "dark" } else { "light" };
                 let pen_only = ui2.get_settings_pen_only();
+                let smart_shapes = ui2.get_settings_smart_shapes();
                 let note_title_pattern = {
                     let s = ui2.get_settings_note_title_pattern();
                     let trimmed = s.trim();
@@ -5258,6 +5318,7 @@ impl App {
                 let mut new_cfg = cfg2.borrow().clone();
                 new_cfg.theme = theme.to_string();
                 new_cfg.pen_only_drawing = pen_only;
+                new_cfg.note_smart_shapes = smart_shapes;
                 new_cfg.note_title_pattern = note_title_pattern;
                 new_cfg.note_suggested_tags =
                     parse_note_tag_list(&ui2.get_settings_note_suggested_tags());
@@ -5898,6 +5959,9 @@ impl App {
             cursor_pos: (0.0, 0.0),
             scale: 1.0,
             ctrl_held,
+            shift_held,
+            ink_history,
+            pending_ink_cmd,
             canvas_touch_down,
             page_swipe_allowed,
             page_swipe_handled,
@@ -5908,6 +5972,9 @@ impl App {
             ink_trace: InkLatencyTrace::new(),
             pen_ink_skip_slint: false,
             last_ink_pressure: 0.5,
+            shape_hold: None,
+            select_gesture: None,
+            undo_ui_page: None,
             data_dir,
             notes: notes.clone(),
             notebooks: notebooks.clone(),
@@ -6004,6 +6071,44 @@ fn board_finger_midpoint(fingers: &HashMap<u64, (f32, f32)>) -> (f32, f32) {
     ((x0 + x1) * 0.5, (y0 + y1) * 0.5)
 }
 
+/// Tracks stillness at the end of a pen stroke for hold-to-snap smart shapes.
+struct ShapeHoldState {
+    quiet_since: Instant,
+    last_x: f32,
+    last_y: f32,
+    snapped: bool,
+}
+
+/// Move-tool gesture state (lasso select + drag). Never feeds the ink engine.
+enum SelectGesture {
+    /// Drawing a freehand loop (canvas-relative points).
+    Lassoing {
+        points: Vec<(f32, f32)>,
+        preview_damage: ephemeris_core::geom::Rect,
+    },
+    /// Strokes selected; waiting for drag or a new lasso.
+    Selected {
+        ids: Vec<ephemeris_core::StrokeId>,
+        /// Union bbox of the selection in canvas coords (for hit-testing).
+        bbox: ephemeris_core::geom::Rect,
+        /// Damage of the dashed outline drawn around the selection.
+        outline: ephemeris_core::geom::Rect,
+    },
+    /// Dragging a prior selection; originals hidden on committed layer.
+    Dragging {
+        ids: Vec<ephemeris_core::StrokeId>,
+        /// Snapshot of strokes at drag start (pre-translate).
+        originals: Vec<ephemeris_core::Stroke>,
+        origin_x: f32,
+        origin_y: f32,
+        /// Region cleared on the committed layer when the drag began.
+        hide_damage: ephemeris_core::geom::Rect,
+        preview_damage: ephemeris_core::geom::Rect,
+        dx: f32,
+        dy: f32,
+    },
+}
+
 /// Distinguishes pen digitiser, finger touch, and desktop mouse for ink gating
 /// and page-swipe eligibility.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6026,6 +6131,12 @@ struct WinitHandler {
     scale: f64,
     /// True while the left Ctrl key is held (simulates the pen side-button).
     ctrl_held: Rc<Cell<bool>>,
+    /// Shift held (Ctrl+Shift+Z = redo).
+    shift_held: Rc<Cell<bool>>,
+    /// Per-page ink undo/redo (ephemeris-e1b).
+    ink_history: Rc<RefCell<InkHistoryMap>>,
+    /// Drawing-menu / shortcut command waiting to run on the UI thread.
+    pending_ink_cmd: Rc<Cell<Option<PendingInkCmd>>>,
     /// Set by the canvas TouchArea's pointer-event(down) callback; cleared
     /// before each dispatch so we know whether the canvas (vs. chrome like the
     /// burger button) actually received the press.
@@ -6052,6 +6163,12 @@ struct WinitHandler {
     /// Last contact pressure while drawing — PenUp often reports 0 and would
     /// otherwise collapse stroke tip width via Catmull-Rom.
     last_ink_pressure: f32,
+    /// Hold-still tracker for smart-shape snap (None when feature off / idle).
+    shape_hold: Option<ShapeHoldState>,
+    /// Lasso / drag state while the Move tool is active.
+    select_gesture: Option<SelectGesture>,
+    /// Note page the undo/redo affordances were last synced for.
+    undo_ui_page: Option<(u32, usize)>,
     /// Directory where per-note pixel data is saved.
     data_dir: PathBuf,
     /// Shared note list — used to map page_idx → note_id for persistence.
@@ -6334,9 +6451,30 @@ impl WinitHandler {
         } else {
             self.ui.dispatch_pointer_moved(lx, ly);
         }
+        // Move-tool lasso / drag tracking (independent of is_drawing).
+        if self.select_gesture.is_some() && self.is_move_tool() {
+            self.handle_select_move(lx, ly);
+            return;
+        }
+
         if self.is_drawing {
             if pressure > 0.05 {
                 self.last_ink_pressure = pressure;
+            }
+            // After a smart-shape snap, ignore further moves so the engine tip
+            // stays put until PenUp commits the fitted stroke.
+            if self.shape_hold.as_ref().is_some_and(|h| h.snapped) {
+                self.request_redraw_coalesced();
+                return;
+            }
+            if let Some(h) = self.shape_hold.as_mut() {
+                let far = (lx - h.last_x).abs() > SHAPE_HOLD_SLOP
+                    || (ly - h.last_y).abs() > SHAPE_HOLD_SLOP;
+                if far {
+                    h.quiet_since = Instant::now();
+                    h.last_x = lx;
+                    h.last_y = ly;
+                }
             }
             let cy = ly - STATUS_BAR_H as f32;
             if cy >= 0.0 {
@@ -6425,6 +6563,23 @@ impl WinitHandler {
             PointerSource::Finger => !pen_only,
         };
 
+        if !self.is_move_tool() && self.select_gesture.is_some() {
+            self.cancel_select_gesture();
+        }
+
+        // Move / lasso tool: select+drag path — never feed the ink engine.
+        if self.is_move_tool()
+            && allow_ink
+            && !self.ctrl_held.get()
+            && self.ui.hits_inkable_canvas(lx, ly)
+        {
+            self.pen_ink_skip_slint = matches!(self.pointer_source, PointerSource::Pen);
+            self.canvas_touch_down.set(true);
+            self.handle_select_press(lx, ly);
+            self.request_redraw_coalesced();
+            return;
+        }
+
         // Pen on the active ink plane: skip Slint press dispatch (dirties UI /
         // can upgrade Fast→Partial). Geometry gate replaces canvas TouchArea.
         let pen_fast = matches!(self.pointer_source, PointerSource::Pen)
@@ -6435,6 +6590,7 @@ impl WinitHandler {
             self.pen_ink_skip_slint = true;
             self.canvas_touch_down.set(true);
             self.is_drawing = true;
+            self.arm_shape_hold(lx, ly);
             self.bg_recog.on_pen_down();
             self.last_ink_pressure = pressure.max(0.05);
             let cy = ly - STATUS_BAR_H as f32;
@@ -6469,6 +6625,7 @@ impl WinitHandler {
             && self.canvas_touch_down.get()
         {
             self.is_drawing = true;
+            self.arm_shape_hold(lx, ly);
             self.bg_recog.on_pen_down();
             self.last_ink_pressure = pressure.max(0.05);
             let cy = ly - STATUS_BAR_H as f32;
@@ -6487,6 +6644,407 @@ impl WinitHandler {
             self.ink_trace.on_feed_done(t_us);
         }
         self.request_redraw_coalesced();
+    }
+
+    /// Start (or clear) hold-to-snap tracking for the new stroke.
+    fn arm_shape_hold(&mut self, lx: f32, ly: f32) {
+        if self.config.borrow().note_smart_shapes {
+            self.shape_hold = Some(ShapeHoldState {
+                quiet_since: Instant::now(),
+                last_x: lx,
+                last_y: ly,
+                snapped: false,
+            });
+        } else {
+            self.shape_hold = None;
+        }
+    }
+
+    fn is_move_tool(&self) -> bool {
+        self.ui.get_active_tool() == "move"
+    }
+
+    /// Abandon lasso/drag; restore any strokes hidden for a move preview.
+    fn cancel_select_gesture(&mut self) {
+        match self.select_gesture.take() {
+            Some(SelectGesture::Dragging { hide_damage, .. }) => {
+                self.ui.restore_hidden_strokes(&hide_damage);
+                self.ui.clear_select_preview();
+            }
+            Some(_) => self.ui.clear_select_preview(),
+            None => {}
+        }
+    }
+
+    /// Forget the selection after a page switch without touching the new
+    /// page's committed raster (hidden-stroke restore is page-specific).
+    fn drop_select_gesture(&mut self) {
+        if self.select_gesture.take().is_some() {
+            self.ui.clear_select_preview();
+            self.request_redraw_coalesced();
+        }
+    }
+
+    fn handle_select_press(&mut self, lx: f32, ly: f32) {
+        use ephemeris_ui::STATUS_BAR_H;
+        let cy = ly - STATUS_BAR_H as f32;
+        if cy < 0.0 {
+            return;
+        }
+
+        if let Some(SelectGesture::Selected { ids, bbox, outline }) = self.select_gesture.take() {
+            let hit = lx >= bbox.min_x - SELECT_HIT_PAD
+                && lx <= bbox.max_x + SELECT_HIT_PAD
+                && cy >= bbox.min_y - SELECT_HIT_PAD
+                && cy <= bbox.max_y + SELECT_HIT_PAD;
+            if hit {
+                let originals: Vec<_> = self
+                    .ui
+                    .get_page_strokes()
+                    .into_iter()
+                    .filter(|s| ids.contains(&s.id))
+                    .collect();
+                let hide_damage = self.ui.hide_strokes_for_move(&ids);
+                // Passing the outline as prior damage erases it on screen.
+                let preview_damage = self.ui.set_move_preview(&originals, outline);
+                self.select_gesture = Some(SelectGesture::Dragging {
+                    ids,
+                    originals,
+                    origin_x: lx,
+                    origin_y: cy,
+                    hide_damage,
+                    preview_damage,
+                    dx: 0.0,
+                    dy: 0.0,
+                });
+                return;
+            }
+            self.ui.clear_select_preview();
+        } else if matches!(
+            self.select_gesture,
+            Some(SelectGesture::Dragging { .. }) | Some(SelectGesture::Lassoing { .. })
+        ) {
+            self.cancel_select_gesture();
+        }
+
+        let preview_damage = self
+            .ui
+            .set_lasso_preview(&[(lx, cy)], ephemeris_core::geom::Rect::empty());
+        self.select_gesture = Some(SelectGesture::Lassoing {
+            points: vec![(lx, cy)],
+            preview_damage,
+        });
+    }
+
+    fn handle_select_move(&mut self, lx: f32, ly: f32) {
+        use ephemeris_ui::STATUS_BAR_H;
+        let cy = ly - STATUS_BAR_H as f32;
+        // Clone what we need so we don't hold `select_gesture` across UI borrows.
+        enum MoveKind {
+            Lasso {
+                points: Vec<(f32, f32)>,
+                prev: ephemeris_core::geom::Rect,
+            },
+            Drag {
+                preview: Vec<ephemeris_core::Stroke>,
+                prev: ephemeris_core::geom::Rect,
+                dx: f32,
+                dy: f32,
+            },
+        }
+        let kind = match &self.select_gesture {
+            Some(SelectGesture::Lassoing {
+                points,
+                preview_damage,
+            }) => {
+                let mut points = points.clone();
+                points.push((lx, cy));
+                Some(MoveKind::Lasso {
+                    points,
+                    prev: *preview_damage,
+                })
+            }
+            Some(SelectGesture::Dragging {
+                originals,
+                origin_x,
+                origin_y,
+                preview_damage,
+                ..
+            }) => {
+                let dx = lx - origin_x;
+                let dy = cy - origin_y;
+                let preview: Vec<_> = originals
+                    .iter()
+                    .map(|s| {
+                        let mut c = s.clone();
+                        ephemeris_core::ink::translate_stroke(&mut c, dx, dy);
+                        c
+                    })
+                    .collect();
+                Some(MoveKind::Drag {
+                    preview,
+                    prev: *preview_damage,
+                    dx,
+                    dy,
+                })
+            }
+            _ => None,
+        };
+        match kind {
+            Some(MoveKind::Lasso { points, prev }) => {
+                let damage = self.ui.set_lasso_preview(&points, prev);
+                if let Some(SelectGesture::Lassoing {
+                    points: p,
+                    preview_damage,
+                }) = self.select_gesture.as_mut()
+                {
+                    *p = points;
+                    *preview_damage = damage;
+                }
+                self.request_redraw_coalesced();
+            }
+            Some(MoveKind::Drag {
+                preview,
+                prev,
+                dx,
+                dy,
+            }) => {
+                let damage = self.ui.set_move_preview(&preview, prev);
+                if let Some(SelectGesture::Dragging {
+                    preview_damage,
+                    dx: ddx,
+                    dy: ddy,
+                    ..
+                }) = self.select_gesture.as_mut()
+                {
+                    *preview_damage = damage;
+                    *ddx = dx;
+                    *ddy = dy;
+                }
+                self.request_redraw_coalesced();
+            }
+            None => {}
+        }
+    }
+
+    fn handle_select_release(&mut self, lx: f32, ly: f32) {
+        use ephemeris_ui::STATUS_BAR_H;
+        let cy = ly - STATUS_BAR_H as f32;
+        match self.select_gesture.take() {
+            Some(SelectGesture::Lassoing { points, .. }) => {
+                let path_len: f32 = points
+                    .windows(2)
+                    .map(|w| {
+                        let dx = w[1].0 - w[0].0;
+                        let dy = w[1].1 - w[0].1;
+                        (dx * dx + dy * dy).sqrt()
+                    })
+                    .sum();
+                self.ui.clear_select_preview();
+                if path_len < LASSO_MIN_PATH || points.len() < 3 {
+                    return;
+                }
+                let ids = self.ui.strokes_inside_lasso(&points);
+                if ids.is_empty() {
+                    return;
+                }
+                self.enter_selected(ids);
+            }
+            Some(SelectGesture::Dragging {
+                ids,
+                hide_damage,
+                origin_x,
+                origin_y,
+                ..
+            }) => {
+                // Prefer release point if the last move was coalesced away.
+                let dx = lx - origin_x;
+                let dy = cy - origin_y;
+                self.ui.clear_select_preview();
+                if dx.abs() > 0.5 || dy.abs() > 0.5 {
+                    self.ui.translate_strokes(&ids, dx, dy);
+                    self.record_ink_edit(InkEdit::Translate {
+                        ids: ids.clone(),
+                        dx,
+                        dy,
+                    });
+                    // Persist + sync_strokes / See-text / note_tasks; arm idle HWR.
+                    // Do not call on_pen_down during the select gesture.
+                    self.persist_note_page_and_schedule_export();
+                    self.bg_recog.on_pen_up();
+                    self.sync_undo_redo_ui();
+                } else {
+                    self.ui.restore_hidden_strokes(&hide_damage);
+                }
+                self.enter_selected(ids);
+            }
+            Some(other) => {
+                // Selected without a drag: keep it.
+                self.select_gesture = Some(other);
+            }
+            None => {}
+        }
+    }
+
+    /// Enter the Selected state and outline the selection on the live layer.
+    fn enter_selected(&mut self, ids: Vec<ephemeris_core::StrokeId>) {
+        let bbox = Self::bbox_for_ids(&self.ui.get_page_strokes(), &ids);
+        let outline = self
+            .ui
+            .set_selection_outline(bbox, ephemeris_core::geom::Rect::empty());
+        self.select_gesture = Some(SelectGesture::Selected { ids, bbox, outline });
+    }
+
+    fn bbox_for_ids(
+        strokes: &[ephemeris_core::Stroke],
+        ids: &[ephemeris_core::StrokeId],
+    ) -> ephemeris_core::geom::Rect {
+        let mut bbox = ephemeris_core::geom::Rect::empty();
+        for s in strokes {
+            if ids.contains(&s.id) {
+                bbox = bbox.union(&s.approx_bbox());
+            }
+        }
+        bbox
+    }
+
+    fn current_note_page(&self) -> Option<(u32, usize)> {
+        let page_idx = self.ui.current_page_idx();
+        self.notes
+            .borrow()
+            .iter()
+            .find(|n| n.page_index == page_idx)
+            .map(|n| (n.id, n.doc_page))
+    }
+
+    /// Record strokes the eraser removed during a gesture that ended without
+    /// a normal PenUp (page swipe / clear), so they stay undoable and do not
+    /// leak into the next stroke's history entry.
+    fn record_pending_erase(&self) {
+        let erased = self.ui.take_eraser_removed();
+        if !erased.is_empty() {
+            self.record_ink_edit(InkEdit::Remove(erased));
+        }
+    }
+
+    fn record_ink_edit(&self, edit: InkEdit) {
+        let Some((note_id, doc_page)) = self.current_note_page() else {
+            return;
+        };
+        self.ink_history.borrow_mut().push(note_id, doc_page, edit);
+    }
+
+    fn sync_undo_redo_ui(&self) {
+        if let Some((note_id, doc_page)) = self.current_note_page() {
+            let h = self.ink_history.borrow();
+            self.ui.set_can_undo(h.can_undo(note_id, doc_page));
+            self.ui.set_can_redo(h.can_redo(note_id, doc_page));
+        } else {
+            self.ui.set_can_undo(false);
+            self.ui.set_can_redo(false);
+        }
+    }
+
+    /// Apply a pending Undo / Redo / Clear from the drawing menu or shortcut.
+    fn process_pending_ink_cmd(&mut self) {
+        let Some(cmd) = self.pending_ink_cmd.take() else {
+            return;
+        };
+        // Undo/redo mid-gesture is dropped (not deferred): replaying it after
+        // PenUp would immediately revert the stroke the user just drew.
+        let mid_gesture = self.is_drawing
+            || matches!(
+                self.select_gesture,
+                Some(SelectGesture::Lassoing { .. }) | Some(SelectGesture::Dragging { .. })
+            );
+        if mid_gesture && !matches!(cmd, PendingInkCmd::Clear) {
+            return;
+        }
+        if self.is_drawing {
+            self.is_drawing = false;
+            self.shape_hold = None;
+            self.bg_recog.set_drawing(false);
+            self.ui.discard_in_progress_stroke();
+            self.record_pending_erase();
+        }
+        // An idle selection would go stale once strokes change underneath it.
+        self.cancel_select_gesture();
+        match cmd {
+            PendingInkCmd::Undo => self.perform_ink_undo(),
+            PendingInkCmd::Redo => self.perform_ink_redo(),
+            PendingInkCmd::Clear => self.perform_ink_clear(),
+        }
+    }
+
+    fn perform_ink_undo(&mut self) {
+        let Some((note_id, doc_page)) = self.current_note_page() else {
+            return;
+        };
+        let Some(op) = self.ink_history.borrow_mut().undo(note_id, doc_page) else {
+            return;
+        };
+        self.bg_recog.on_pen_down(); // cancel in-flight HWR
+        if self.ui.apply_ink_op(&op) {
+            self.persist_note_page_and_schedule_export();
+            self.bg_recog.on_pen_up();
+        }
+        self.sync_undo_redo_ui();
+        self.request_redraw_coalesced();
+    }
+
+    fn perform_ink_redo(&mut self) {
+        let Some((note_id, doc_page)) = self.current_note_page() else {
+            return;
+        };
+        let Some(op) = self.ink_history.borrow_mut().redo(note_id, doc_page) else {
+            return;
+        };
+        self.bg_recog.on_pen_down();
+        if self.ui.apply_ink_op(&op) {
+            self.persist_note_page_and_schedule_export();
+            self.bg_recog.on_pen_up();
+        }
+        self.sync_undo_redo_ui();
+        self.request_redraw_coalesced();
+    }
+
+    fn perform_ink_clear(&mut self) {
+        self.cancel_select_gesture();
+        let before = self.ui.get_page_strokes();
+        if before.is_empty() {
+            return;
+        }
+        self.record_ink_edit(InkEdit::Clear { before });
+        self.ui.clear_ink();
+        self.persist_note_page_and_schedule_export();
+        self.bg_recog.on_pen_up();
+        self.sync_undo_redo_ui();
+        self.request_redraw_coalesced();
+    }
+
+    /// Fire smart-shape snap once the tip has been still for [`SHAPE_HOLD`].
+    fn poll_shape_hold(&mut self) -> bool {
+        if !self.is_drawing {
+            return false;
+        }
+        let Some(h) = self.shape_hold.as_ref() else {
+            return false;
+        };
+        if h.snapped || h.quiet_since.elapsed() < SHAPE_HOLD {
+            return false;
+        }
+        if self.ui.try_snap_in_progress_shape() {
+            if let Some(h) = self.shape_hold.as_mut() {
+                h.snapped = true;
+            }
+            true
+        } else {
+            // Fit failed — wait another hold period before retrying.
+            if let Some(h) = self.shape_hold.as_mut() {
+                h.quiet_since = Instant::now();
+            }
+            false
+        }
     }
 
     /// Persist raster + strokes when the live stroke list changed (erase / clear).
@@ -6592,8 +7150,14 @@ impl WinitHandler {
         if !skip_slint && self.page_swipe_handled.get() {
             if self.is_drawing {
                 self.is_drawing = false;
+                self.shape_hold = None;
                 self.bg_recog.set_drawing(false);
                 self.ui.discard_in_progress_stroke();
+                self.record_pending_erase();
+                self.sync_undo_redo_ui();
+            }
+            if self.select_gesture.is_some() {
+                self.cancel_select_gesture();
             }
             self.page_swipe_handled.set(false);
             if let Some(d) = &self.display {
@@ -6601,8 +7165,16 @@ impl WinitHandler {
             }
             return;
         }
+        if self.select_gesture.is_some() && self.is_move_tool() {
+            self.handle_select_release(lx, ly);
+            if let Some(d) = &self.display {
+                d.request_redraw();
+            }
+            return;
+        }
         if self.is_drawing {
             self.is_drawing = false;
+            self.shape_hold = None;
             let cy = ly - STATUS_BAR_H as f32;
             self.ink_trace.on_drained(t_us);
             let update = self.ui.feed_input(
@@ -6618,6 +7190,19 @@ impl WinitHandler {
                 t_ms_from_us(t_us),
             );
             self.ink_trace.on_feed_done(t_us);
+            // Record undo history (pen add or eraser batch) before persist.
+            let erased = self.ui.take_eraser_removed();
+            if !erased.is_empty() {
+                self.record_ink_edit(InkEdit::Remove(erased));
+            } else if let InkUpdate::Finished { stroke, .. } = &update {
+                // Look up the stored stroke: a smart-shape snap replaces the
+                // engine's freehand points, and redo must restore the shape.
+                if stroke.tool != Tool::Eraser {
+                    if let Some(stored) = self.ui.page_stroke(stroke.id) {
+                        self.record_ink_edit(InkEdit::Add(vec![stored]));
+                    }
+                }
+            }
             // Persist after pen commit / erase gesture end. Keep local disk
             // writes on the UI thread (fast) but never run vault OCR/PDF here.
             if matches!(update, InkUpdate::Finished { .. }) || self.ui.take_strokes_dirty() {
@@ -6625,6 +7210,7 @@ impl WinitHandler {
             }
             // Arm idle background recognition (≥ 1.5 s after last PenUp).
             self.bg_recog.on_pen_up();
+            self.sync_undo_redo_ui();
         } else {
             // Clear / erase that finished without an active draw still needs save.
             self.persist_if_strokes_dirty();
@@ -6690,6 +7276,21 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let _stall = StallWatch::new("about_to_wait");
+        self.process_pending_ink_cmd();
+        // Page / note switches change which history the drawing menu reflects
+        // and leave any selection pointing at the previous page's strokes.
+        let note_page = self.current_note_page();
+        if note_page != self.undo_ui_page {
+            self.undo_ui_page = note_page;
+            self.sync_undo_redo_ui();
+            self.drop_select_gesture();
+        }
+        // Switching away from the Move tool drops the selection outline now,
+        // not on the next pen-down.
+        if self.select_gesture.is_some() && !self.is_move_tool() {
+            self.cancel_select_gesture();
+            self.request_redraw_coalesced();
+        }
         #[cfg(target_os = "linux")]
         self.drain_pen_events();
         // Hide Mutter tablet-tool cursor (zwp_tablet_tool_v2.set_cursor on
@@ -6789,6 +7390,11 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
 
         // --- Canvas: long-press fires while the finger is still down ---
         if crate::canvas_app::poll_board_long_press(&self.ui, &self.canvas_session) {
+            self.request_redraw_coalesced();
+        }
+
+        // --- Notes: hold-still smart-shape snap while the tip is still down ---
+        if self.poll_shape_hold() {
             self.request_redraw_coalesced();
         }
 
@@ -7008,7 +7614,20 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
             ControlFlow::WaitUntil(_) | ControlFlow::Wait => None,
             ControlFlow::Poll => Some(now),
         };
-        match (crate::canvas_app::next_wake(&self.canvas_session), current) {
+        let shape_wake = self.shape_hold.as_ref().and_then(|h| {
+            if self.is_drawing && !h.snapped {
+                Some(h.quiet_since + SHAPE_HOLD)
+            } else {
+                None
+            }
+        });
+        let canvas_wake = crate::canvas_app::next_wake(&self.canvas_session);
+        let earliest = match (shape_wake, canvas_wake) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        };
+        match (earliest, current) {
             (Some(wake), Some(t)) if wake < t => {
                 event_loop.set_control_flow(ControlFlow::WaitUntil(wake));
             }
@@ -7104,11 +7723,12 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
                 self.on_kiosk_geometry();
             }
 
-            // Track Ctrl modifier so canvas-touch only opens ring when Ctrl is held.
+            // Track Ctrl/Shift so canvas-touch opens ring and Ctrl+Z/Y undo/redo.
             WindowEvent::ModifiersChanged(modifiers) => {
                 use winit::keyboard::ModifiersState;
-                self.ctrl_held
-                    .set(modifiers.state().contains(ModifiersState::CONTROL));
+                let state = modifiers.state();
+                self.ctrl_held.set(state.contains(ModifiersState::CONTROL));
+                self.shift_held.set(state.contains(ModifiersState::SHIFT));
             }
 
             WindowEvent::CursorMoved { position, .. } => {
@@ -7222,6 +7842,37 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
 
             WindowEvent::KeyboardInput { event, .. } => {
                 use winit::keyboard::{Key, NamedKey};
+                // Desktop undo/redo (ephemeris-e1b): Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y.
+                // Text fields keep their own Ctrl+Z; only the note page owns ink undo.
+                if event.state == winit::event::ElementState::Pressed
+                    && self.ctrl_held.get()
+                    && !self.ui.text_entry_active()
+                    && self.ui.is_note_canvas_page()
+                {
+                    if let Key::Character(s) = &event.logical_key {
+                        let lower = s.to_lowercase();
+                        if lower == "z" {
+                            if self.shift_held.get() {
+                                self.pending_ink_cmd.set(Some(PendingInkCmd::Redo));
+                            } else {
+                                self.pending_ink_cmd.set(Some(PendingInkCmd::Undo));
+                            }
+                            self.process_pending_ink_cmd();
+                            if let Some(d) = &self.display {
+                                d.request_redraw();
+                            }
+                            return;
+                        }
+                        if lower == "y" {
+                            self.pending_ink_cmd.set(Some(PendingInkCmd::Redo));
+                            self.process_pending_ink_cmd();
+                            if let Some(d) = &self.display {
+                                d.request_redraw();
+                            }
+                            return;
+                        }
+                    }
+                }
                 let text: slint::SharedString = match &event.logical_key {
                     Key::Named(NamedKey::Backspace) => slint::platform::Key::Backspace.into(),
                     Key::Named(NamedKey::Delete) => slint::platform::Key::Delete.into(),
