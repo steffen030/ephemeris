@@ -120,8 +120,9 @@ pub use local_task_store::{
 };
 pub use markdown_tasks::{MarkdownTaskExtractor, DEFAULT_TASKS_INBOX};
 pub use note_search::{
-    list_markdown_files, markdown_to_blocks, markdown_to_plain, search_events, search_local_notes,
-    search_tasks, strip_inline_markdown, MdBlock, MdBlockKind, SearchHit, VaultFtsIndex,
+    list_markdown_files, markdown_to_blocks, markdown_to_plain, resolve_wiki_target, search_events,
+    search_local_notes, search_tasks, strip_inline_markdown, MdBlock, MdBlockKind, SearchHit,
+    VaultFtsIndex,
 };
 pub use note_tasks::{
     checkbox_tasks_for_page, note_task_id, note_task_source_ref, parse_note_source_ref,

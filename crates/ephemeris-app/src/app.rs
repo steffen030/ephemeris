@@ -6,14 +6,15 @@ use ephemeris_core::profile_manager::ProfileManager;
 use ephemeris_core::{
     count_lane, export_raster_pages_to_pdf, filter_agenda, format_note_title, is_stale,
     list_engage, load_merged_htr_lexicon, lower_thread_nice_priority, mark_reviewed,
-    markdown_to_blocks, markdown_to_plain, recognition_model_version, resolve_lane, review_queue,
-    search_events, search_local_notes, search_tasks, set_lane_tag, spawn_user_lexicon_refresh,
-    strip_inline_markdown, sync_notes_to_vault, sync_tags_from_structured, to_agenda_entries,
-    AgendaRange, BgRecogIdle, CalendarEvent, CascadingTranscriber, Config, EngageFilter, EventId,
-    LineImageHtrTranscriber, MarkdownTaskExtractor, PageRecognitionCache, PdfExportOptions,
-    ProfileId, RasterOcrTranscriber, RasterPage, SearchHit, SharedHtrLexicon, StrokeHtrTranscriber,
-    Task, TaskContext, TaskContextKind, TaskId, TaskPriority, TaskProvider, UserLexiconSources,
-    VaultFtsIndex, VaultNoteExport, BG_RECOG_IDLE_DELAY, RECOGNITION_CACHE_FORMAT,
+    markdown_to_blocks, markdown_to_plain, recognition_model_version, resolve_lane,
+    resolve_wiki_target, review_queue, search_events, search_local_notes, search_tasks,
+    set_lane_tag, spawn_user_lexicon_refresh, strip_inline_markdown, sync_notes_to_vault,
+    sync_tags_from_structured, to_agenda_entries, AgendaRange, BgRecogIdle, CalendarEvent,
+    CascadingTranscriber, Config, EngageFilter, EventId, LineImageHtrTranscriber,
+    MarkdownTaskExtractor, PageRecognitionCache, PdfExportOptions, ProfileId, RasterOcrTranscriber,
+    RasterPage, SearchHit, SharedHtrLexicon, StrokeHtrTranscriber, Task, TaskContext,
+    TaskContextKind, TaskId, TaskPriority, TaskProvider, UserLexiconSources, VaultFtsIndex,
+    VaultNoteExport, BG_RECOG_IDLE_DELAY, RECOGNITION_CACHE_FORMAT,
 };
 #[cfg(target_os = "linux")]
 use ephemeris_pal::input::{EvdevPenSource, PenTarget};
@@ -56,6 +57,13 @@ static VAULT_GIT_PUSH_AGAIN: AtomicBool = AtomicBool::new(false);
 
 /// How long ink can sit dirty before a background vault OCR/PDF batch runs.
 const VAULT_EXPORT_BATCH_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+/// Left nav-rail section indices (`nav-section` in main.slint).
+const NAV_HOME: i32 = 0;
+const NAV_TASKS: i32 = 1;
+const NAV_NOTES: i32 = 2;
+const NAV_CAL: i32 = 4;
+const NAV_REC: i32 = 5;
 
 /// Coalesce local page `.bin` / strokes JSON writes so rapid strokes do not
 /// stall the UI thread on flash I/O. Leave-note still flushes synchronously.
@@ -906,6 +914,7 @@ impl App {
                         text_content: None,
                         doc_page: 0,
                         doc_page_count: 1,
+                        tags: vec![],
                     }],
                     vec![AppNotebook {
                         id: 1,
@@ -1012,7 +1021,7 @@ impl App {
         }
         push_agenda_ui(&ui, &calendar_events.borrow(), AgendaRange::Day, now);
         ui.set_show_start_page(true);
-        ui.set_nav_section(0);
+        ui.set_nav_section(NAV_HOME);
 
         // ── Profile list ──────────────────────────────────────────────────────
         let profile_mgr = Rc::new(RefCell::new(profile_mgr));
@@ -1602,7 +1611,7 @@ impl App {
                 ui2.set_show_notebook_list(false);
                 ui2.set_show_calendar(false);
                 ui2.set_ring_visible(false);
-                ui2.set_nav_section(0);
+                ui2.set_nav_section(NAV_HOME);
                 ui2.set_show_start_page(true);
             });
         }
@@ -2184,6 +2193,7 @@ impl App {
                         text_content: None,
                         doc_page: 0,
                         doc_page_count: 1,
+                        tags: vec![],
                     });
                 }
                 active_nb2.set(nb_id_u32);
@@ -2251,6 +2261,93 @@ impl App {
                     &cfg2.borrow(),
                     &vault_ex,
                 );
+            });
+        }
+
+        // ── Note tags sheet ───────────────────────────────────────────────────
+        {
+            let ui_rc = ui.clone();
+            let ui2 = ui.clone_component();
+            let notes2 = notes.clone();
+            let cfg2 = config.clone();
+            ui.on_note_tags_open(move || {
+                let id = ui2.get_active_note_id().to_string();
+                let tags = notes2
+                    .borrow()
+                    .iter()
+                    .find(|n| n.id.to_string() == id)
+                    .map(|n| n.tags.join(" "))
+                    .unwrap_or_default();
+                let suggestions = cfg2.borrow().note_suggested_tags.join(" ");
+                ui_rc.set_note_tags_id(&id);
+                ui_rc.set_note_tags_value(&tags);
+                ui_rc.set_note_tags_suggestions(&suggestions);
+                ui2.set_note_tags_draft("".into());
+                ui_rc.set_note_tags_visible(true);
+            });
+        }
+        {
+            let ui_rc = ui.clone();
+            ui.on_note_tags_cancel(move || {
+                ui_rc.set_note_tags_visible(false);
+            });
+        }
+        {
+            let ui_rc = ui.clone();
+            ui.on_note_tags_add_suggestion(move |draft| {
+                let mut current = parse_note_tag_list(&ui_rc.get_note_tags_value());
+                let add = if draft.trim().is_empty() {
+                    // "+ tag" chip: add first curated suggestion not already present.
+                    parse_note_tag_list(&ui_rc.get_note_tags_suggestions())
+                        .into_iter()
+                        .find(|s| !current.iter().any(|c| c.eq_ignore_ascii_case(s)))
+                } else {
+                    normalize_note_tag(&draft)
+                };
+                if let Some(tag) = add {
+                    if !current.iter().any(|c| c.eq_ignore_ascii_case(&tag)) {
+                        current.push(tag);
+                    }
+                }
+                ui_rc.set_note_tags_value(&current.join(" "));
+            });
+        }
+        {
+            let ui_rc = ui.clone();
+            let notes2 = notes.clone();
+            let notebooks2 = notebooks.clone();
+            let data_dir2 = data_dir.clone();
+            let note_seq2 = note_id_seq.clone();
+            let nb_seq2 = notebook_id_seq.clone();
+            let cfg2 = config.clone();
+            let vault_ex = vault_export.clone();
+            let push_rn = push_notebooks.clone();
+            ui.on_note_tags_confirm(move |id, tags_raw| {
+                let tags = parse_note_tag_list(&tags_raw);
+                {
+                    let mut ns = notes2.borrow_mut();
+                    if let Some(note) = ns.iter_mut().find(|n| n.id.to_string() == id) {
+                        note.tags = tags;
+                        note.updated_at = now_secs();
+                    }
+                }
+                ui_rc.set_note_tags_visible(false);
+                push_rn();
+                save_notes_index_and_sync_vault(
+                    &data_dir2,
+                    &notes2.borrow(),
+                    &notebooks2.borrow(),
+                    note_seq2.get(),
+                    nb_seq2.get(),
+                    &cfg2.borrow(),
+                    &vault_ex,
+                );
+                // Mark for leave-style vault export so tags hit the MD soon.
+                if let Ok(nid) = id.parse::<u32>() {
+                    vault_ex.mark(nid);
+                    vault_ex.request_flush_soon();
+                    ui_rc.request_screen_change();
+                }
             });
         }
 
@@ -2633,6 +2730,7 @@ impl App {
                             text_content: None,
                             doc_page: 0,
                             doc_page_count: 1,
+                            tags: vec![],
                         });
                         ui_rc.push_new_page();
                         ui_rc.set_page_index(1, 1);
@@ -2712,7 +2810,7 @@ impl App {
                         ui2.set_show_calendar(true);
                         ui2.set_show_note_list(false);
                         ui2.set_show_notebook_list(false);
-                        ui2.set_nav_section(4);
+                        ui2.set_nav_section(NAV_CAL);
                     }
                 }
             });
@@ -2727,7 +2825,7 @@ impl App {
                 active_nb_start.set(0);
                 push_nbs_start();
                 ui2.set_show_start_page(false);
-                ui2.set_nav_section(1);
+                ui2.set_nav_section(NAV_NOTES);
                 ui2.set_show_note_list(false);
                 ui2.set_show_notebook_list(true);
             });
@@ -2807,7 +2905,7 @@ impl App {
                     ui2.set_show_start_page(false);
                     push_recs_audio();
                     ui2.set_show_recording_list(true);
-                    ui2.set_nav_section(4);
+                    ui2.set_nav_section(NAV_REC);
                     return;
                 }
                 let pf = filter_ra.borrow().clone();
@@ -3330,7 +3428,7 @@ impl App {
                 ui2.set_show_md_viewer(false);
                 ui2.set_ring_visible(false);
                 ui2.set_show_task_view(true);
-                ui2.set_nav_section(3);
+                ui2.set_nav_section(NAV_TASKS);
             });
         }
 
@@ -3342,7 +3440,7 @@ impl App {
                 ui2.set_show_notebook_list(false);
                 ui2.set_show_search(false);
                 ui2.set_show_md_viewer(false);
-                ui2.set_nav_section(0);
+                ui2.set_nav_section(NAV_HOME);
                 ui2.set_show_start_page(true);
             });
         }
@@ -3379,6 +3477,8 @@ impl App {
 
         // When true, md-viewer Back returns to Tasks instead of Search.
         let md_viewer_return_tasks: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        // Wiki-link navigation stack (vault-relative paths); Back pops, else exits.
+        let md_viewer_stack: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
 
         // ── Edit requested → populate + show dialog ───────────────────────────
         {
@@ -3427,6 +3527,7 @@ impl App {
             let cfg2 = config.clone();
             let conns2 = connections.clone();
             let ret = md_viewer_return_tasks.clone();
+            let stack = md_viewer_stack.clone();
             ui.on_task_view_source_note(move |id| {
                 let ts = tasks2.borrow();
                 let Some(t) = ts.iter().find(|t| t.id.0.to_string() == id) else {
@@ -3446,15 +3547,9 @@ impl App {
                 };
                 match VaultFtsIndex::read_vault_file(&vault, rel) {
                     Ok(md) => {
-                        let title = Path::new(rel)
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("Note")
-                            .to_string();
-                        let body = markdown_to_plain(&md);
-                        let blocks = markdown_to_blocks(&md);
-                        ui_rc.set_md_viewer(&title, &body, rel);
-                        ui_rc.set_md_viewer_blocks(&blocks);
+                        stack.borrow_mut().clear();
+                        stack.borrow_mut().push(rel.to_string());
+                        show_md_viewer_content(&ui_rc, rel, &md);
                         ui2.set_task_dialog_visible(false);
                         ui2.set_show_search(false);
                         ret.set(true);
@@ -3763,7 +3858,7 @@ impl App {
                     ui2.set_show_notebook_list(false);
                     push_recs();
                     ui2.set_show_recording_list(true);
-                    ui2.set_nav_section(4);
+                    ui2.set_nav_section(NAV_REC);
                     open_rec_detail(id);
                 }
             });
@@ -4421,6 +4516,7 @@ impl App {
                 ui2.set_settings_theme_idx(theme_idx);
                 ui2.set_settings_pen_only(cfg.pen_only_drawing);
                 ui2.set_settings_note_title_pattern(cfg.note_title_pattern.as_str().into());
+                ui_rc.set_settings_note_suggested_tags(&cfg.note_suggested_tags.join(", "));
                 let vault = cfg
                     .vault_path
                     .as_ref()
@@ -4643,7 +4739,7 @@ impl App {
             ui.on_search_back(move || {
                 ui2.set_show_search(false);
                 ui2.set_show_md_viewer(false);
-                ui2.set_nav_section(0);
+                ui2.set_nav_section(NAV_HOME);
                 ui2.set_show_start_page(true);
             });
         }
@@ -4733,6 +4829,7 @@ impl App {
             let notes2 = notes.clone();
             let filter_rc = active_profile_filter.clone();
             let ret = md_viewer_return_tasks.clone();
+            let stack = md_viewer_stack.clone();
             ui.on_search_result_tapped(move |id, source| {
                 match source.as_str() {
                     "vault" => {
@@ -4743,15 +4840,9 @@ impl App {
                         };
                         match VaultFtsIndex::read_vault_file(&vault, &id) {
                             Ok(md) => {
-                                let title = Path::new(&id)
-                                    .file_stem()
-                                    .and_then(|s| s.to_str())
-                                    .unwrap_or("Note")
-                                    .to_string();
-                                let body = markdown_to_plain(&md);
-                                let blocks = markdown_to_blocks(&md);
-                                ui_rc.set_md_viewer(&title, &body, &id);
-                                ui_rc.set_md_viewer_blocks(&blocks);
+                                stack.borrow_mut().clear();
+                                stack.borrow_mut().push(id.clone());
+                                show_md_viewer_content(&ui_rc, &id, &md);
                                 ui2.set_show_search(false);
                                 ret.set(false);
                                 ui2.set_show_md_viewer(true);
@@ -4790,31 +4881,84 @@ impl App {
                         // Task view is refreshed by existing nav handler patterns.
                         let _ = filter_str;
                         ui2.set_show_task_view(true);
-                        ui2.set_nav_section(3);
+                        ui2.set_nav_section(NAV_TASKS);
                     }
                     "calendar" => {
                         ui2.set_show_search(false);
                         ui2.set_show_md_viewer(false);
                         ui2.set_show_calendar(true);
-                        ui2.set_nav_section(4);
+                        ui2.set_nav_section(NAV_CAL);
                     }
                     _ => {}
                 }
             });
         }
 
-        // ── MD viewer back → search (or Tasks when opened from a task) ────────
+        // ── MD viewer back → pop wiki stack, else search/Tasks ────────────────
         {
+            let ui_rc = ui.clone();
             let ui2 = ui.clone_component();
             let ret = md_viewer_return_tasks.clone();
+            let stack = md_viewer_stack.clone();
+            let cfg2 = config.clone();
+            let conns2 = connections.clone();
             ui.on_md_viewer_back(move || {
+                let prev = {
+                    let mut st = stack.borrow_mut();
+                    if st.len() > 1 {
+                        st.pop();
+                        st.last().cloned()
+                    } else {
+                        st.clear();
+                        None
+                    }
+                };
+                if let Some(rel) = prev {
+                    if let Some(vault) = resolve_vault_path(&cfg2.borrow(), &conns2.borrow()) {
+                        if let Ok(md) = VaultFtsIndex::read_vault_file(&vault, &rel) {
+                            show_md_viewer_content(&ui_rc, &rel, &md);
+                            return;
+                        }
+                    }
+                }
                 ui2.set_show_md_viewer(false);
                 if ret.get() {
                     ret.set(false);
                     ui2.set_show_task_view(true);
-                    ui2.set_nav_section(4); // Tasks
+                    ui2.set_nav_section(NAV_TASKS);
                 } else {
                     ui2.set_show_search(true);
+                }
+            });
+        }
+
+        // ── MD viewer wiki / vault link follow ────────────────────────────────
+        {
+            let ui_rc = ui.clone();
+            let cfg2 = config.clone();
+            let conns2 = connections.clone();
+            let stack = md_viewer_stack.clone();
+            ui.on_md_viewer_link_tapped(move |target| {
+                if target.starts_with("http://") || target.starts_with("https://") {
+                    tracing::info!("External link (not opened on device): {target}");
+                    return;
+                }
+                let Some(vault) = resolve_vault_path(&cfg2.borrow(), &conns2.borrow()) else {
+                    tracing::warn!("Cannot follow link: no vault path");
+                    return;
+                };
+                let exclude = cfg2.borrow().vault_export_subdir.clone();
+                let Some(rel) = resolve_wiki_target(&vault, &target, Some(exclude.as_path()))
+                else {
+                    tracing::warn!("Wiki target not found: {target}");
+                    return;
+                };
+                match VaultFtsIndex::read_vault_file(&vault, &rel) {
+                    Ok(md) => {
+                        stack.borrow_mut().push(rel.clone());
+                        show_md_viewer_content(&ui_rc, &rel, &md);
+                    }
+                    Err(e) => tracing::warn!("Failed to open linked note {rel}: {e}"),
                 }
             });
         }
@@ -4826,7 +4970,7 @@ impl App {
                 ui2.set_show_settings(false);
                 ui2.set_show_search(false);
                 ui2.set_show_md_viewer(false);
-                ui2.set_nav_section(0);
+                ui2.set_nav_section(NAV_HOME);
                 ui2.set_show_start_page(true);
             });
         }
@@ -5115,6 +5259,8 @@ impl App {
                 new_cfg.theme = theme.to_string();
                 new_cfg.pen_only_drawing = pen_only;
                 new_cfg.note_title_pattern = note_title_pattern;
+                new_cfg.note_suggested_tags =
+                    parse_note_tag_list(&ui2.get_settings_note_suggested_tags());
                 new_cfg.ocr_enabled = ui2.get_settings_ocr_enabled();
                 if let Some(lang) = ephemeris_core::HandwritingLanguage::parse(
                     ui2.get_settings_handwriting_lang().as_str(),
@@ -5651,6 +5797,7 @@ impl App {
                                 text_content: None,
                                 doc_page: 0,
                                 doc_page_count: 1,
+                        tags: vec![],
                             });
                         }
                         *anchor_rc.borrow_mut() = String::new();
@@ -5670,7 +5817,7 @@ impl App {
                             ui2.set_show_md_viewer(false);
                             ui2.set_drawing_menu_open(false);
                             ui2.set_ring_visible(false);
-                            ui2.set_nav_section(1);
+                            ui2.set_nav_section(NAV_NOTES);
                         }
                         ui2.set_show_note_list(false);
                         ui2.set_show_notebook_list(false);
@@ -7210,6 +7357,9 @@ struct AppNote {
     /// Number of pages in this note's document (at least 1).
     #[serde(default = "default_doc_page_count")]
     doc_page_count: usize,
+    /// Freeform Obsidian-style tags (exported as YAML `tags:` frontmatter).
+    #[serde(default)]
+    tags: Vec<String>,
 }
 
 fn default_doc_page_count() -> usize {
@@ -8276,10 +8426,20 @@ fn build_note_list(
             } else {
                 note_updated_at(n)
             };
+            let tags_label = if n.tags.is_empty() {
+                String::new()
+            } else {
+                n.tags
+                    .iter()
+                    .map(|t| format!("#{t}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
             ephemeris_ui::NoteListItem {
                 id: n.id.to_string(),
                 title: n.title.clone(),
                 date_label: format_note_date(stamp, now),
+                tags_label,
                 has_preview,
                 preview,
                 show_profile,
@@ -8454,6 +8614,19 @@ pub(crate) fn note_preview_from_gray(w: u32, h: u32, gray: &[u8]) -> (bool, slin
 }
 
 /// Leave the note canvas: persist ink locally and request a soon vault export.
+/// Push title/body/blocks into the Obsidian markdown viewer.
+fn show_md_viewer_content(ui: &EphemerisUi, rel_path: &str, md: &str) {
+    let title = Path::new(rel_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Note")
+        .to_string();
+    let body = markdown_to_plain(md);
+    let blocks = markdown_to_blocks(md);
+    ui.set_md_viewer(&title, &body, rel_path);
+    ui.set_md_viewer_blocks(&blocks);
+}
+
 fn leave_note_canvas(
     ui: &EphemerisUi,
     notes: &mut [AppNote],
@@ -8469,6 +8642,9 @@ fn leave_note_canvas(
     if let Ok(id) = active_note_id.parse::<u32>() {
         vault_export.mark(id);
         vault_export.request_flush_soon();
+        // Wake the event loop so `about_to_wait` runs `try_flush` promptly
+        // instead of waiting for the next user input / 10‑minute batch.
+        ui.request_screen_change();
     }
 }
 
@@ -9026,6 +9202,7 @@ fn build_vault_note_export(
             .or(recognised_text)
             .or_else(|| note.text_content.clone()),
         pdf_vault_rel,
+        tags: note.tags.clone(),
     }
 }
 
@@ -9969,7 +10146,7 @@ fn schedule_vault_git_push(config: &Config) {
 }
 
 /// Debounced background `git add/commit/push` after writes to a specific vault.
-fn schedule_vault_git_push_for(config: &Config, vault: &Path) {
+pub(crate) fn schedule_vault_git_push_for(config: &Config, vault: &Path) {
     if !config.vault_git_enabled {
         return;
     }
@@ -10739,6 +10916,34 @@ fn priority_to_int(p: TaskPriority) -> i32 {
 /// Next auto-title for a new note (`Config.note_title_pattern`, `{n}` = counter).
 fn next_note_title(config: &Config, n: u32) -> String {
     format_note_title(&config.note_title_pattern, n, Local::now().date_naive())
+}
+
+/// Normalize a freeform note tag for Obsidian (`#` stripped, spaces → `-`).
+fn normalize_note_tag(raw: &str) -> Option<String> {
+    let t = raw
+        .trim()
+        .trim_start_matches('#')
+        .replace(' ', "-")
+        .trim_matches(|c: char| c == ',' || c.is_whitespace())
+        .to_string();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t)
+    }
+}
+
+/// Parse space/comma-separated note tags into a deduped list.
+fn parse_note_tag_list(raw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for part in raw.split(|c: char| c.is_whitespace() || c == ',') {
+        if let Some(tag) = normalize_note_tag(part) {
+            if !out.iter().any(|t: &String| t.eq_ignore_ascii_case(&tag)) {
+                out.push(tag);
+            }
+        }
+    }
+    out
 }
 
 fn now_secs() -> u64 {
