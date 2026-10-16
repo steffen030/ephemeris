@@ -257,13 +257,51 @@ pub enum MdBlockKind {
     Quote,
     Code,
     Rule,
+    /// Tappable wiki / markdown link (`link_target` set).
+    Link,
 }
 
 /// One rendered block of markdown (plain text + role).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MdBlock {
     pub kind: MdBlockKind,
+    /// Plain text for fallback / list display.
     pub text: String,
+    /// Inline markdown safe for Slint `StyledText::from_markdown` (emphasis, etc.).
+    pub styled_md: String,
+    /// Wiki path or relative vault path when `kind == Link`; empty otherwise.
+    pub link_target: String,
+}
+
+impl MdBlock {
+    fn new(kind: MdBlockKind, text: impl Into<String>) -> Self {
+        let text = text.into();
+        Self {
+            kind,
+            styled_md: text.clone(),
+            text,
+            link_target: String::new(),
+        }
+    }
+
+    fn styled(kind: MdBlockKind, plain: impl Into<String>, styled_md: impl Into<String>) -> Self {
+        Self {
+            kind,
+            text: plain.into(),
+            styled_md: styled_md.into(),
+            link_target: String::new(),
+        }
+    }
+
+    fn link(label: impl Into<String>, target: impl Into<String>) -> Self {
+        let label = label.into();
+        Self {
+            kind: MdBlockKind::Link,
+            styled_md: format!("**{label}**"),
+            text: label,
+            link_target: target.into(),
+        }
+    }
 }
 
 /// Strip common inline markdown markers for list/title display.
@@ -367,158 +405,383 @@ fn find_closing_pair(chars: &[char], start: usize, marker: char, doubled: bool) 
     None
 }
 
-/// Parse markdown into display blocks for the eink viewer.
-pub fn markdown_to_blocks(md: &str) -> Vec<MdBlock> {
-    let mut blocks = Vec::new();
-    let mut in_code = false;
-    let mut code_buf = String::new();
-    let mut para_buf = String::new();
-    let mut in_frontmatter = false;
-    let mut seen_content = false;
-
-    let flush_para = |buf: &mut String, blocks: &mut Vec<MdBlock>| {
-        let t = buf.trim().to_string();
-        buf.clear();
-        if !t.is_empty() {
-            blocks.push(MdBlock {
-                kind: MdBlockKind::Paragraph,
-                text: strip_inline_markdown(&t),
-            });
+/// Fold Obsidian `==highlight==` into `**bold**` for Slint StyledText.
+fn obsidian_highlights_to_bold(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '=' && chars.get(i + 1) == Some(&'=') {
+            if let Some(end) = chars[i + 2..].iter().position(|&c| c == '=') {
+                let end = i + 2 + end;
+                if chars.get(end + 1) == Some(&'=') {
+                    out.push_str("**");
+                    for &c in &chars[i + 2..end] {
+                        out.push(c);
+                    }
+                    out.push_str("**");
+                    i = end + 2;
+                    continue;
+                }
+            }
         }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Strip YAML frontmatter (`---` … `---`) so the MD viewer skips metadata.
+fn strip_yaml_frontmatter(md: &str) -> &str {
+    let mut lines = md.lines();
+    let Some(first) = lines.next() else {
+        return md;
+    };
+    if first.trim() != "---" {
+        return md;
+    }
+    let mut consumed = first.len();
+    if md.as_bytes().get(consumed) == Some(&b'\n') {
+        consumed += 1;
+    } else if md.as_bytes().get(consumed) == Some(&b'\r') {
+        consumed += 1;
+        if md.as_bytes().get(consumed) == Some(&b'\n') {
+            consumed += 1;
+        }
+    }
+    for line in lines {
+        let line_len = line.len();
+        let mut step = line_len;
+        if md.as_bytes().get(consumed + step) == Some(&b'\n') {
+            step += 1;
+        } else if md.as_bytes().get(consumed + step) == Some(&b'\r') {
+            step += 1;
+            if md.as_bytes().get(consumed + step) == Some(&b'\n') {
+                step += 1;
+            }
+        }
+        consumed += step;
+        if line.trim() == "---" {
+            return md.get(consumed..).unwrap_or("");
+        }
+    }
+    md
+}
+
+/// Rewrite Obsidian `[[Note|Alias]]` / `[[Note]]` into `[Alias](wiki:Note)` so
+/// pulldown-cmark emits ordinary links we can follow in the viewer.
+fn expand_wikilinks(md: &str) -> String {
+    let mut out = String::with_capacity(md.len());
+    let mut rest = md;
+    while let Some(start) = rest.find("[[") {
+        out.push_str(&rest[..start]);
+        rest = &rest[start + 2..];
+        if let Some(end) = rest.find("]]") {
+            let inner = &rest[..end];
+            let (target, label) = match inner.split_once('|') {
+                Some((t, l)) => (t.trim(), l.trim()),
+                None => (inner.trim(), inner.trim()),
+            };
+            if !target.is_empty() {
+                out.push('[');
+                out.push_str(label);
+                out.push_str("](wiki:");
+                out.push_str(target);
+                out.push(')');
+            } else {
+                out.push_str("[[");
+                out.push_str(inner);
+                out.push_str("]]");
+            }
+            rest = &rest[end + 2..];
+        } else {
+            out.push_str("[[");
+            break;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Parse markdown into display blocks for the eink viewer via `pulldown-cmark`.
+pub fn markdown_to_blocks(md: &str) -> Vec<MdBlock> {
+    use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+
+    let body = strip_yaml_frontmatter(md);
+    let expanded = expand_wikilinks(body);
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_TASKLISTS);
+
+    let mut blocks = Vec::new();
+    let mut plain = String::new();
+    let mut styled = String::new();
+    let mut kind_stack: Vec<MdBlockKind> = Vec::new();
+    let mut list_is_ordered: Vec<bool> = Vec::new();
+    let mut ordered_index: Vec<u64> = Vec::new();
+    let mut link_dest: Option<String> = None;
+    let mut link_plain = String::new();
+    let mut link_styled = String::new();
+    let mut task_checked: Option<bool> = None;
+    let mut in_table = false;
+    let mut table_row = String::new();
+
+    let flush_text_block = |kind: MdBlockKind,
+                            plain: &mut String,
+                            styled: &mut String,
+                            task: &mut Option<bool>,
+                            blocks: &mut Vec<MdBlock>| {
+        let raw = plain.trim().to_string();
+        let raw_styled = styled.trim().to_string();
+        plain.clear();
+        styled.clear();
+        if raw.is_empty() && !matches!(kind, MdBlockKind::Rule) {
+            *task = None;
+            return;
+        }
+        // Obsidian ==highlight== is not CommonMark; fold to bold for StyledText
+        // and strip for plain (matches legacy strip_inline_markdown).
+        let p = strip_inline_markdown(&raw);
+        let s = obsidian_highlights_to_bold(if raw_styled.is_empty() {
+            &raw
+        } else {
+            &raw_styled
+        });
+        let (p, s) = match (*task, kind) {
+            (Some(true), MdBlockKind::Bullet) => (format!("☑ {p}"), format!("☑ {s}")),
+            (Some(false), MdBlockKind::Bullet) => (format!("☐ {p}"), format!("☐ {s}")),
+            _ => (p, s),
+        };
+        *task = None;
+        blocks.push(MdBlock::styled(kind, p, s));
     };
 
-    for line in md.lines() {
-        let trimmed = line.trim_end();
-        let trim_start = trimmed.trim_start();
-
-        if !seen_content && trim_start == "---" {
-            in_frontmatter = !in_frontmatter;
-            continue;
-        }
-        if in_frontmatter {
-            continue;
-        }
-        seen_content = true;
-
-        if trim_start.starts_with("```") {
-            if in_code {
-                blocks.push(MdBlock {
-                    kind: MdBlockKind::Code,
-                    text: code_buf.trim_end().to_string(),
-                });
-                code_buf.clear();
-                in_code = false;
-            } else {
-                flush_para(&mut para_buf, &mut blocks);
-                in_code = true;
+    for event in Parser::new_ext(&expanded, options) {
+        match event {
+            Event::Start(Tag::Heading { level, .. }) => {
+                let k = match level {
+                    pulldown_cmark::HeadingLevel::H1 => MdBlockKind::Heading1,
+                    pulldown_cmark::HeadingLevel::H2 => MdBlockKind::Heading2,
+                    _ => MdBlockKind::Heading3,
+                };
+                kind_stack.push(k);
             }
-            continue;
-        }
-        if in_code {
-            code_buf.push_str(trimmed);
-            code_buf.push('\n');
-            continue;
-        }
-
-        if trim_start.is_empty() {
-            flush_para(&mut para_buf, &mut blocks);
-            continue;
-        }
-
-        if trim_start == "---" || trim_start == "***" || trim_start == "___" {
-            flush_para(&mut para_buf, &mut blocks);
-            blocks.push(MdBlock {
-                kind: MdBlockKind::Rule,
-                text: String::new(),
-            });
-            continue;
-        }
-
-        if let Some(rest) = trim_start.strip_prefix("### ") {
-            flush_para(&mut para_buf, &mut blocks);
-            blocks.push(MdBlock {
-                kind: MdBlockKind::Heading3,
-                text: strip_inline_markdown(rest),
-            });
-            continue;
-        }
-        if let Some(rest) = trim_start.strip_prefix("## ") {
-            flush_para(&mut para_buf, &mut blocks);
-            blocks.push(MdBlock {
-                kind: MdBlockKind::Heading2,
-                text: strip_inline_markdown(rest),
-            });
-            continue;
-        }
-        if let Some(rest) = trim_start.strip_prefix("# ") {
-            flush_para(&mut para_buf, &mut blocks);
-            blocks.push(MdBlock {
-                kind: MdBlockKind::Heading1,
-                text: strip_inline_markdown(rest),
-            });
-            continue;
-        }
-
-        if let Some(rest) = trim_start.strip_prefix("> ") {
-            flush_para(&mut para_buf, &mut blocks);
-            blocks.push(MdBlock {
-                kind: MdBlockKind::Quote,
-                text: strip_inline_markdown(rest),
-            });
-            continue;
-        }
-
-        if let Some(rest) = trim_start
-            .strip_prefix("- ")
-            .or_else(|| trim_start.strip_prefix("* "))
-            .or_else(|| trim_start.strip_prefix("+ "))
-        {
-            flush_para(&mut para_buf, &mut blocks);
-            // Task items: `- [ ] x` / `- [x] x` keep a readable box glyph.
-            let (prefix, rest) = if let Some(r) = rest.strip_prefix("[ ] ") {
-                ("☐ ", r)
-            } else if let Some(r) = rest
-                .strip_prefix("[x] ")
-                .or_else(|| rest.strip_prefix("[X] "))
-            {
-                ("☑ ", r)
-            } else {
-                ("", rest)
-            };
-            blocks.push(MdBlock {
-                kind: MdBlockKind::Bullet,
-                text: format!("{prefix}{}", strip_inline_markdown(rest)),
-            });
-            continue;
-        }
-
-        // Ordered list "1. item"
-        if let Some(dot) = trim_start.find(". ") {
-            let (num, rest) = trim_start.split_at(dot);
-            if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
-                flush_para(&mut para_buf, &mut blocks);
-                blocks.push(MdBlock {
-                    kind: MdBlockKind::Numbered,
-                    text: format!("{}. {}", num, strip_inline_markdown(&rest[2..])),
-                });
-                continue;
+            Event::End(TagEnd::Heading(_)) => {
+                if let Some(k) = kind_stack.pop() {
+                    // Headings: plain only (bold weight from kind in UI).
+                    let p = strip_inline_markdown(plain.trim());
+                    plain.clear();
+                    styled.clear();
+                    blocks.push(MdBlock::new(k, p));
+                    task_checked = None;
+                }
             }
+            Event::Start(Tag::Paragraph) => {
+                kind_stack.push(MdBlockKind::Paragraph);
+            }
+            Event::End(TagEnd::Paragraph) => {
+                if let Some(k) = kind_stack.pop() {
+                    flush_text_block(k, &mut plain, &mut styled, &mut task_checked, &mut blocks);
+                }
+            }
+            Event::Start(Tag::BlockQuote(_)) => {
+                kind_stack.push(MdBlockKind::Quote);
+            }
+            Event::End(TagEnd::BlockQuote(_)) => {
+                if let Some(k) = kind_stack.pop() {
+                    flush_text_block(k, &mut plain, &mut styled, &mut task_checked, &mut blocks);
+                }
+            }
+            Event::Start(Tag::CodeBlock(_)) => {
+                kind_stack.push(MdBlockKind::Code);
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                if let Some(k) = kind_stack.pop() {
+                    let t = plain.trim_end().to_string();
+                    plain.clear();
+                    styled.clear();
+                    if !t.is_empty() {
+                        blocks.push(MdBlock::new(k, t));
+                    }
+                }
+            }
+            Event::Start(Tag::List(start)) => {
+                list_is_ordered.push(start.is_some());
+                ordered_index.push(start.unwrap_or(1));
+            }
+            Event::End(TagEnd::List(_)) => {
+                list_is_ordered.pop();
+                ordered_index.pop();
+            }
+            Event::Start(Tag::Item) => {
+                let ordered = list_is_ordered.last().copied().unwrap_or(false);
+                if ordered {
+                    let n = ordered_index.last().copied().unwrap_or(1);
+                    if let Some(idx) = ordered_index.last_mut() {
+                        *idx += 1;
+                    }
+                    plain.push_str(&format!("{n}. "));
+                    styled.push_str(&format!("{n}. "));
+                    kind_stack.push(MdBlockKind::Numbered);
+                } else {
+                    kind_stack.push(MdBlockKind::Bullet);
+                }
+            }
+            Event::End(TagEnd::Item) => {
+                if let Some(k) = kind_stack.pop() {
+                    flush_text_block(k, &mut plain, &mut styled, &mut task_checked, &mut blocks);
+                }
+            }
+            Event::Start(Tag::Table(_)) => {
+                in_table = true;
+                table_row.clear();
+            }
+            Event::End(TagEnd::Table) => {
+                in_table = false;
+                if !table_row.trim().is_empty() {
+                    blocks.push(MdBlock::new(
+                        MdBlockKind::Code,
+                        table_row.trim().to_string(),
+                    ));
+                }
+                table_row.clear();
+            }
+            Event::Start(Tag::TableHead) | Event::Start(Tag::TableRow) => {}
+            Event::End(TagEnd::TableHead) | Event::End(TagEnd::TableRow) => {
+                table_row.push('\n');
+            }
+            Event::Start(Tag::TableCell) => {
+                if !table_row.is_empty() && !table_row.ends_with('\n') {
+                    table_row.push_str(" | ");
+                }
+            }
+            Event::End(TagEnd::TableCell) => {}
+            Event::Rule => {
+                blocks.push(MdBlock::new(MdBlockKind::Rule, String::new()));
+            }
+            Event::TaskListMarker(checked) => {
+                task_checked = Some(checked);
+            }
+            Event::Start(Tag::Link { dest_url, .. }) => {
+                link_dest = Some(dest_url.to_string());
+                link_plain.clear();
+                link_styled.clear();
+            }
+            Event::End(TagEnd::Link) => {
+                let label_plain = strip_inline_markdown(link_plain.trim());
+                link_plain.clear();
+                link_styled.clear();
+                if let Some(dest) = link_dest.take() {
+                    let is_wiki = dest.starts_with("wiki:");
+                    let target = dest
+                        .strip_prefix("wiki:")
+                        .unwrap_or(dest.as_str())
+                        .to_string();
+                    if is_wiki && !label_plain.is_empty() {
+                        // Wiki links become their own tappable rows.
+                        blocks.push(MdBlock::link(label_plain, target));
+                    } else if !label_plain.is_empty() {
+                        // External / relative MD links: keep label in the
+                        // surrounding block; still emit a follow-row for .md.
+                        plain.push_str(&label_plain);
+                        styled.push_str("**");
+                        styled.push_str(&label_plain);
+                        styled.push_str("**");
+                        if target.ends_with(".md") || !target.contains("://") {
+                            blocks.push(MdBlock::link(label_plain, target));
+                        }
+                    }
+                }
+            }
+            Event::Start(Tag::Emphasis) => styled.push('*'),
+            Event::End(TagEnd::Emphasis) => styled.push('*'),
+            Event::Start(Tag::Strong) => styled.push_str("**"),
+            Event::End(TagEnd::Strong) => styled.push_str("**"),
+            Event::Start(Tag::Strikethrough) => styled.push_str("~~"),
+            Event::End(TagEnd::Strikethrough) => styled.push_str("~~"),
+            Event::Code(c) => {
+                let c = c.as_ref();
+                plain.push_str(c);
+                styled.push('`');
+                styled.push_str(c);
+                styled.push('`');
+                if in_table {
+                    table_row.push_str(c);
+                }
+            }
+            Event::Text(t) => {
+                let t = t.as_ref();
+                if in_table {
+                    table_row.push_str(t);
+                } else if link_dest.is_some() {
+                    link_plain.push_str(t);
+                    link_styled.push_str(t);
+                } else {
+                    plain.push_str(t);
+                    styled.push_str(t);
+                }
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                if in_table {
+                    // ignore
+                } else {
+                    plain.push(' ');
+                    styled.push(' ');
+                }
+            }
+            Event::Html(_) | Event::InlineHtml(_) => {}
+            _ => {}
         }
-
-        if !para_buf.is_empty() {
-            para_buf.push(' ');
-        }
-        para_buf.push_str(trim_start);
     }
-
-    if in_code && !code_buf.is_empty() {
-        blocks.push(MdBlock {
-            kind: MdBlockKind::Code,
-            text: code_buf.trim_end().to_string(),
-        });
-    }
-    flush_para(&mut para_buf, &mut blocks);
     blocks
+}
+
+/// Resolve an Obsidian wiki target (`Note`, `Folder/Note`, `Note.md`) to a
+/// vault-relative `.md` path, or `None` if not found.
+pub fn resolve_wiki_target(
+    vault_root: &Path,
+    target: &str,
+    exclude_subdir: Option<&Path>,
+) -> Option<String> {
+    let target = target.trim().trim_start_matches('/').replace('\\', "/");
+    if target.is_empty() {
+        return None;
+    }
+    let with_ext = if target.ends_with(".md") {
+        target.clone()
+    } else {
+        format!("{target}.md")
+    };
+    let direct = vault_root.join(&with_ext);
+    if direct.is_file() {
+        return Some(with_ext);
+    }
+    let stem = Path::new(&target)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(target.as_str())
+        .to_lowercase();
+    let files = list_markdown_files(vault_root, exclude_subdir).ok()?;
+    let mut matches: Vec<String> = files
+        .into_iter()
+        .filter_map(|p| {
+            let rel = p.strip_prefix(vault_root).ok()?;
+            let rel_s = rel.to_string_lossy().replace('\\', "/");
+            let file_stem = rel
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            if file_stem == stem {
+                Some(rel_s)
+            } else {
+                None
+            }
+        })
+        .collect();
+    matches.sort();
+    matches.into_iter().next()
 }
 
 /// Turn markdown into readable plain text for the in-app viewer.
@@ -533,6 +796,13 @@ pub fn markdown_to_plain(md: &str) -> String {
             MdBlockKind::Code => b.text,
             MdBlockKind::Rule => "────────".to_string(),
             MdBlockKind::Paragraph => b.text,
+            MdBlockKind::Link => {
+                if b.link_target.is_empty() {
+                    b.text
+                } else {
+                    format!("{} → {}", b.text, b.link_target)
+                }
+            }
         })
         .collect::<Vec<_>>()
         .join("\n\n")

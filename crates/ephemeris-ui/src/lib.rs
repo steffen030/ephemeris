@@ -260,6 +260,7 @@ pub struct NoteListItem {
     pub id: String,
     pub title: String,
     pub date_label: String,
+    pub tags_label: String,
     pub has_preview: bool,
     pub preview: slint::Image,
     pub show_profile: bool,
@@ -359,9 +360,9 @@ pub const TOOLBAR_H: u32 = 0;
 pub const NAV_W: u32 = 80;
 
 /// Burger dropdown panel (`drawing-dropdown` in `main.slint`):
-/// `x = parent.width - 192`, `y = 60`, `width = 184`, `height = 268`.
+/// `x = parent.width - 192`, `y = 60`, `width = 184`, `height = 330`.
 const DRAWING_MENU_W: u32 = 184;
-const DRAWING_MENU_H: u32 = 268;
+const DRAWING_MENU_H: u32 = 330;
 const DRAWING_MENU_RIGHT_PAD: u32 = 8; // 192 - 184
 const DRAWING_MENU_Y: u32 = 60;
 
@@ -1465,10 +1466,15 @@ impl EphemerisUi {
                     MdBlockKind::Quote => 6,
                     MdBlockKind::Code => 7,
                     MdBlockKind::Rule => 8,
+                    MdBlockKind::Link => 9,
                 };
+                let body = slint::StyledText::from_markdown(&b.styled_md)
+                    .unwrap_or_else(|_| slint::StyledText::from_plain_text(&b.text));
                 MdBlockEntry {
                     kind,
                     text: slint::SharedString::from(b.text.as_str()),
+                    link_target: slint::SharedString::from(b.link_target.as_str()),
+                    body,
                 }
             })
             .collect();
@@ -1503,6 +1509,11 @@ impl EphemerisUi {
         self.component.on_md_viewer_back(handler);
     }
 
+    pub fn on_md_viewer_link_tapped<F: FnMut(String) + 'static>(&self, mut handler: F) {
+        self.component
+            .on_md_viewer_link_tapped(move |t| handler(t.to_string()));
+    }
+
     /// Set the theme index shown in settings (0 = light, 1 = dark).
     pub fn set_settings_theme_idx(&self, idx: i32) {
         self.component.set_settings_theme_idx(idx);
@@ -1532,6 +1543,62 @@ impl EphemerisUi {
     /// Read the Settings › General new-note title pattern.
     pub fn get_settings_note_title_pattern(&self) -> String {
         self.component.get_settings_note_title_pattern().to_string()
+    }
+
+    pub fn set_settings_note_suggested_tags(&self, tags: &str) {
+        self.component
+            .set_settings_note_suggested_tags(slint::SharedString::from(tags));
+    }
+
+    pub fn get_settings_note_suggested_tags(&self) -> String {
+        self.component
+            .get_settings_note_suggested_tags()
+            .to_string()
+    }
+
+    pub fn on_note_tags_open<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_note_tags_open(handler);
+    }
+
+    pub fn on_note_tags_confirm<F: FnMut(String, String) + 'static>(&self, mut handler: F) {
+        self.component
+            .on_note_tags_confirm(move |id, tags| handler(id.to_string(), tags.to_string()));
+    }
+
+    pub fn on_note_tags_cancel<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_note_tags_cancel(handler);
+    }
+
+    pub fn on_note_tags_add_suggestion<F: FnMut(String) + 'static>(&self, mut handler: F) {
+        self.component
+            .on_note_tags_add_suggestion(move |t| handler(t.to_string()));
+    }
+
+    pub fn set_note_tags_visible(&self, visible: bool) {
+        self.component.set_note_tags_visible(visible);
+    }
+
+    pub fn set_note_tags_id(&self, id: &str) {
+        self.component
+            .set_note_tags_id(slint::SharedString::from(id));
+    }
+
+    pub fn set_note_tags_value(&self, value: &str) {
+        self.component
+            .set_note_tags_value(slint::SharedString::from(value));
+    }
+
+    pub fn get_note_tags_value(&self) -> String {
+        self.component.get_note_tags_value().to_string()
+    }
+
+    pub fn set_note_tags_suggestions(&self, value: &str) {
+        self.component
+            .set_note_tags_suggestions(slint::SharedString::from(value));
+    }
+
+    pub fn get_note_tags_suggestions(&self) -> String {
+        self.component.get_note_tags_suggestions().to_string()
     }
 
     /// Set the vault path shown in settings.
@@ -1967,6 +2034,7 @@ impl EphemerisUi {
                 id: slint::SharedString::from(e.id.as_str()),
                 title: slint::SharedString::from(e.title.as_str()),
                 date_label: slint::SharedString::from(e.date_label.as_str()),
+                tags_label: slint::SharedString::from(e.tags_label.as_str()),
                 has_preview: e.has_preview,
                 preview: e.preview.clone(),
                 show_profile: e.show_profile,

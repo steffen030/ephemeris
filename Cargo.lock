@@ -1397,6 +1397,7 @@ dependencies = [
  "libc",
  "log",
  "printpdf",
+ "pulldown-cmark",
  "reqwest 0.12.28",
  "reqwest_dav",
  "rten",

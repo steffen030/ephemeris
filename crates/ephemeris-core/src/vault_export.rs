@@ -37,6 +37,8 @@ pub struct VaultNoteExport {
     pub text_content: Option<String>,
     /// If set, markdown embeds a wiki-style link to this vault-relative PDF.
     pub pdf_vault_rel: Option<String>,
+    /// Obsidian YAML frontmatter tags.
+    pub tags: Vec<String>,
 }
 
 /// Absolute directory for a note under `{export_subdir}/Notes/{segments…}`.
@@ -187,6 +189,12 @@ fn render_markdown(note: &VaultNoteExport) -> String {
         escape_yaml(&note.notebook_title)
     ));
     out.push_str(&format!("created: {}\n", note.created_at));
+    if !note.tags.is_empty() {
+        out.push_str("tags:\n");
+        for tag in &note.tags {
+            out.push_str(&format!("  - {}\n", escape_yaml(tag)));
+        }
+    }
     out.push_str("source: ephemeris\n");
     out.push_str("ephemeris_format: 1\n");
     out.push_str("---\n\n");
@@ -408,6 +416,7 @@ mod tests {
             created_at: 1_700_000_000,
             text_content: Some("Hello from OCR".into()),
             pdf_vault_rel: None,
+            tags: vec![],
         };
         let path = export_note_markdown(vault, Path::new("Ephemeris"), &note).unwrap();
         assert!(path.ends_with("Ephemeris/Notes/Work/Ideas/Meeting Notes.md"));
@@ -430,6 +439,7 @@ mod tests {
             created_at: 0,
             text_content: None,
             pdf_vault_rel: None,
+            tags: vec![],
         };
         let path = export_note_markdown(tmp.path(), Path::new("Ephemeris"), &note).unwrap();
         assert!(path.ends_with("Ephemeris/Notes/Loose.md"));
@@ -447,6 +457,7 @@ mod tests {
             created_at: 0,
             text_content: None,
             pdf_vault_rel: Some("Ephemeris/Notes/N/_assets/T.pdf".into()),
+            tags: vec![],
         };
         let path = export_note_markdown(tmp.path(), Path::new("Ephemeris"), &note).unwrap();
         let body = fs::read_to_string(path).unwrap();
@@ -465,6 +476,7 @@ mod tests {
             created_at: 0,
             text_content: None,
             pdf_vault_rel: Some("Ephemeris/Notes/N/T.pdf".into()),
+            tags: vec![],
         };
         let path = export_note_markdown(tmp.path(), Path::new("Ephemeris"), &note).unwrap();
         let body = fs::read_to_string(path).unwrap();
@@ -539,6 +551,7 @@ mod tests {
                 created_at: 0,
                 text_content: None,
                 pdf_vault_rel: None,
+                tags: vec![],
             },
             VaultNoteExport {
                 notebook_title: "B".into(),
@@ -548,6 +561,7 @@ mod tests {
                 created_at: 0,
                 text_content: Some("x".into()),
                 pdf_vault_rel: None,
+                tags: vec![],
             },
         ];
         let n = sync_notes_to_vault(tmp.path(), Path::new("Ephemeris"), &notes).unwrap();
@@ -646,6 +660,7 @@ mod tests {
             created_at: 0,
             text_content: Some("# Heading 1\n## Heading 2\nRegular text".into()),
             pdf_vault_rel: None,
+            tags: vec![],
         };
         let path = export_note_markdown(tmp.path(), Path::new("Ephemeris"), &note).unwrap();
         let body = fs::read_to_string(path).unwrap();
@@ -666,6 +681,7 @@ mod tests {
             created_at: 0,
             text_content: Some("Some ==highlighted== and <u>underlined</u> text".into()),
             pdf_vault_rel: None,
+            tags: vec![],
         };
         let path = export_note_markdown(tmp.path(), Path::new("Ephemeris"), &note).unwrap();
         let body = fs::read_to_string(path).unwrap();
@@ -684,6 +700,7 @@ mod tests {
             created_at: 0,
             text_content: Some("- item 1\n- item 2\n  - nested\n1. ordered\n2. second".into()),
             pdf_vault_rel: None,
+            tags: vec![],
         };
         let path = export_note_markdown(tmp.path(), Path::new("Ephemeris"), &note).unwrap();
         let body = fs::read_to_string(path).unwrap();
@@ -705,6 +722,7 @@ mod tests {
             created_at: 0,
             text_content: Some("- [ ] buy milk\n- [x] call bob".into()),
             pdf_vault_rel: None,
+            tags: vec![],
         };
         let path = export_note_markdown(tmp.path(), Path::new("Ephemeris"), &note).unwrap();
         let body = fs::read_to_string(path).unwrap();
@@ -723,11 +741,30 @@ mod tests {
             created_at: 0,
             text_content: Some("\\# not a heading\nRegular paragraph".into()),
             pdf_vault_rel: None,
+            tags: vec![],
         };
         let path = export_note_markdown(tmp.path(), Path::new("Ephemeris"), &note).unwrap();
         let body = fs::read_to_string(path).unwrap();
         assert!(body.contains("\\# not a heading"));
         assert!(body.contains("Regular paragraph"));
+    }
+
+    #[test]
+    fn frontmatter_includes_tags_when_set() {
+        let tmp = TempDir::new().unwrap();
+        let note = VaultNoteExport {
+            notebook_title: "N".into(),
+            notebook_segments: vec![],
+            note_title: "Tagged".into(),
+            note_id: 9,
+            created_at: 0,
+            text_content: None,
+            pdf_vault_rel: None,
+            tags: vec!["work".into(), "ideas".into()],
+        };
+        let path = export_note_markdown(tmp.path(), Path::new("Ephemeris"), &note).unwrap();
+        let body = fs::read_to_string(&path).unwrap();
+        assert!(body.contains("tags:\n  - work\n  - ideas\n"));
     }
 
     #[test]
@@ -741,6 +778,7 @@ mod tests {
             created_at: 1_700_000_000,
             text_content: Some("Body text".into()),
             pdf_vault_rel: None,
+            tags: vec![],
         };
         let path = export_note_markdown(tmp.path(), Path::new("Ephemeris"), &note).unwrap();
         let body = fs::read_to_string(path).unwrap();

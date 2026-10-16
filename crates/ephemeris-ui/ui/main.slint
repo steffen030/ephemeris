@@ -157,8 +157,10 @@ export struct TaskEntry {
 
 /// A rendered markdown block for the vault note viewer.
 export struct MdBlockEntry {
-    kind: int,   // 0=h1 1=h2 2=h3 3=para 4=bullet 5=numbered 6=quote 7=code 8=rule
+    kind: int,   // 0=h1 1=h2 2=h3 3=para 4=bullet 5=numbered 6=quote 7=code 8=rule 9=link
     text: string,
+    link-target: string,
+    body: styled-text,
 }
 
 /// One formatted line of the See-text view.
@@ -256,6 +258,8 @@ export struct NoteEntry {
     id: string,
     title: string,
     date-label: string,
+    /// Space-joined `#tag` labels for the list secondary line (may be empty).
+    tags-label: string,
     has-preview: bool,
     preview: image,
     /// Show owning-profile badge (All aggregator view).
@@ -640,7 +644,7 @@ export component EphemerisPage inherits Window {
     // GNOME shows its on-screen keyboard.
     out property <bool> text-entry-active: root.canvas-rename-visible
         || root.canvas-file-dialog-visible || root.canvas-link-dialog-visible
-        || root.note-rename-visible || root.see-text-edit-open;
+        || root.note-rename-visible || root.note-tags-visible || root.see-text-edit-open;
     callback nav-canvas-tapped();
     callback canvas-folder-tapped(string);
     callback canvas-browser-back-tapped();
@@ -777,6 +781,7 @@ export component EphemerisPage inherits Window {
         !root.show-canvas-board &&
         !root.show-calendar && !root.task-dialog-visible &&
         !root.note-rename-visible && !root.note-move-visible &&
+        !root.note-tags-visible &&
         !root.notebook-rename-visible && !root.notebook-delete-visible &&
         !root.ring-visible &&
         !root.show-recording-list && !root.rec-rename-visible &&
@@ -805,6 +810,8 @@ export component EphemerisPage inherits Window {
     in-out property <string> md-viewer-path: "";
     in property <[MdBlockEntry]> md-viewer-blocks: [];
     callback md-viewer-back();
+    /// Follow a wiki / vault link from the markdown viewer (`link-target`).
+    callback md-viewer-link-tapped(string);
 
     in-out property <bool> drawing-menu-open: false;
     in-out property <string> active-paper: "blank";
@@ -838,6 +845,8 @@ export component EphemerisPage inherits Window {
     in-out property <bool> settings-pen-only: true;
     // New-note title template (`yyyy`/`mm`/`dd` + `{n}`).
     in-out property <string> settings-note-title-pattern: "yyyy-mm-dd Note {n}";
+    /// Comma- or space-separated curated note tag suggestions.
+    in-out property <string> settings-note-suggested-tags: "";
     in property <string> settings-vault-path: "";
     in property <[CalSource]> settings-cal-sources: [];
     in-out property <string> settings-new-url: "";
@@ -943,6 +952,19 @@ export component EphemerisPage inherits Window {
 
     callback note-rename-confirm(string, string);
     callback note-rename-cancel();
+
+    // ── Note tags sheet ───────────────────────────────────────────────────
+    in-out property <bool> note-tags-visible: false;
+    in-out property <string> note-tags-id: "";
+    /// Space-separated current tags (editable).
+    in-out property <string> note-tags-value: "";
+    /// Space-separated curated suggestions from settings.
+    in-out property <string> note-tags-suggestions: "";
+    in-out property <string> note-tags-draft: "";
+    callback note-tags-open();
+    callback note-tags-confirm(string, string);
+    callback note-tags-cancel();
+    callback note-tags-add-suggestion(string);
 
     // ── Note move dialog ──────────────────────────────────────────────────
     in-out property <bool> note-move-visible: false;
@@ -2386,15 +2408,17 @@ export component EphemerisPage inherits Window {
                                     background: transparent;
 
                                     VerticalLayout {
-                                        spacing: 4px; alignment: center;
+                                        spacing: 2px; alignment: center;
                                         Text {
                                             text: note.title;
                                             font-size: 14px; color: EinkTheme.btn-fg;
                                             overflow: elide;
                                         }
                                         Text {
-                                            text: note.date-label;
+                                            text: note.tags-label == "" ? note.date-label
+                                                : (note.date-label + " · " + note.tags-label);
                                             font-size: 11px; color: EinkTheme.text-secondary;
+                                            overflow: elide;
                                         }
                                     }
                                     TouchArea {
@@ -2554,7 +2578,8 @@ export component EphemerisPage inherits Window {
                                                 overflow: elide;
                                             }
                                             Text {
-                                                text: note.date-label;
+                                                text: note.tags-label == "" ? note.date-label
+                                                    : (note.date-label + " · " + note.tags-label);
                                                 font-size: 9px; color: EinkTheme.text-secondary;
                                                 overflow: elide;
                                             }
@@ -3298,8 +3323,8 @@ export component EphemerisPage inherits Window {
     drawing-dropdown := Rectangle {
         visible: root.drawing-menu-open && root.is-canvas-context;
         x: parent.width - 192px; y: 60px;
-        // Last row (See text) ends at y 282; +6px bottom padding like the top.
-        width: 184px; height: 288px;
+        // Last row (See text) ends at y 324; +6px bottom padding like the top.
+        width: 184px; height: 330px;
         background: EinkTheme.chrome-bg;
         border-width: 2px; border-color: EinkTheme.chrome-border;
         border-radius: 6px;
@@ -3553,9 +3578,38 @@ export component EphemerisPage inherits Window {
         // Separator
         Rectangle { x: 6px; y: 235px; width: 172px; height: 1px; background: EinkTheme.chrome-border; }
 
-        // -- See text toggle (OCR / transcribed layer)
+        // -- Tags (note metadata → vault frontmatter)
         Rectangle {
             x: 6px; y: 240px; width: 172px; height: 42px;
+            background: transparent;
+            border-radius: 3px;
+            Text {
+                x: 10px; y: 2px; width: 28px; height: 38px;
+                text: Icons.link; font-family: "Material Icons"; font-size: 20px;
+                color: EinkTheme.btn-fg;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
+            Text {
+                x: 40px; width: parent.width - 50px; height: parent.height;
+                text: "Tags";
+                font-size: 12px;
+                color: EinkTheme.btn-fg;
+                horizontal-alignment: left; vertical-alignment: center;
+            }
+            TouchArea {
+                clicked => {
+                    root.drawing-menu-open = false;
+                    root.note-tags-open();
+                }
+            }
+        }
+
+        // Separator
+        Rectangle { x: 6px; y: 282px; width: 172px; height: 1px; background: EinkTheme.chrome-border; }
+
+        // -- See text toggle (OCR / transcribed layer)
+        Rectangle {
+            x: 6px; y: 286px; width: 172px; height: 42px;
             background: root.note-see-text ? EinkTheme.btn-active-bg : transparent;
             border-radius: 3px;
             Text {
@@ -4719,7 +4773,7 @@ export component EphemerisPage inherits Window {
         background: root.canvas-menu-open ? EinkTheme.btn-active-bg : EinkTheme.chrome-bg;
         border-radius: 22px; border-width: 2px; border-color: EinkTheme.btn-border;
         Text {
-            text: root.canvas-menu-open ? Icons.close : Icons.menu;
+            text: root.canvas-menu-open ? Icons.close : Icons.grid-view;
             font-family: "Material Icons"; font-size: 20px;
             color: root.canvas-menu-open ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
             horizontal-alignment: center; vertical-alignment: center;
@@ -4900,16 +4954,63 @@ export component EphemerisPage inherits Window {
             font-size: 14px; font-weight: 700; color: EinkTheme.btn-fg; overflow: elide;
             vertical-alignment: center;
         }
-        // Done sits under the card (bottom-right), clear of the drawing burger.
-        Rectangle {
-            x: focus-card.x + focus-card.width - 120px;
+        // Ink tools + Done under the card (bottom-right), clear of the drawing burger.
+        HorizontalLayout {
+            x: focus-card.x + focus-card.width - 280px;
             y: focus-card.y + focus-card.height + 24px;
-            width: 120px; height: 52px;
-            background: EinkTheme.btn-active-bg;
-            border-radius: 6px; border-width: 2px; border-color: EinkTheme.btn-border;
-            Text { text: "Done"; font-size: 15px; font-weight: 700; color: EinkTheme.btn-active-fg;
-                   horizontal-alignment: center; vertical-alignment: center; }
-            TouchArea { clicked => { root.canvas-focus-done(); } }
+            width: 280px; height: 52px;
+            spacing: 8px;
+            alignment: end;
+            Rectangle {
+                width: 48px; height: 52px;
+                background: root.active-tool == "pen" ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+                border-radius: 6px; border-width: 2px; border-color: EinkTheme.btn-border;
+                Text {
+                    text: Icons.tool-pen; font-family: "Material Icons"; font-size: 22px;
+                    color: root.active-tool == "pen" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                    horizontal-alignment: center; vertical-alignment: center;
+                    width: parent.width; height: parent.height;
+                }
+                TouchArea {
+                    clicked => { root.active-tool = "pen"; root.tool-selected("pen"); }
+                }
+            }
+            Rectangle {
+                width: 48px; height: 52px;
+                background: root.active-tool == "highlighter" ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+                border-radius: 6px; border-width: 2px; border-color: EinkTheme.btn-border;
+                Text {
+                    text: Icons.tool-highlight; font-family: "Material Icons"; font-size: 22px;
+                    color: root.active-tool == "highlighter" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                    horizontal-alignment: center; vertical-alignment: center;
+                    width: parent.width; height: parent.height;
+                }
+                TouchArea {
+                    clicked => { root.active-tool = "highlighter"; root.tool-selected("highlighter"); }
+                }
+            }
+            Rectangle {
+                width: 48px; height: 52px;
+                background: root.active-tool == "eraser" ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+                border-radius: 6px; border-width: 2px; border-color: EinkTheme.btn-border;
+                Text {
+                    text: Icons.tool-eraser; font-family: "Material Icons"; font-size: 22px;
+                    color: root.active-tool == "eraser" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                    horizontal-alignment: center; vertical-alignment: center;
+                    width: parent.width; height: parent.height;
+                }
+                TouchArea {
+                    clicked => { root.active-tool = "eraser"; root.tool-selected("eraser"); }
+                }
+            }
+            Rectangle {
+                width: 120px; height: 52px;
+                background: EinkTheme.btn-active-bg;
+                border-radius: 6px; border-width: 2px; border-color: EinkTheme.btn-border;
+                Text { text: "Done"; font-size: 15px; font-weight: 700; color: EinkTheme.btn-active-fg;
+                       horizontal-alignment: center; vertical-alignment: center; }
+                TouchArea { clicked => { root.canvas-focus-done(); } }
+            }
         }
     }
 
@@ -5071,28 +5172,55 @@ export component EphemerisPage inherits Window {
 
             Rectangle { height: 1px; background: EinkTheme.chrome-border; }
 
-            // Notes
+            // Tasks (after Home)
             Rectangle {
                 height: 72px;
                 background: root.nav-section == 1 ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
                 VerticalLayout {
                     padding: 6px; spacing: 2px; alignment: center;
                     Text {
-                        text: Icons.notes;
+                        text: Icons.tasks;
                         font-family: "Material Icons";
                         font-size: 26px;
                         color: root.nav-section == 1 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
                         horizontal-alignment: center;
                     }
                     Text {
-                        text: "Notes";
+                        text: "Tasks";
                         font-size: 10px;
                         color: root.nav-section == 1 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
                         horizontal-alignment: center;
                     }
                 }
                 TouchArea {
-                    clicked => { root.nav-section = 1; root.nav-notes-tapped(); }
+                    clicked => { root.nav-section = 1; root.nav-tasks-tapped(); }
+                }
+            }
+
+            Rectangle { height: 1px; background: EinkTheme.chrome-border; }
+
+            // Notes
+            Rectangle {
+                height: 72px;
+                background: root.nav-section == 2 ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+                VerticalLayout {
+                    padding: 6px; spacing: 2px; alignment: center;
+                    Text {
+                        text: Icons.notes;
+                        font-family: "Material Icons";
+                        font-size: 26px;
+                        color: root.nav-section == 2 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                        horizontal-alignment: center;
+                    }
+                    Text {
+                        text: "Notes";
+                        font-size: 10px;
+                        color: root.nav-section == 2 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                        horizontal-alignment: center;
+                    }
+                }
+                TouchArea {
+                    clicked => { root.nav-section = 2; root.nav-notes-tapped(); }
                 }
             }
 
@@ -5101,52 +5229,25 @@ export component EphemerisPage inherits Window {
             // Canvas (Obsidian-compatible spatial boards)
             Rectangle {
                 height: 72px;
-                background: root.nav-section == 2 ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+                background: root.nav-section == 3 ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
                 VerticalLayout {
                     padding: 6px; spacing: 2px; alignment: center;
                     Text {
                         text: Icons.grid-view;
                         font-family: "Material Icons";
                         font-size: 26px;
-                        color: root.nav-section == 2 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                        color: root.nav-section == 3 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
                         horizontal-alignment: center;
                     }
                     Text {
                         text: "Canvas";
                         font-size: 10px;
-                        color: root.nav-section == 2 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
-                        horizontal-alignment: center;
-                    }
-                }
-                TouchArea {
-                    clicked => { root.nav-section = 2; root.nav-canvas-tapped(); }
-                }
-            }
-
-            Rectangle { height: 1px; background: EinkTheme.chrome-border; }
-
-            // Tasks
-            Rectangle {
-                height: 72px;
-                background: root.nav-section == 3 ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
-                VerticalLayout {
-                    padding: 6px; spacing: 2px; alignment: center;
-                    Text {
-                        text: Icons.tasks;
-                        font-family: "Material Icons";
-                        font-size: 26px;
-                        color: root.nav-section == 3 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
-                        horizontal-alignment: center;
-                    }
-                    Text {
-                        text: "Tasks";
-                        font-size: 10px;
                         color: root.nav-section == 3 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
                         horizontal-alignment: center;
                     }
                 }
                 TouchArea {
-                    clicked => { root.nav-section = 3; root.nav-tasks-tapped(); }
+                    clicked => { root.nav-section = 3; root.nav-canvas-tapped(); }
                 }
             }
 
@@ -5761,21 +5862,58 @@ export component EphemerisPage inherits Window {
                     spacing: 10px;
                     width: root.width - root.nav-w - 24px;
 
-                    for block[i] in root.md-viewer-blocks: Text {
+                    for block[i] in root.md-viewer-blocks: Rectangle {
                         width: root.width - root.nav-w - 24px;
-                        text: block.kind == 8 ? "────────"
-                            : block.kind == 4 ? ("•  " + block.text)
-                            : block.kind == 6 ? ("│  " + block.text)
-                            : block.text;
-                        wrap: word-wrap;
-                        color: block.kind == 6 || block.kind == 7 || block.kind == 8
-                            ? EinkTheme.text-secondary
-                            : EinkTheme.btn-fg;
-                        font-size: block.kind == 0 ? 20px
-                            : block.kind == 1 ? 17px
-                            : block.kind == 2 ? 15px
-                            : 14px;
-                        font-weight: block.kind <= 2 ? 700 : 400;
+                        height: block-body.preferred-height;
+                        background: block.kind == 9 ? EinkTheme.btn-bg : transparent;
+                        border-radius: block.kind == 9 ? 4px : 0px;
+                        border-width: block.kind == 9 ? 1px : 0px;
+                        border-color: EinkTheme.btn-border;
+                        block-body := VerticalLayout {
+                            padding: block.kind == 9 ? 6px : 0px;
+                            if block.kind == 8: Text {
+                                width: parent.width;
+                                text: "────────";
+                                color: EinkTheme.text-secondary;
+                                font-size: 14px;
+                            }
+                            if block.kind != 8 && block.kind <= 2: Text {
+                                width: parent.width;
+                                text: block.text;
+                                wrap: word-wrap;
+                                color: EinkTheme.btn-fg;
+                                font-size: block.kind == 0 ? 20px
+                                    : block.kind == 1 ? 17px
+                                    : 15px;
+                                font-weight: 700;
+                            }
+                            if block.kind != 8 && block.kind > 2: HorizontalLayout {
+                                spacing: 4px;
+                                if block.kind == 4: Text {
+                                    text: "•"; font-size: 14px; color: EinkTheme.btn-fg;
+                                }
+                                if block.kind == 6: Text {
+                                    text: "│"; font-size: 14px; color: EinkTheme.text-secondary;
+                                }
+                                if block.kind == 9: Text {
+                                    text: Icons.link; font-family: "Material Icons";
+                                    font-size: 16px; color: EinkTheme.btn-fg;
+                                    vertical-alignment: center;
+                                }
+                                StyledText {
+                                    horizontal-stretch: 1;
+                                    text: block.body;
+                                    default-font-size: 14px;
+                                    default-color: block.kind == 6 || block.kind == 7
+                                        ? EinkTheme.text-secondary
+                                        : EinkTheme.btn-fg;
+                                }
+                            }
+                        }
+                        if block.kind == 9 && block.link-target != "": TouchArea {
+                            width: parent.width; height: parent.height;
+                            clicked => { root.md-viewer-link-tapped(block.link-target); }
+                        }
                     }
 
                     if root.md-viewer-blocks.length == 0: Text {
@@ -6095,6 +6233,39 @@ export component EphemerisPage inherits Window {
                                 }
                                 Text {
                                     text: "Tokens: yyyy mm dd · {n} = counter";
+                                    font-size: 11px; color: EinkTheme.text-secondary;
+                                }
+                            }
+                        }
+
+                        Rectangle { height: 2px; background: EinkTheme.chrome-border; }
+
+                        Rectangle {
+                            height: 72px;
+                            background: EinkTheme.canvas-bg;
+                            VerticalLayout {
+                                padding-left: 16px; padding-right: 16px;
+                                padding-top: 6px; padding-bottom: 6px;
+                                spacing: 4px;
+                                Text {
+                                    text: "Suggested note tags";
+                                    font-size: 14px; color: EinkTheme.btn-fg;
+                                    vertical-alignment: center;
+                                }
+                                Rectangle {
+                                    height: 32px;
+                                    border-radius: 4px; border-width: 2px;
+                                    border-color: EinkTheme.btn-border;
+                                    background: EinkTheme.canvas-bg;
+                                    TextInput {
+                                        x: 8px; width: parent.width - 16px; height: parent.height;
+                                        font-size: 13px; color: EinkTheme.btn-fg;
+                                        text <=> root.settings-note-suggested-tags;
+                                        vertical-alignment: center; single-line: true;
+                                    }
+                                }
+                                Text {
+                                    text: "Comma or space separated · shown when tagging a note";
                                     font-size: 11px; color: EinkTheme.text-secondary;
                                 }
                             }
@@ -8914,6 +9085,144 @@ export component EphemerisPage inherits Window {
         }
     }
 
+    note-tags-dialog := Rectangle {
+        visible: root.note-tags-visible;
+        changed visible => {
+            if (self.visible) {
+                note-tags-input.focus();
+            }
+        }
+        x: 0; y: 0;
+        width: parent.width;
+        height: parent.height;
+        background: EinkTheme.chrome-bg;
+        opacity: 0.95;
+        Rectangle {
+            x: (parent.width - 420px) / 2;
+            y: max(24px, (parent.height - 340px) / 2);
+            width: 420px; height: 340px;
+            background: EinkTheme.canvas-bg;
+            border-radius: 8px;
+            border-width: 3px;
+            border-color: EinkTheme.chrome-border;
+            VerticalLayout {
+                padding: 18px; spacing: 10px;
+                Text {
+                    text: "Note tags";
+                    font-size: 16px; font-weight: 700;
+                    color: EinkTheme.btn-fg;
+                    horizontal-alignment: center;
+                }
+                Text {
+                    text: "Current (space-separated). Tap a suggestion to add.";
+                    font-size: 11px; color: EinkTheme.text-secondary;
+                    wrap: word-wrap;
+                }
+                Rectangle {
+                    height: 44px;
+                    border-radius: 4px; border-width: 2px;
+                    border-color: EinkTheme.btn-border;
+                    background: EinkTheme.canvas-bg;
+                    note-tags-input := TextInput {
+                        x: 8px; width: parent.width - 16px; height: parent.height;
+                        font-size: 14px; color: EinkTheme.btn-fg;
+                        text <=> root.note-tags-value;
+                        vertical-alignment: center; single-line: true;
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Rectangle {
+                        height: 40px; horizontal-stretch: 1;
+                        border-radius: 4px; border-width: 2px;
+                        border-color: EinkTheme.btn-border;
+                        background: EinkTheme.btn-bg;
+                        TextInput {
+                            x: 8px; width: parent.width - 16px; height: parent.height;
+                            font-size: 13px; color: EinkTheme.btn-fg;
+                            text <=> root.note-tags-draft;
+                            vertical-alignment: center; single-line: true;
+                        }
+                    }
+                    Rectangle {
+                        width: 72px; height: 40px;
+                        background: EinkTheme.btn-active-bg;
+                        border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                        Text {
+                            text: "Add"; font-size: 13px; font-weight: 700;
+                            color: EinkTheme.btn-active-fg;
+                            horizontal-alignment: center; vertical-alignment: center;
+                        }
+                        TouchArea {
+                            clicked => {
+                                if (root.note-tags-draft != "") {
+                                    root.note-tags-add-suggestion(root.note-tags-draft);
+                                    root.note-tags-draft = "";
+                                }
+                            }
+                        }
+                    }
+                }
+                Text {
+                    text: root.note-tags-suggestions == ""
+                        ? "No curated suggestions — set them in Settings › General."
+                        : ("Suggestions: " + root.note-tags-suggestions);
+                    font-size: 12px; color: EinkTheme.text-secondary;
+                    wrap: word-wrap;
+                }
+                // Suggestion chips: first three tokens as one-tap add
+                HorizontalLayout {
+                    spacing: 6px;
+                    Rectangle {
+                        height: 36px; horizontal-stretch: 1;
+                        visible: root.note-tags-suggestions != "";
+                        background: EinkTheme.btn-bg;
+                        border-radius: 4px; border-width: 1px; border-color: EinkTheme.btn-border;
+                        Text {
+                            text: "+ tag";
+                            font-size: 12px; color: EinkTheme.btn-fg;
+                            horizontal-alignment: center; vertical-alignment: center;
+                        }
+                        TouchArea {
+                            clicked => {
+                                // Cycle: take first suggestion token and add it
+                                root.note-tags-add-suggestion("");
+                            }
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 12px; alignment: stretch;
+                    Rectangle {
+                        height: 44px; horizontal-stretch: 1;
+                        background: EinkTheme.btn-bg;
+                        border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                        Text {
+                            text: "Cancel"; font-size: 14px; color: EinkTheme.btn-fg;
+                            horizontal-alignment: center; vertical-alignment: center;
+                        }
+                        TouchArea { clicked => { root.note-tags-cancel(); } }
+                    }
+                    Rectangle {
+                        height: 44px; horizontal-stretch: 1;
+                        background: EinkTheme.btn-active-bg;
+                        border-radius: 4px; border-width: 2px; border-color: EinkTheme.btn-border;
+                        Text {
+                            text: "Done"; font-size: 14px; font-weight: 700;
+                            color: EinkTheme.btn-active-fg;
+                            horizontal-alignment: center; vertical-alignment: center;
+                        }
+                        TouchArea {
+                            clicked => {
+                                root.note-tags-confirm(root.note-tags-id, root.note-tags-value);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     note-rename-dialog := Rectangle {
         visible: root.note-rename-visible;
         changed visible => {
@@ -9651,7 +9960,7 @@ export component EphemerisPage inherits Window {
         opacity: 1.0;
 
         Text {
-            text: root.drawing-menu-open ? Icons.close : Icons.menu;
+            text: root.drawing-menu-open ? Icons.close : Icons.notes;
             font-family: "Material Icons";
             font-size: 20px;
             color: root.drawing-menu-open ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;

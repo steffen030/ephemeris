@@ -23,8 +23,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::app::{
     begin_create_with_profile, build_cascading_transcriber, note_preview_from_gray,
-    profile_badge_for, recognition_model_version_for, AppConnection,
+    profile_badge_for, recognition_model_version_for, schedule_vault_git_push_for, AppConnection,
 };
+
+/// Left nav-rail section for Canvas (`nav-section` in main.slint).
+const NAV_HOME: i32 = 0;
+const NAV_CANVAS: i32 = 3;
 
 const GRID: i32 = 20;
 const CONNECT_MARGIN: f32 = 48.0;
@@ -374,7 +378,7 @@ pub(crate) fn leave_canvas_session(
     if return_to_browser {
         page.set_show_canvas_folder_list(true);
         page.set_show_canvas_list(session.active_folder_id.get() != 0);
-        page.set_nav_section(2);
+        page.set_nav_section(NAV_CANVAS);
         push_browser(ui, session);
     } else {
         page.set_show_canvas_folder_list(false);
@@ -490,7 +494,7 @@ pub(crate) fn wire_canvas(
             page.set_show_search(false);
             page.set_show_canvas_board(false);
             page.set_canvas_focus_active(false);
-            page.set_nav_section(2);
+            page.set_nav_section(NAV_CANVAS);
             page.set_show_canvas_list(false);
             page.set_show_canvas_folder_list(true);
             ui_rc.set_canvas_search_query("");
@@ -655,7 +659,7 @@ pub(crate) fn wire_canvas(
                 page.set_show_canvas_folder_list(false);
                 page.set_show_canvas_list(false);
                 page.set_show_start_page(true);
-                page.set_nav_section(0);
+                page.set_nav_section(NAV_HOME);
                 return;
             }
             let parent = session
@@ -1328,6 +1332,7 @@ fn open_canvas(ui: &EphemerisUi, session: &CanvasSession, id: u32, refresh: &Rc<
     page.set_show_canvas_board(true);
     page.set_canvas_focus_active(false);
     page.set_canvas_menu_open(false);
+    page.set_drawing_menu_open(false);
     page.set_canvas_add_visible(false);
     session.sync_selection_ui(ui);
     let title = session
@@ -2095,11 +2100,15 @@ fn export_active_canvas(session: &CanvasSession, config: &Config, connections: &
         ink_pngs,
         include_ink_file_nodes: true,
     };
-    std::thread::spawn(move || {
-        if let Err(e) = export_canvas_json(&vault, &export_subdir, &export) {
-            tracing::warn!("canvas export failed: {e}");
-        }
-    });
+    let config = config.clone();
+    std::thread::spawn(
+        move || match export_canvas_json(&vault, &export_subdir, &export) {
+            Ok(_) => {
+                schedule_vault_git_push_for(&config, &vault);
+            }
+            Err(e) => tracing::warn!("canvas export failed: {e}"),
+        },
+    );
 }
 
 fn folder_export_parts(index: &CanvasIndex, folder_id: Option<u32>) -> (String, Vec<String>) {

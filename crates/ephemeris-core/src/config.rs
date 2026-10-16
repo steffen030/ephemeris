@@ -150,6 +150,10 @@ pub struct Config {
     #[serde(default = "default_note_title_pattern")]
     pub note_title_pattern: String,
 
+    /// Curated tag suggestions offered when tagging a note (freeform still allowed).
+    #[serde(default)]
+    pub note_suggested_tags: Vec<String>,
+
     /// Configurable GTD horizon lanes (Now / Next / Later / …).
     #[serde(default = "default_task_lanes")]
     pub task_lanes: Vec<TaskLaneConfig>,
@@ -418,6 +422,7 @@ impl Default for Config {
             line_htr_model_dir: None,
             pen_only_drawing: default_pen_only_drawing(),
             note_title_pattern: default_note_title_pattern(),
+            note_suggested_tags: Vec::new(),
             task_lanes: default_task_lanes(),
             task_engage: TaskEngageConfig::default(),
             custom: HashMap::new(),
