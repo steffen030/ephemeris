@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.25](https://github.com/steffen030/ephemeris/compare/v0.1.24...v0.1.25) (2026-10-16)
+
+
+### Features
+
+* **notes:** ink undo/redo, lasso move, and hold-to-snap smart shapes ([#65](https://github.com/steffen030/ephemeris/issues/65)) ([b3391dd](https://github.com/steffen030/ephemeris/commit/b3391dd7b19fbf3a4632a07b3a3fe5f1ca516cef))
+* **ui:** polish notes/canvas chrome, MD viewer, tags, and vault export ([#63](https://github.com/steffen030/ephemeris/issues/63)) ([2eee0a0](https://github.com/steffen030/ephemeris/commit/2eee0a022767ac21b3615d2b86e4a293ea3f48e1))
+
 ## [0.1.24](https://github.com/steffen030/ephemeris/compare/v0.1.23...v0.1.24) (2026-10-16)
 
 
