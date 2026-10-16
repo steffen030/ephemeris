@@ -223,11 +223,15 @@ fn side_anchor(n: &CanvasNode, side: NodeSide) -> (f32, f32) {
 #[derive(Debug, Clone, Copy)]
 pub struct BoardDrawOpts<'a> {
     pub selected_ids: &'a [String],
-    pub connect_from: Option<&'a str>,
     /// Draw mid-side connection ports (single selection).
     pub show_ports: bool,
     /// Optional ink thumbnails keyed by node id: (w, h, gray8).
     pub ink_previews: &'a std::collections::HashMap<String, (u32, u32, Vec<u8>)>,
+    /// Text card bodies are drawn by the UI on top of the board (formatted
+    /// text); the raster leaves those cards blank. Thumbnails keep it false.
+    pub text_overlay: bool,
+    /// Text cards showing recognised text: their ink preview is not drawn.
+    pub typed_cards: &'a [String],
 }
 
 /// Screen-space hit radius for connection ports (logical px).
@@ -397,8 +401,7 @@ fn draw_node(
     let sh = (n.height() as f32 * vp.scale) as i32;
     let x0 = sx as i32;
     let y0 = sy as i32;
-    let selected =
-        opts.selected_ids.iter().any(|id| id == n.id()) || opts.connect_from == Some(n.id());
+    let selected = opts.selected_ids.iter().any(|id| id == n.id());
     let fill = WHITE;
     let border = if selected { SELECT } else { BLACK };
     let border_w = if selected { 3 } else { 2 };
@@ -416,7 +419,11 @@ fn draw_node(
         }
         CanvasNode::Text(t) => {
             fill_rect(buf, width, height, x0, y0, sw, sh, fill);
-            if let Some((iw, ih, px)) = opts.ink_previews.get(n.id()) {
+            let ink = opts
+                .ink_previews
+                .get(n.id())
+                .filter(|_| !opts.typed_cards.iter().any(|t| t == n.id()));
+            if let Some((iw, ih, px)) = ink {
                 blit_ink_preview(
                     buf,
                     width,
@@ -429,6 +436,8 @@ fn draw_node(
                     *ih,
                     px,
                 );
+            } else if opts.text_overlay {
+                // Body comes from the UI overlay.
             } else if t.text.trim().is_empty() {
                 blit_label(buf, width, height, x0 + 8, y0 + 8, "Empty");
             } else {
@@ -878,13 +887,55 @@ mod tests {
         let previews = std::collections::HashMap::new();
         let opts = BoardDrawOpts {
             selected_ids: &ids,
-            connect_from: None,
             show_ports: false,
             ink_previews: &previews,
+            text_overlay: false,
+            typed_cards: &ids,
         };
         let buf = render_board(&doc, &vp, 800, 600, &opts);
         assert_eq!(buf.len(), 800 * 600);
         assert!(buf.iter().any(|&p| p < 255));
+    }
+
+    #[test]
+    fn typed_card_hides_ink_and_overlay_leaves_text_blank() {
+        let mut doc = CanvasDoc::default();
+        let id = doc.add_text_card(0, 0);
+        if let Some(CanvasNode::Text(t)) = doc.find_node_mut(&id) {
+            t.text = "HELLO".into();
+        }
+        let vp = Viewport {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            scale: 1.0,
+        };
+        let mut previews = std::collections::HashMap::new();
+        previews.insert(id.clone(), (4u32, 4u32, vec![BLACK; 16]));
+        let none: [String; 0] = [];
+        let typed = [id.clone()];
+        let render = |typed_cards: &[String], text_overlay: bool| {
+            let opts = BoardDrawOpts {
+                selected_ids: &none,
+                show_ports: false,
+                ink_previews: &previews,
+                text_overlay,
+                typed_cards,
+            };
+            render_board(&doc, &vp, 400, 300, &opts)
+        };
+        let dark = |buf: &[u8]| {
+            // Card interior only (skip the border).
+            (10..60u32)
+                .flat_map(|y| (10..200u32).map(move |x| (x, y)))
+                .filter(|&(x, y)| buf[(y * 400 + x) as usize] < 128)
+                .count()
+        };
+        let ink = dark(&render(&none, true));
+        let typed_overlay = dark(&render(&typed, true));
+        let typed_raster = dark(&render(&typed, false));
+        assert!(ink > 0, "ink preview drawn for a handwritten card");
+        assert_eq!(typed_overlay, 0, "UI overlay draws the typed text");
+        assert!(typed_raster > 0, "thumbnails still raster the text");
     }
 
     #[test]

@@ -372,6 +372,13 @@ impl DesktopWindow {
         self.window.request_redraw();
     }
 
+    /// Enable / disable the platform text input (Wayland `text-input-v3`).
+    /// GNOME raises its on-screen keyboard while enabled after a touch;
+    /// typed text then arrives as `WindowEvent::Ime(Commit)`.
+    pub fn set_text_entry(&self, active: bool) {
+        self.window.set_ime_allowed(active);
+    }
+
     /// Request keyboard/pointer focus so the shell dismisses the top panel.
     pub fn focus(&self) {
         self.window.focus_window();

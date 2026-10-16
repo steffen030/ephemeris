@@ -99,6 +99,7 @@
 //! ```
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -316,6 +317,23 @@ pub struct CanvasListItem {
     pub custom_profile_icon: slint::Image,
 }
 
+/// A canvas text card whose body the UI draws over the board raster.
+#[derive(Clone, Debug)]
+pub struct CanvasCardOverlay {
+    pub id: String,
+    /// Screen rect of the card body (inside the border), logical px.
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    /// Board zoom: scales fonts and spacing.
+    pub scale: f32,
+    /// Card text (recognised or typed markdown).
+    pub markdown: String,
+    /// Shown when `markdown` has no rows.
+    pub placeholder: String,
+}
+
 fn folder_list_item_to_entry(e: &FolderListItem) -> NotebookEntry {
     NotebookEntry {
         id: slint::SharedString::from(e.id.as_str()),
@@ -483,6 +501,9 @@ pub struct EphemerisUi {
     /// Logical grayscale UI frame (Slint luma + page template, no ink).
     /// Updated only inside UI-damage rects.
     ui_gray: RefCell<PixelBuf>,
+    /// Formatted rows per canvas card id, keyed by the markdown they came
+    /// from (rebuilt only when a card's text changes, not on every pan).
+    canvas_card_rows: RefCell<HashMap<String, (String, slint::ModelRc<SeeTextLine>)>>,
     /// Physical background cache: `ui_gray` bilinear-upscaled. Refreshed only
     /// where the UI changed — never per pen sample.
     bg_phys: RefCell<PixelBuf>,
@@ -585,6 +606,7 @@ impl EphemerisUi {
             height,
             // Initialise to "white" (0xFFFF in RGB565) so partial repaints don't
             // show black artefacts in regions Slint hasn't touched yet.
+            canvas_card_rows: RefCell::new(HashMap::new()),
             rgb565_buf: RefCell::new(vec![
                 slint::platform::software_renderer::Rgb565Pixel(0xFFFF);
                 pixel_count
@@ -2104,6 +2126,75 @@ impl EphemerisUi {
 
     pub fn on_canvas_group_selected<F: FnMut() + 'static>(&self, handler: F) {
         self.component.on_canvas_group_selected(handler);
+    }
+
+    pub fn on_canvas_add_open<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_canvas_add_open(handler);
+    }
+
+    pub fn on_canvas_convert_selected<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_canvas_convert_selected(handler);
+    }
+
+    pub fn on_canvas_revert_selected<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_canvas_revert_selected(handler);
+    }
+
+    pub fn on_canvas_open_selected<F: FnMut() + 'static>(&self, handler: F) {
+        self.component.on_canvas_open_selected(handler);
+    }
+
+    /// Text card bodies drawn over the board (formatted, zoom-scaled).
+    pub fn set_canvas_text_cards(&self, cards: &[CanvasCardOverlay]) {
+        let mut cache = self.canvas_card_rows.borrow_mut();
+        cache.retain(|id, _| cards.iter().any(|c| &c.id == id));
+        let entries: Vec<CanvasTextCard> = cards
+            .iter()
+            .map(|c| {
+                let rows = match cache.get(&c.id) {
+                    Some((md, rows)) if *md == c.markdown => rows.clone(),
+                    _ => {
+                        let lines: Vec<SeeTextLine> =
+                            ephemeris_core::see_text::rows_from_markdown(&c.markdown)
+                                .iter()
+                                .map(see_text_line)
+                                .collect();
+                        let rows: slint::ModelRc<SeeTextLine> =
+                            Rc::new(slint::VecModel::from(lines)).into();
+                        cache.insert(c.id.clone(), (c.markdown.clone(), rows.clone()));
+                        rows
+                    }
+                };
+                CanvasTextCard {
+                    x: c.x,
+                    y: c.y,
+                    width: c.w,
+                    height: c.h,
+                    scale: c.scale,
+                    rows,
+                    placeholder: c.placeholder.as_str().into(),
+                }
+            })
+            .collect();
+        drop(cache);
+        // Unchanged overlay (e.g. a tap that only re-selects): skip the set so
+        // Slint does not dirty the board region.
+        let current = self.component.get_canvas_text_cards();
+        if current.row_count() == entries.len()
+            && entries
+                .iter()
+                .enumerate()
+                .all(|(i, e)| current.row_data(i).as_ref() == Some(e))
+        {
+            return;
+        }
+        self.component
+            .set_canvas_text_cards(Rc::new(slint::VecModel::from(entries)).into());
+    }
+
+    /// A text-field dialog is open (drives the platform on-screen keyboard).
+    pub fn text_entry_active(&self) -> bool {
+        self.component.get_text_entry_active()
     }
 
     pub fn on_canvas_leave_board<F: FnMut() + 'static>(&self, handler: F) {
