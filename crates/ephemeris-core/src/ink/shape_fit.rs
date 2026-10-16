@@ -39,6 +39,19 @@ const MIN_SAMPLES: usize = 6;
 /// Endpoints within this fraction of path length ⇒ closed shape.
 const CLOSURE_FRAC: f32 = 0.12;
 
+/// Samples closer than this to the previous kept one are dropped, so tip
+/// jitter (notably while holding still to trigger the snap) does not inflate
+/// path length.
+const MIN_STEP: f32 = 3.0;
+
+/// Trailing samples within this radius of the final one are the hold-still
+/// dwell, not part of the drawn shape.
+const HOLD_TRIM: f32 = 8.0;
+
+/// Search the last fraction of a loop for the point nearest the start, so an
+/// overshoot past the start does not count as part of the shape.
+const OVERSHOOT_SEARCH_FRAC: f32 = 0.35;
+
 /// Samples along generated perimeters (enough for smooth raster capsules).
 const PERIM_SAMPLES_RECT: usize = 48;
 const PERIM_SAMPLES_TRI: usize = 36;
@@ -54,14 +67,18 @@ pub fn fit_smart_shape(raw: &[Point]) -> Option<FittedShape> {
     if raw.len() < MIN_SAMPLES {
         return None;
     }
-    let xy: Vec<(f32, f32)> = raw.iter().map(|p| (p.x, p.y)).collect();
+    let xy = trim_hold(&decimate(raw));
+    if xy.len() < MIN_SAMPLES {
+        return None;
+    }
     let path_len = polyline_length(&xy);
     if path_len < MIN_PATH_LEN {
         return None;
     }
 
     let (pressure, tilt) = typical_attrs(raw);
-    let closed = dist(xy[0], *xy.last().unwrap()) <= path_len * CLOSURE_FRAC;
+    let loop_xy = trim_overshoot(&xy, path_len);
+    let closed = loop_xy.is_some();
 
     let mut best: Option<Candidate> = None;
     let consider =
@@ -79,14 +96,14 @@ pub fn fit_smart_shape(raw: &[Point]) -> Option<FittedShape> {
     if let Some((conf, pts)) = try_line(&xy, closed) {
         consider(&mut best, ShapeKind::Line, conf, pts);
     }
-    if closed {
-        if let Some((conf, pts)) = try_rectangle(&xy) {
+    if let Some(xy) = loop_xy.as_deref() {
+        if let Some((conf, pts)) = try_rectangle(xy) {
             consider(&mut best, ShapeKind::Rectangle, conf, pts);
         }
-        if let Some((conf, pts)) = try_triangle(&xy) {
+        if let Some((conf, pts)) = try_triangle(xy) {
             consider(&mut best, ShapeKind::Triangle, conf, pts);
         }
-        if let Some((conf, pts)) = try_ellipse(&xy) {
+        if let Some((conf, pts)) = try_ellipse(xy) {
             consider(&mut best, ShapeKind::Ellipse, conf, pts);
         }
     }
@@ -97,6 +114,49 @@ pub fn fit_smart_shape(raw: &[Point]) -> Option<FittedShape> {
         points: stamp_points(&pts, pressure, tilt),
         confidence,
     })
+}
+
+fn decimate(raw: &[Point]) -> Vec<(f32, f32)> {
+    let mut out: Vec<(f32, f32)> = Vec::with_capacity(raw.len());
+    for p in raw {
+        let q = (p.x, p.y);
+        if out.last().is_none_or(|&l| dist(l, q) >= MIN_STEP) {
+            out.push(q);
+        }
+    }
+    // Keep the true end point even if it lands within MIN_STEP.
+    if let (Some(last), Some(&end)) = (raw.last(), out.last()) {
+        if (last.x, last.y) != end {
+            out.push((last.x, last.y));
+        }
+    }
+    out
+}
+
+fn trim_hold(xy: &[(f32, f32)]) -> Vec<(f32, f32)> {
+    let Some(&end) = xy.last() else {
+        return Vec::new();
+    };
+    let mut n = xy.len();
+    while n > 1 && dist(xy[n - 2], end) < HOLD_TRIM {
+        n -= 1;
+    }
+    let mut out = xy[..n].to_vec();
+    if let Some(last) = out.last_mut() {
+        *last = end;
+    }
+    out
+}
+
+/// If the stroke closes on itself, the loop up to the sample nearest the
+/// start (dropping any overshoot); `None` for open strokes.
+fn trim_overshoot(xy: &[(f32, f32)], path_len: f32) -> Option<Vec<(f32, f32)>> {
+    let n = xy.len();
+    let from = ((n as f32) * (1.0 - OVERSHOOT_SEARCH_FRAC)) as usize;
+    let (k, d) = (from.max(1)..n)
+        .map(|i| (i, dist(xy[0], xy[i])))
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))?;
+    (d <= path_len * CLOSURE_FRAC).then(|| xy[..=k].to_vec())
 }
 
 fn typical_attrs(raw: &[Point]) -> (f32, f32) {
@@ -329,7 +389,21 @@ fn try_triangle(xy: &[(f32, f32)]) -> Option<(f32, Vec<(f32, f32)>)> {
 }
 
 fn try_ellipse(xy: &[(f32, f32)]) -> Option<(f32, Vec<(f32, f32)>)> {
-    let (min_x, min_y, max_x, max_y) = bbox(xy);
+    // Principal axes so tilted ovals fit as well as axis-aligned ones.
+    let (mx, my) = centroid(xy);
+    let (mut sxx, mut syy, mut sxy) = (0.0f32, 0.0f32, 0.0f32);
+    for &(x, y) in xy {
+        let (dx, dy) = (x - mx, y - my);
+        sxx += dx * dx;
+        syy += dy * dy;
+        sxy += dx * dy;
+    }
+    let angle = 0.5 * (2.0 * sxy).atan2(sxx - syy);
+    let (c, s) = (angle.cos(), angle.sin());
+    let to_local = |(x, y): (f32, f32)| ((x - mx) * c + (y - my) * s, -(x - mx) * s + (y - my) * c);
+    let local: Vec<(f32, f32)> = xy.iter().map(|&p| to_local(p)).collect();
+
+    let (min_x, min_y, max_x, max_y) = bbox(&local);
     let rx = (max_x - min_x) * 0.5;
     let ry = (max_y - min_y) * 0.5;
     if rx < 12.0 || ry < 12.0 {
@@ -337,16 +411,17 @@ fn try_ellipse(xy: &[(f32, f32)]) -> Option<(f32, Vec<(f32, f32)>)> {
     }
     let cx = (min_x + max_x) * 0.5;
     let cy = (min_y + max_y) * 0.5;
-    // Prefer roughly elliptical / circular occupancy: path length ≈ ellipse perimeter.
+    // Prefer roughly elliptical / circular occupancy: path length ≈ ellipse
+    // perimeter (Ramanujan's approximation).
     let perim_est =
-        std::f32::consts::PI * (3.0 * (rx + ry) - ((2.0 * rx + ry) * (rx + 2.0 * ry)).sqrt());
+        std::f32::consts::PI * (3.0 * (rx + ry) - ((3.0 * rx + ry) * (rx + 3.0 * ry)).sqrt());
     let path_len = polyline_length(xy);
     let len_ratio = (path_len / perim_est.max(1.0)).clamp(0.5, 1.5);
     let len_score = 1.0 - (len_ratio - 1.0).abs() * 2.0;
 
     let scale = rx.max(ry);
     let conf_fit = residual_confidence(
-        xy,
+        &local,
         |(x, y)| {
             // Radial residual vs unit ellipse.
             let dx = (x - cx) / rx.max(1e-3);
@@ -365,7 +440,8 @@ fn try_ellipse(xy: &[(f32, f32)]) -> Option<(f32, Vec<(f32, f32)>)> {
     let pts: Vec<(f32, f32)> = (0..=PERIM_SAMPLES_ELLIPSE)
         .map(|i| {
             let t = i as f32 / PERIM_SAMPLES_ELLIPSE as f32 * std::f32::consts::TAU;
-            (cx + rx * t.cos(), cy + ry * t.sin())
+            let (lx, ly) = (cx + rx * t.cos(), cy + ry * t.sin());
+            (mx + lx * c - ly * s, my + lx * s + ly * c)
         })
         .collect();
     Some((conf, pts))
@@ -685,5 +761,81 @@ mod tests {
     fn rejects_tiny_stroke() {
         let pts = stroke_line((10.0, 10.0), (20.0, 12.0), 8, 0.5);
         assert!(fit_smart_shape(&pts).is_none());
+    }
+}
+
+#[cfg(test)]
+mod hand_drawn_tests {
+    use super::*;
+
+    /// Append the tip jitter recorded while the user holds still to snap.
+    fn hold(pts: &mut Vec<Point>, n: usize) {
+        let l = *pts.last().unwrap();
+        for i in 0..n {
+            let j = (i as f32 * 1.7).sin() * 1.5;
+            pts.push(Point::new(
+                l.x + j,
+                l.y - j,
+                0.5,
+                0.0,
+                l.t_ms + i as u32 * 8,
+            ));
+        }
+    }
+
+    /// Wobbly (optionally tilted) loop starting at `start` and sweeping `sweep` rad.
+    fn loop_stroke(rx: f32, ry: f32, rot: f32, sweep: f32, wobble: f32) -> Vec<Point> {
+        let n = 80;
+        (0..=n)
+            .map(|i| {
+                let a = 0.3 + sweep * i as f32 / n as f32;
+                let r = 1.0 + wobble * (a * 3.0).sin() + wobble * 0.5 * (a * 5.0 + 1.0).cos();
+                let (x, y) = (rx * r * a.cos(), ry * r * a.sin());
+                let (c, s) = (rot.cos(), rot.sin());
+                Point::new(
+                    300.0 + x * c - y * s,
+                    300.0 + x * s + y * c,
+                    0.5,
+                    0.0,
+                    i as u32 * 8,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hand_drawn_loops_snap_to_ellipse() {
+        let tau = std::f32::consts::TAU;
+        let cases = [
+            ("wobbly", loop_stroke(100.0, 100.0, 0.0, tau, 0.08)),
+            (
+                "overshoot",
+                loop_stroke(100.0, 100.0, 0.0, tau * 1.17, 0.04),
+            ),
+            ("gap", loop_stroke(100.0, 100.0, 0.0, tau * 0.92, 0.04)),
+            ("tilted", loop_stroke(120.0, 70.0, 0.6, tau, 0.03)),
+        ];
+        for (name, mut pts) in cases {
+            hold(&mut pts, 40);
+            let fit = fit_smart_shape(&pts).unwrap_or_else(|| panic!("{name}: no fit"));
+            assert_eq!(fit.kind, ShapeKind::Ellipse, "{name}");
+        }
+    }
+
+    #[test]
+    fn line_survives_hold_jitter() {
+        let mut pts: Vec<Point> = (0..50)
+            .map(|i| {
+                Point::new(
+                    100.0 + i as f32 * 6.0,
+                    300.0 + (i as f32 * 0.4).sin() * 3.0,
+                    0.5,
+                    0.0,
+                    i * 8,
+                )
+            })
+            .collect();
+        hold(&mut pts, 40);
+        assert_eq!(fit_smart_shape(&pts).expect("line").kind, ShapeKind::Line);
     }
 }

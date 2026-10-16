@@ -70,6 +70,7 @@ export global Icons {
     out property <string> profile-flight:   "\u{E297}";  // flight (legacy alias → travel)
     // Connections / providers
     out property <string> link:           "\u{E380}";  // link
+    out property <string> tag:            "\u{E570}";  // sell_baseline (price tag)
     // Folder / files — Flutter MaterialIcons cmap (verified via otfinfo/hb-shape).
     out property <string> folder:         "\u{E2A3}";  // folder_baseline
     out property <string> folder-open:    "\u{E2A4}";  // folder_open_baseline
@@ -103,13 +104,14 @@ export global Icons {
     out property <string> tool-pen:       "\u{E19D}";  // create_baseline (pencil)
     out property <string> tool-highlight: "\u{E310}";  // highlight_baseline (marker)
     out property <string> tool-eraser:    "\u{E0BD}";  // auto_fix_off_baseline
+    out property <string> tool-select:    "\u{E311}";  // highlight_alt_baseline (lasso select)
     out property <string> tool-clear:     "\u{E1B9}";  // delete_baseline
-    out property <string> undo:           "\u{E166}";  // undo (Flutter Material Icons)
-    out property <string> redo:           "\u{E15A}";  // redo
+    out property <string> undo:           "\u{E68C}";  // undo_baseline
+    out property <string> redo:           "\u{E512}";  // redo_baseline
     out property <string> line-weight:    "\u{E37E}";  // line_weight_baseline
     out property <string> paper-blank:    "\u{E0F9}";  // border_clear_baseline
     out property <string> paper-lined:    "\u{E0FB}";  // border_horizontal_baseline
-    out property <string> paper-dotted:   "\u{E653}";  // texture_baseline
+    out property <string> paper-dotted:   "\u{E08F}";  // apps_baseline (3×3 dot grid)
     out property <string> paper-squared:  "\u{E2E9}";  // grid_on_baseline
     out property <string> see-text:       "\u{E0A2}";  // article_baseline
 }
@@ -3329,6 +3331,8 @@ export component EphemerisPage inherits Window {
     // ── Burger dropdown (tool & paper selector) ──────────────────────────
     // Icon-primary + micro-label (e-ink UX): glyphs carry the action, short
     // labels keep first-use discoverability without crowding the palette.
+    // Tool / width / paper / undo taps keep it open for chained actions;
+    // only the backdrop, the X, Tags and See text close it.
     drawing-dropdown := Rectangle {
         visible: root.drawing-menu-open && root.is-canvas-context;
         x: parent.width - 192px; y: 60px;
@@ -3356,7 +3360,7 @@ export component EphemerisPage inherits Window {
                 color: root.active-tool == "pen" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
                 horizontal-alignment: center; vertical-alignment: center;
             }
-            TouchArea { clicked => { root.active-tool = "pen"; root.tool-selected("pen"); root.drawing-menu-open = false; } }
+            TouchArea { clicked => { root.active-tool = "pen"; root.tool-selected("pen"); } }
         }
         Rectangle {
             x: 64px; y: 6px; width: 54px; height: 42px;
@@ -3374,7 +3378,7 @@ export component EphemerisPage inherits Window {
                 color: root.active-tool == "highlighter" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
                 horizontal-alignment: center; vertical-alignment: center;
             }
-            TouchArea { clicked => { root.active-tool = "highlighter"; root.tool-selected("highlighter"); root.drawing-menu-open = false; } }
+            TouchArea { clicked => { root.active-tool = "highlighter"; root.tool-selected("highlighter"); } }
         }
         Rectangle {
             x: 122px; y: 6px; width: 56px; height: 42px;
@@ -3392,27 +3396,27 @@ export component EphemerisPage inherits Window {
                 color: root.active-tool == "eraser" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
                 horizontal-alignment: center; vertical-alignment: center;
             }
-            TouchArea { clicked => { root.active-tool = "eraser"; root.tool-selected("eraser"); root.drawing-menu-open = false; } }
+            TouchArea { clicked => { root.active-tool = "eraser"; root.tool-selected("eraser"); } }
         }
 
-        // -- Tool row 2: Move / Clear --
+        // -- Tool row 2: Select / Clear --
         Rectangle {
             x: 6px; y: 52px; width: 84px; height: 42px;
             background: root.active-tool == "move" ? EinkTheme.btn-active-bg : transparent;
             border-radius: 3px;
             Text {
                 y: 2px; width: parent.width; height: 24px;
-                text: Icons.move; font-family: "Material Icons"; font-size: 20px;
+                text: Icons.tool-select; font-family: "Material Icons"; font-size: 20px;
                 color: root.active-tool == "move" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
                 horizontal-alignment: center; vertical-alignment: center;
             }
             Text {
                 y: 26px; width: parent.width; height: 14px;
-                text: "Move"; font-size: 9px;
+                text: "Select"; font-size: 9px;
                 color: root.active-tool == "move" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
                 horizontal-alignment: center; vertical-alignment: center;
             }
-            TouchArea { clicked => { root.active-tool = "move"; root.tool-selected("move"); root.drawing-menu-open = false; } }
+            TouchArea { clicked => { root.active-tool = "move"; root.tool-selected("move"); } }
         }
         Rectangle {
             x: 94px; y: 52px; width: 84px; height: 42px;
@@ -3428,7 +3432,7 @@ export component EphemerisPage inherits Window {
                 text: "Clear"; font-size: 9px; color: EinkTheme.danger-fg;
                 horizontal-alignment: center; vertical-alignment: center;
             }
-            TouchArea { clicked => { root.clear-page(); root.drawing-menu-open = false; } }
+            TouchArea { clicked => { root.clear-page(); } }
         }
 
         // -- Undo / Redo
@@ -3449,7 +3453,7 @@ export component EphemerisPage inherits Window {
             }
             TouchArea {
                 enabled: root.can-undo;
-                clicked => { root.ink-undo(); root.drawing-menu-open = false; }
+                clicked => { root.ink-undo(); }
             }
         }
         Rectangle {
@@ -3469,7 +3473,7 @@ export component EphemerisPage inherits Window {
             }
             TouchArea {
                 enabled: root.can-redo;
-                clicked => { root.ink-redo(); root.drawing-menu-open = false; }
+                clicked => { root.ink-redo(); }
             }
         }
 
@@ -3495,7 +3499,6 @@ export component EphemerisPage inherits Window {
                 root.pen-width-selected("thin");
                 root.active-tool = "pen";
                 root.tool-selected("pen");
-                root.drawing-menu-open = false;
             } }
         }
         Rectangle {
@@ -3519,7 +3522,6 @@ export component EphemerisPage inherits Window {
                 root.pen-width-selected("medium");
                 root.active-tool = "pen";
                 root.tool-selected("pen");
-                root.drawing-menu-open = false;
             } }
         }
         Rectangle {
@@ -3543,7 +3545,6 @@ export component EphemerisPage inherits Window {
                 root.pen-width-selected("thick");
                 root.active-tool = "pen";
                 root.tool-selected("pen");
-                root.drawing-menu-open = false;
             } }
         }
 
@@ -3567,7 +3568,7 @@ export component EphemerisPage inherits Window {
                 color: root.active-paper == "blank" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
                 horizontal-alignment: center; vertical-alignment: center;
             }
-            TouchArea { clicked => { root.active-paper = "blank"; root.paper-type-tapped("blank"); root.drawing-menu-open = false; } }
+            TouchArea { clicked => { root.active-paper = "blank"; root.paper-type-tapped("blank"); } }
         }
         Rectangle {
             x: 94px; y: 189px; width: 84px; height: 42px;
@@ -3585,7 +3586,7 @@ export component EphemerisPage inherits Window {
                 color: root.active-paper == "lined" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
                 horizontal-alignment: center; vertical-alignment: center;
             }
-            TouchArea { clicked => { root.active-paper = "lined"; root.paper-type-tapped("lined"); root.drawing-menu-open = false; } }
+            TouchArea { clicked => { root.active-paper = "lined"; root.paper-type-tapped("lined"); } }
         }
 
         // -- Paper row 2: Dotted / Squared --
@@ -3605,7 +3606,7 @@ export component EphemerisPage inherits Window {
                 color: root.active-paper == "dotted" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
                 horizontal-alignment: center; vertical-alignment: center;
             }
-            TouchArea { clicked => { root.active-paper = "dotted"; root.paper-type-tapped("dotted"); root.drawing-menu-open = false; } }
+            TouchArea { clicked => { root.active-paper = "dotted"; root.paper-type-tapped("dotted"); } }
         }
         Rectangle {
             x: 94px; y: 235px; width: 84px; height: 42px;
@@ -3623,7 +3624,7 @@ export component EphemerisPage inherits Window {
                 color: root.active-paper == "squared" ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
                 horizontal-alignment: center; vertical-alignment: center;
             }
-            TouchArea { clicked => { root.active-paper = "squared"; root.paper-type-tapped("squared"); root.drawing-menu-open = false; } }
+            TouchArea { clicked => { root.active-paper = "squared"; root.paper-type-tapped("squared"); } }
         }
 
         // Separator
@@ -3636,7 +3637,7 @@ export component EphemerisPage inherits Window {
             border-radius: 3px;
             Text {
                 x: 10px; y: 2px; width: 28px; height: 38px;
-                text: Icons.link; font-family: "Material Icons"; font-size: 20px;
+                text: Icons.tag; font-family: "Material Icons"; font-size: 20px;
                 color: EinkTheme.btn-fg;
                 horizontal-alignment: center; vertical-alignment: center;
             }
@@ -3691,14 +3692,14 @@ export component EphemerisPage inherits Window {
     // Buttons use the same next/create and prev rules as finger edge swipes.
     note-page-indicator := Rectangle {
         visible: root.drawing-menu-open && root.is-canvas-context;
-        x: parent.width - 168px;
-        y: parent.height - 40px;
-        width: 158px;
-        height: 28px;
+        x: parent.width - 210px;
+        y: parent.height - 52px;
+        width: 200px;
+        height: 40px;
         background: EinkTheme.chrome-bg;
         border-width: 1px;
         border-color: EinkTheme.chrome-border;
-        border-radius: 4px;
+        border-radius: 6px;
 
         HorizontalLayout {
             spacing: 0px;
@@ -3707,13 +3708,13 @@ export component EphemerisPage inherits Window {
             alignment: center;
 
             Rectangle {
-                width: 32px; height: parent.height;
+                width: 48px; height: parent.height;
                 background: transparent;
                 opacity: root.page-index > 1 ? 1.0 : 0.35;
                 Text {
                     text: Icons.nav-prev;
                     font-family: "Material Icons";
-                    font-size: 18px;
+                    font-size: 24px;
                     color: EinkTheme.btn-fg;
                     horizontal-alignment: center;
                     vertical-alignment: center;
@@ -3731,19 +3732,19 @@ export component EphemerisPage inherits Window {
             Text {
                 horizontal-stretch: 1;
                 text: "\{root.page-index}/\{root.page-count}";
-                font-size: 13px;
+                font-size: 17px;
                 color: EinkTheme.btn-fg;
                 horizontal-alignment: center;
                 vertical-alignment: center;
             }
 
             Rectangle {
-                width: 32px; height: parent.height;
+                width: 48px; height: parent.height;
                 background: transparent;
                 Text {
                     text: Icons.nav-next;
                     font-family: "Material Icons";
-                    font-size: 18px;
+                    font-size: 24px;
                     color: EinkTheme.btn-fg;
                     horizontal-alignment: center;
                     vertical-alignment: center;
@@ -4952,7 +4953,7 @@ export component EphemerisPage inherits Window {
     canvas-title-bar := Rectangle {
         visible: root.canvas-menu-open && root.is-obsidian-canvas-context;
         x: root.nav-w + 8px; y: 8px; height: 44px;
-        width: parent.width - root.nav-w - 68px;
+        width: parent.width - root.nav-w - 76px;
         background: EinkTheme.chrome-bg;
         border-width: 1px; border-color: EinkTheme.chrome-border; border-radius: 8px;
         HorizontalLayout {
@@ -9972,7 +9973,8 @@ export component EphemerisPage inherits Window {
         x: root.nav-w + 8px;
         y: 8px;
         height: 44px;
-        width: parent.width - root.nav-w - 60px;
+        // Ends 16px short of the burger X; same geometry as canvas-title-bar.
+        width: parent.width - root.nav-w - 76px;
         // Opaque chrome chip so ink behind the title stays readable on e-ink.
         background: EinkTheme.chrome-bg;
         border-width: 1px;

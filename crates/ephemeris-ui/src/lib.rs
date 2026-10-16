@@ -963,7 +963,9 @@ impl EphemerisUi {
             && !c.get_event_dialog_visible()
             && !c.get_note_rename_visible()
             && !c.get_note_move_visible()
+            && !c.get_note_tags_visible()
             && !c.get_notebook_rename_visible()
+            && !c.get_notebook_delete_visible()
             && !c.get_rec_rename_visible()
             && !c.get_rec_transcription_visible()
             && !c.get_profile_edit_dialog_visible()
@@ -3523,6 +3525,29 @@ impl EphemerisUi {
         }
     }
 
+    /// White-fill only `rect` (logical) of the live layer; a full clear when
+    /// `rect` is empty. Previews redraw every frame, so a whole-plane fill
+    /// per frame is too slow on the PineNote.
+    fn clear_preview_region(&self, rect: &ephemeris_core::geom::Rect) {
+        if rect.is_empty() {
+            self.clear_in_progress_layer(Tool::Pen);
+            return;
+        }
+        self.select_preview_live.set(false);
+        let scale = self.ink_scale();
+        let mut layer = self.in_progress_layer.borrow_mut();
+        let Some((x0, y0, x1, y1)) =
+            raster::ink_pixel_bounds(rect, scale, layer.width, layer.height)
+        else {
+            return;
+        };
+        let stride = layer.stride as usize;
+        for y in y0..y1 {
+            let row = y as usize * stride;
+            layer.data[row + x0 as usize..row + x1 as usize].fill(255);
+        }
+    }
+
     /// Reset the live stroke raster to the blend identity for `tool`.
     fn clear_in_progress_layer(&self, tool: Tool) {
         self.select_preview_live.set(false);
@@ -3655,7 +3680,7 @@ impl EphemerisUi {
         prev_damage: ephemeris_core::geom::Rect,
     ) -> ephemeris_core::geom::Rect {
         let tool = Tool::Pen;
-        self.clear_in_progress_layer(tool);
+        self.clear_preview_region(&prev_damage);
         let bw = 1.5_f32;
         let mut cur = ephemeris_core::geom::Rect::empty();
         if points.len() >= 2 {
@@ -3792,13 +3817,15 @@ impl EphemerisUi {
 
     /// Draw `strokes` (already translated) onto the in-progress preview layer.
     ///
-    /// `prev_damage` clears the previous preview position on e-ink.
+    /// `prev_damage` clears the previous preview position on e-ink. Returns
+    /// only the new preview bbox (pass it back next frame) so the cleared
+    /// region does not grow with the length of the drag.
     pub fn set_move_preview(
         &self,
         strokes: &[Stroke],
         prev_damage: ephemeris_core::geom::Rect,
     ) -> ephemeris_core::geom::Rect {
-        self.clear_in_progress_layer(Tool::Pen);
+        self.clear_preview_region(&prev_damage);
         let scale = self.ink_scale();
         let mut cur = ephemeris_core::geom::Rect::empty();
         {
@@ -3816,7 +3843,7 @@ impl EphemerisUi {
         if !damage.is_empty() {
             self.push_ink_damage(damage);
         }
-        damage
+        cur
     }
 
     /// After [`hide_strokes_for_move`], put the (still-untranslated) strokes
