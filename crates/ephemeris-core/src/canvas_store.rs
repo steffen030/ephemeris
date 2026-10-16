@@ -108,6 +108,10 @@ pub struct CanvasDoc {
     pub edges: Vec<CanvasEdge>,
     #[serde(default)]
     pub view: CanvasView,
+    /// Text cards shown as their recognised (HWR) text instead of the ink.
+    /// Ephemeris-only: the ink stays on disk so the card can revert.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub typed_cards: Vec<String>,
 }
 
 impl CanvasDoc {
@@ -124,6 +128,7 @@ impl CanvasDoc {
             nodes: jc.nodes,
             edges: jc.edges,
             view: CanvasView::default(),
+            typed_cards: Vec::new(),
         }
     }
 
@@ -135,7 +140,21 @@ impl CanvasDoc {
         self.nodes.iter_mut().find(|n| n.id() == id)
     }
 
+    /// True when text card `id` shows its recognised text, not the ink.
+    pub fn is_typed(&self, id: &str) -> bool {
+        self.typed_cards.iter().any(|t| t == id)
+    }
+
+    /// Show text card `id` as recognised text (`true`) or as ink (`false`).
+    pub fn set_typed(&mut self, id: &str, typed: bool) {
+        self.typed_cards.retain(|t| t != id);
+        if typed {
+            self.typed_cards.push(id.to_string());
+        }
+    }
+
     pub fn remove_node(&mut self, id: &str) {
+        self.typed_cards.retain(|t| t != id);
         self.nodes.retain(|n| n.id() != id);
         self.edges.retain(|e| e.from_node != id && e.to_node != id);
     }
@@ -485,5 +504,30 @@ mod tests {
         save_card_page_pixels(dir, 1, "abc", 2, 2, &[255, 255, 255, 255]).unwrap();
         let (w, h, px) = load_card_page_pixels(dir, 1, "abc").unwrap();
         assert_eq!((w, h, px.len()), (2, 2, 4));
+    }
+
+    #[test]
+    fn typed_cards_persist_and_stay_out_of_export() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut doc = CanvasDoc::default();
+        let a = doc.add_text_card(0, 0);
+        let b = doc.add_text_card(300, 0);
+        doc.set_typed(&a, true);
+        doc.set_typed(&a, true);
+        assert_eq!(doc.typed_cards, vec![a.clone()]);
+        save_canvas_doc(dir, 1, &doc).unwrap();
+        let again = load_canvas_doc(dir, 1);
+        assert!(again.is_typed(&a) && !again.is_typed(&b));
+        // Ephemeris-only: Obsidian's JSON Canvas never sees it.
+        let json = again.to_json_canvas().to_json_pretty().unwrap();
+        assert!(!json.contains("typed_cards"));
+
+        let mut doc = again;
+        doc.set_typed(&a, false);
+        assert!(!doc.is_typed(&a));
+        doc.set_typed(&b, true);
+        doc.remove_node(&b);
+        assert!(doc.typed_cards.is_empty());
     }
 }

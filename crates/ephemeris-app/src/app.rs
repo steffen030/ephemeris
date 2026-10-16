@@ -5739,6 +5739,7 @@ impl App {
             pointer_source: PointerSource::Mouse,
             is_drawing: false,
             redraw_pending: false,
+            text_entry_active: false,
             ink_trace: InkLatencyTrace::new(),
             pen_ink_skip_slint: false,
             last_ink_pressure: 0.5,
@@ -5876,6 +5877,9 @@ struct WinitHandler {
     /// Wayland `buffer_mut` blocks until the back buffer is released; per-sample
     /// `request_redraw` wedges the UI thread on PineNote (force-quit dialog).
     redraw_pending: bool,
+    /// Platform text input currently enabled (mirrors the UI's
+    /// `text-entry-active`; drives the GNOME on-screen keyboard).
+    text_entry_active: bool,
     /// End-to-end sample→present timings when `EPHEMERIS_INK_TRACE=1`.
     ink_trace: InkLatencyTrace,
     /// Skip Slint press/release for the current pen ink stroke (canvas fast path).
@@ -6609,6 +6613,25 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
         // --- Debounced local page .bin / strokes JSON ---
         self.local_page_writes.try_flush_async(false);
 
+        // --- On-screen keyboard follows the UI's text-entry dialogs ---
+        let text_entry = self.ui.text_entry_active();
+        if text_entry != self.text_entry_active {
+            self.text_entry_active = text_entry;
+            if let Some(d) = &self.display {
+                d.set_text_entry(text_entry);
+            }
+        }
+
+        // --- Canvas: long-press fires while the finger is still down ---
+        if crate::canvas_app::poll_board_long_press(&self.ui, &self.canvas_session) {
+            self.request_redraw_coalesced();
+        }
+
+        // --- Canvas: finished handwriting → text conversions ---
+        if crate::canvas_app::poll_card_recognition(&self.ui, &self.canvas_session) {
+            self.request_redraw_coalesced();
+        }
+
         // --- Deferred vault OCR/PDF (leave-note or 10‑minute batch) ---
         self.vault_export.try_flush(
             &self.config.borrow(),
@@ -6810,6 +6833,23 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
             };
             event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + wake));
         }
+        // Canvas long-press deadline / card recognition worker.
+        // Every branch above re-arms a future deadline when it still needs one,
+        // so a deadline already in the past here is stale.
+        let now = Instant::now();
+        let current = match event_loop.control_flow() {
+            ControlFlow::WaitUntil(t) if t > now => Some(t),
+            ControlFlow::WaitUntil(_) | ControlFlow::Wait => None,
+            ControlFlow::Poll => Some(now),
+        };
+        match (crate::canvas_app::next_wake(&self.canvas_session), current) {
+            (Some(wake), Some(t)) if wake < t => {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(wake));
+            }
+            (Some(wake), None) => event_loop.set_control_flow(ControlFlow::WaitUntil(wake)),
+            (None, None) => event_loop.set_control_flow(ControlFlow::Wait),
+            _ => {}
+        }
 
         // --- Drain completed CalDAV syncs ---
         if let Ok(mut pending) = self.caldav_pending.lock() {
@@ -6999,6 +7039,18 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
                     self.canvas_session.save_doc();
                     crate::canvas_app::refresh_board_now(&self.ui, &self.canvas_session);
                     self.request_redraw_coalesced();
+                }
+            }
+
+            WindowEvent::Ime(winit::event::Ime::Commit(text)) => {
+                // On-screen keyboard text: one key press/release per char.
+                for c in text.chars() {
+                    let key = slint::SharedString::from(c.to_string().as_str());
+                    self.ui.dispatch_key_pressed(key.clone());
+                    self.ui.dispatch_key_released(key);
+                }
+                if let Some(d) = &self.display {
+                    d.request_redraw();
                 }
             }
 
@@ -7663,7 +7715,7 @@ fn resolve_htr_model_dir(config: &ephemeris_core::Config) -> PathBuf {
 /// Process-wide lexicon shared by See-text / bg recog / vault export cascades.
 static SHARED_HTR_LEXICON: OnceLock<SharedHtrLexicon> = OnceLock::new();
 
-fn build_cascading_transcriber(config: &ephemeris_core::Config) -> CascadingTranscriber {
+pub(crate) fn build_cascading_transcriber(config: &ephemeris_core::Config) -> CascadingTranscriber {
     let htr =
         StrokeHtrTranscriber::from_parts(config.htr_enabled, Some(resolve_htr_model_dir(config)));
     let line_htr = LineImageHtrTranscriber::from_parts(
