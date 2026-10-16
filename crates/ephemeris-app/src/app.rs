@@ -51,6 +51,8 @@ const KIOSK_SETTLE: Duration = Duration::from_secs(3);
 
 /// Debounce flag for background vault git commit/push.
 static VAULT_GIT_PUSH_PENDING: AtomicBool = AtomicBool::new(false);
+/// Set when a push is requested while one is already pending — run again after.
+static VAULT_GIT_PUSH_AGAIN: AtomicBool = AtomicBool::new(false);
 
 /// How long ink can sit dirty before a background vault OCR/PDF batch runs.
 const VAULT_EXPORT_BATCH_INTERVAL: Duration = Duration::from_secs(10 * 60);
@@ -300,6 +302,11 @@ impl VaultExportQueue {
 
     fn mark(&self, note_id: u32) {
         self.dirty.borrow_mut().insert(note_id);
+        // A mark while a flush is running must schedule a follow-up so the
+        // newer ink is not stranded until the next 10‑minute batch.
+        if self.active.load(Ordering::Relaxed) {
+            self.flush_soon.set(true);
+        }
     }
 
     fn mark_full_sync(&self) {
@@ -319,6 +326,9 @@ impl VaultExportQueue {
 
     /// Start a background flush when leave-note was requested or the batch
     /// interval elapsed. Returns true if a worker was spawned.
+    ///
+    /// `local_writes` is drained synchronously first so the worker reads
+    /// up-to-date page bins (avoids hash-skipping the PDF on stale rasters).
     fn try_flush(
         &self,
         config: &Config,
@@ -326,6 +336,7 @@ impl VaultExportQueue {
         notebooks: &[AppNotebook],
         data_dir: &Path,
         connections: &[AppConnection],
+        local_writes: &LocalPageWriteQueue,
     ) -> bool {
         // Export is driven by per-profile vault connections, not the legacy
         // single `config.vault_path` (which may point at another profile).
@@ -353,13 +364,20 @@ impl VaultExportQueue {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
             .is_err()
         {
-            // Race: put work back.
+            // Race: put work back (including leave-note urgency).
             if full {
                 self.needs_full_sync.set(true);
+            }
+            if force {
+                self.flush_soon.set(true);
             }
             self.dirty.borrow_mut().extend(ids);
             return false;
         }
+        // Page bins must be on disk before the worker hashes/rasterises them;
+        // otherwise a 10‑minute batch can export yesterday's pixels, match the
+        // sidecar hash, skip the PDF rewrite, and clear dirty permanently.
+        local_writes.flush_sync();
         self.last_flush_at.set(Instant::now());
         let config = config.clone();
         let notes = notes.to_vec();
@@ -6639,6 +6657,7 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
             &self.notebooks.borrow(),
             &self.data_dir,
             &self.connections.borrow(),
+            &self.local_page_writes,
         );
 
         // --- Idle background per-line recognition (ktg.12) ---
@@ -8974,6 +8993,14 @@ fn build_vault_note_export(
             },
         };
         match export_raster_pages_to_pdf(&[page], &pdf_abs, &opts) {
+            Ok(0) => {
+                pdf_ok = true;
+                tracing::debug!(
+                    "PDF export for note {} skipped (content hash current): {}",
+                    note.id,
+                    pdf_abs.display()
+                );
+            }
             Ok(_) => pdf_ok = true,
             Err(e) => tracing::warn!("PDF export for note {} failed: {e}", note.id),
         }
@@ -9914,6 +9941,7 @@ fn create_obsidian_task(
 }
 
 /// Background `git pull` when vault git sync is enabled.
+/// Conflicts under `vault_export_subdir` resolve with Ephemeris (local) winning.
 fn schedule_vault_git_pull(config: &Config) {
     if !config.vault_git_enabled {
         return;
@@ -9924,9 +9952,12 @@ fn schedule_vault_git_pull(config: &Config) {
     if !ephemeris_core::is_git_repo(&vault) {
         return;
     }
-    std::thread::spawn(move || match ephemeris_core::vault_git_pull(&vault) {
-        Ok(()) => tracing::debug!("Vault git pull ok: {}", vault.display()),
-        Err(e) => tracing::warn!("Vault git pull failed: {e}"),
+    let export_subdir = config.vault_export_subdir.clone();
+    std::thread::spawn(move || {
+        match ephemeris_core::vault_git_pull(&vault, Some(export_subdir.as_path())) {
+            Ok(()) => tracing::debug!("Vault git pull ok: {}", vault.display()),
+            Err(e) => tracing::warn!("Vault git pull failed: {e}"),
+        }
     });
 }
 
@@ -9946,15 +9977,37 @@ fn schedule_vault_git_push_for(config: &Config, vault: &Path) {
         return;
     }
     if VAULT_GIT_PUSH_PENDING.swap(true, Ordering::AcqRel) {
+        // Coalesce: run once more after the in-flight debounce finishes so a
+        // push scheduled during the sleep window is not dropped.
+        VAULT_GIT_PUSH_AGAIN.store(true, Ordering::Release);
         return;
     }
     let vault = vault.to_path_buf();
+    let export_subdir = config.vault_export_subdir.clone();
     std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs(3));
-        VAULT_GIT_PUSH_PENDING.store(false, Ordering::Release);
-        match ephemeris_core::vault_git_commit_and_push(&vault, "ephemeris: sync notes and tasks") {
-            Ok(()) => tracing::debug!("Vault git commit/push ok: {}", vault.display()),
-            Err(e) => tracing::warn!("Vault git commit/push failed: {e}"),
+        loop {
+            std::thread::sleep(Duration::from_secs(3));
+            VAULT_GIT_PUSH_AGAIN.store(false, Ordering::Release);
+            match ephemeris_core::vault_git_commit_and_push(
+                &vault,
+                "ephemeris: sync notes and tasks",
+                &export_subdir,
+            ) {
+                Ok(()) => tracing::debug!("Vault git commit/push ok: {}", vault.display()),
+                Err(e) => tracing::warn!("Vault git commit/push failed: {e}"),
+            }
+            if !VAULT_GIT_PUSH_AGAIN.swap(false, Ordering::AcqRel) {
+                VAULT_GIT_PUSH_PENDING.store(false, Ordering::Release);
+                // Lost race: another schedule set AGAIN after we cleared it.
+                if VAULT_GIT_PUSH_AGAIN.swap(false, Ordering::AcqRel)
+                    && VAULT_GIT_PUSH_PENDING
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                        .is_ok()
+                {
+                    continue;
+                }
+                break;
+            }
         }
     });
 }
