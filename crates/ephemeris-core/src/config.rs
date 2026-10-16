@@ -22,6 +22,7 @@
 //! | `EPHEMERIS_SYNC_INTERVAL`  | `sync_interval_secs`  |
 //! | `EPHEMERIS_LOG_LEVEL`      | `logging_level`       |
 //! | `EPHEMERIS_PEN_ONLY`       | `pen_only_drawing`    |
+//! | `EPHEMERIS_SMART_SHAPES`   | `note_smart_shapes`   |
 //!
 //! Optional TOML: `vault_tasks_inbox` (default `Ephemeris/Tasks.md`) — vault-relative
 //! file where new Ephemeris tasks are appended.
@@ -142,6 +143,13 @@ pub struct Config {
     /// artifacts. Finger touch still drives UI chrome and page-swipe gestures.
     #[serde(default = "default_pen_only_drawing")]
     pub pen_only_drawing: bool,
+
+    /// When true, holding the stylus still at the end of a one-stroke
+    /// rectangle / oval / triangle / line snaps the ink into a clean shape
+    /// (ephemeris-9co). Off by default so handwriting is never force-squared
+    /// until the user opts in.
+    #[serde(default = "default_note_smart_shapes")]
+    pub note_smart_shapes: bool,
 
     /// Template for auto-titles when creating a note.
     ///
@@ -388,6 +396,10 @@ fn default_pen_only_drawing() -> bool {
     true
 }
 
+fn default_note_smart_shapes() -> bool {
+    false
+}
+
 fn default_note_title_pattern() -> String {
     "yyyy-mm-dd Note {n}".to_string()
 }
@@ -421,6 +433,7 @@ impl Default for Config {
             line_htr_enabled: default_line_htr_enabled(),
             line_htr_model_dir: None,
             pen_only_drawing: default_pen_only_drawing(),
+            note_smart_shapes: default_note_smart_shapes(),
             note_title_pattern: default_note_title_pattern(),
             note_suggested_tags: Vec::new(),
             task_lanes: default_task_lanes(),
@@ -605,6 +618,13 @@ fn apply_env_overrides(config: &mut Config) {
             _ => tracing::warn!("EPHEMERIS_PEN_ONLY={v:?} not recognised; ignoring"),
         }
     }
+    if let Ok(v) = std::env::var("EPHEMERIS_SMART_SHAPES") {
+        match v.to_lowercase().as_str() {
+            "0" | "false" | "off" | "no" => config.note_smart_shapes = false,
+            "1" | "true" | "on" | "yes" => config.note_smart_shapes = true,
+            _ => tracing::warn!("EPHEMERIS_SMART_SHAPES={v:?} not recognised; ignoring"),
+        }
+    }
     if let Ok(v) = std::env::var("EPHEMERIS_HTR") {
         match v.to_lowercase().as_str() {
             "0" | "false" | "off" | "no" => config.htr_enabled = false,
@@ -674,6 +694,7 @@ mod tests {
         assert_eq!(cfg.handwriting_language, HandwritingLanguage::Auto);
         assert!(cfg.ocr_tessdata.is_none());
         assert!(cfg.pen_only_drawing);
+        assert!(!cfg.note_smart_shapes);
         assert!(cfg.custom.is_empty());
     }
 

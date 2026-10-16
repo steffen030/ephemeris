@@ -566,6 +566,15 @@ pub struct EphemerisUi {
     /// paint) so the next [`render_frame`] forces a `Clear` refresh.  Cleared
     /// once consumed.
     screen_change: Cell<bool>,
+    /// When set, the next [`InkUpdate::Finished`] replaces freehand points with
+    /// this fitted polyline (hold-to-snap smart shapes, ephemeris-9co).
+    pending_shape_snap: RefCell<Option<Vec<Point>>>,
+    /// Live layer holds a Move-tool preview (lasso / drag / selection outline)
+    /// rather than pen points, so it must be composited even though
+    /// `in_progress` is empty. Reset whenever the live layer is cleared.
+    select_preview_live: Cell<bool>,
+    /// Strokes removed during the current eraser gesture (for undo, ephemeris-e1b).
+    eraser_removed: RefCell<Vec<Stroke>>,
 }
 
 impl EphemerisUi {
@@ -640,6 +649,9 @@ impl EphemerisUi {
             // change so the initial present is a full/clear refresh.
             screen_change: Cell::new(true),
             strokes_dirty: Cell::new(false),
+            pending_shape_snap: RefCell::new(None),
+            select_preview_live: Cell::new(false),
+            eraser_removed: RefCell::new(Vec::new()),
         })
     }
 
@@ -849,6 +861,30 @@ impl EphemerisUi {
         F: FnMut() + 'static,
     {
         self.component.on_clear_page(handler);
+    }
+
+    /// Register a closure for drawing-menu Undo (ephemeris-e1b).
+    pub fn on_ink_undo<F>(&self, handler: F)
+    where
+        F: FnMut() + 'static,
+    {
+        self.component.on_ink_undo(handler);
+    }
+
+    /// Register a closure for drawing-menu Redo.
+    pub fn on_ink_redo<F>(&self, handler: F)
+    where
+        F: FnMut() + 'static,
+    {
+        self.component.on_ink_redo(handler);
+    }
+
+    pub fn set_can_undo(&self, can: bool) {
+        self.component.set_can_undo(can);
+    }
+
+    pub fn set_can_redo(&self, can: bool) {
+        self.component.set_can_redo(can);
     }
 
     /// Register a closure called when the user completes a leftward swipe
@@ -1532,6 +1568,16 @@ impl EphemerisUi {
     /// Read the Settings › General "Pen only" toggle.
     pub fn get_settings_pen_only(&self) -> bool {
         self.component.get_settings_pen_only()
+    }
+
+    /// Set whether Settings › General enables hold-to-snap smart shapes.
+    pub fn set_settings_smart_shapes(&self, enabled: bool) {
+        self.component.set_settings_smart_shapes(enabled);
+    }
+
+    /// Read the Settings › General smart-shapes toggle.
+    pub fn get_settings_smart_shapes(&self) -> bool {
+        self.component.get_settings_smart_shapes()
     }
 
     /// Set the Settings › General new-note title pattern.
@@ -2870,9 +2916,10 @@ impl EphemerisUi {
         page.raster_stale = false;
     }
 
-    fn remove_strokes_by_id(&self, ids: &[StrokeId]) -> bool {
+    /// Remove strokes by id. Returns the removed stroke objects (for undo).
+    fn remove_strokes_by_id(&self, ids: &[StrokeId]) -> Vec<Stroke> {
         if ids.is_empty() {
-            return false;
+            return Vec::new();
         }
         let removed_strokes: Vec<Stroke> = {
             let strokes = self.strokes.borrow();
@@ -2883,7 +2930,7 @@ impl EphemerisUi {
                 .collect()
         };
         if removed_strokes.is_empty() {
-            return false;
+            return Vec::new();
         }
         self.strokes.borrow_mut().retain(|s| !ids.contains(&s.id));
         let remaining = self.strokes.borrow().clone();
@@ -2908,7 +2955,12 @@ impl EphemerisUi {
         self.strokes_dirty.set(true);
         // Damage is pushed by the eraser path; do NOT force a Clear/full
         // screen refresh here — that freezes PineNote on every erase hit.
-        true
+        removed_strokes
+    }
+
+    /// Take strokes removed during the current eraser gesture (clears buffer).
+    pub fn take_eraser_removed(&self) -> Vec<Stroke> {
+        std::mem::take(&mut *self.eraser_removed.borrow_mut())
     }
 
     /// White-fill `damage` in the committed layer, then re-raster survivors that
@@ -3258,6 +3310,7 @@ impl EphemerisUi {
 
         match &update {
             InkUpdate::Started => {
+                *self.pending_shape_snap.borrow_mut() = None;
                 let bw = self.engine.borrow().config().base_width;
                 *self.in_progress_base_width.borrow_mut() = bw;
                 self.in_progress.borrow_mut().clear();
@@ -3312,58 +3365,108 @@ impl EphemerisUi {
                 // Never store eraser strokes — eraser is handled above.
                 if stroke.tool != Tool::Eraser && !stroke.points.is_empty() {
                     let bw = *self.in_progress_base_width.borrow();
-                    // Stamp any final tip-span points not yet pushed via Extended.
-                    {
-                        let already = self.in_progress.borrow().len();
-                        if already < stroke.points.len() {
-                            let mut stamp = Vec::new();
-                            if let Some(prev) = self.in_progress.borrow().last().copied() {
-                                stamp.push(prev);
-                            }
-                            stamp.extend_from_slice(&stroke.points[already..]);
-                            raster::rasterize_points(
-                                &mut self.in_progress_layer.borrow_mut(),
-                                &stamp,
-                                bw,
-                                tool,
+                    let snapped = self.pending_shape_snap.borrow_mut().take();
+                    if let Some(fitted) = snapped {
+                        // Hold-to-snap: replace freehand with fitted geometry.
+                        // Full-stroke damage — tip-only would leave the old sketch.
+                        let mut committed = (**stroke).clone();
+                        let old_bbox = committed.approx_bbox();
+                        committed.points = fitted;
+                        let new_bbox = committed.approx_bbox();
+                        let merge_rect = old_bbox.union(&new_bbox);
+                        self.clear_in_progress_layer(tool);
+                        raster::rasterize_points(
+                            &mut self.in_progress_layer.borrow_mut(),
+                            &committed.points,
+                            bw,
+                            tool,
+                            scale,
+                        );
+                        {
+                            let ip = self.in_progress_layer.borrow();
+                            let mut arc = self.committed_layer.borrow_mut();
+                            raster::merge_min_rect(
+                                Arc::make_mut(&mut arc),
+                                &ip,
+                                &merge_rect,
                                 scale,
                             );
-                            self.in_progress
-                                .borrow_mut()
-                                .extend_from_slice(&stroke.points[already..]);
                         }
-                    }
-
-                    // Promote live → committed with min (no re-raster). Merge
-                    // over the stroke bbox ∪ last-span damage so every stamped
-                    // pixel is copied; present damage stays last-span only.
-                    let merge_rect = stroke.approx_bbox().union(damage).inflate(bw + 1.0);
-                    {
-                        let ip = self.in_progress_layer.borrow();
-                        let mut arc = self.committed_layer.borrow_mut();
-                        raster::merge_min_rect(Arc::make_mut(&mut arc), &ip, &merge_rect, scale);
-                    }
-
-                    if stroke.points.len() >= 2 {
-                        self.strokes.borrow_mut().push((**stroke).clone());
+                        if committed.points.len() >= 2 {
+                            self.strokes.borrow_mut().push(committed);
+                            {
+                                let mut book = self.pages.borrow_mut();
+                                let page = book.current_page_mut();
+                                page.strokes = self.strokes.borrow().clone();
+                            }
+                            self.strokes_dirty.set(true);
+                        }
+                        self.in_progress.borrow_mut().clear();
+                        self.clear_in_progress_layer(tool);
+                        self.push_ink_damage(merge_rect);
+                    } else {
+                        // Stamp any final tip-span points not yet pushed via Extended.
                         {
-                            let mut book = self.pages.borrow_mut();
-                            let page = book.current_page_mut();
-                            page.strokes = self.strokes.borrow().clone();
-                            // Do NOT Arc::clone committed into PageBook here —
-                            // that shares ownership so the next stroke's
-                            // Arc::make_mut COWs the full canvas. Live
-                            // `committed_layer` stays unique; save_current_page
-                            // / navigate sync PageBook.
+                            let already = self.in_progress.borrow().len();
+                            if already < stroke.points.len() {
+                                let mut stamp = Vec::new();
+                                if let Some(prev) = self.in_progress.borrow().last().copied() {
+                                    stamp.push(prev);
+                                }
+                                stamp.extend_from_slice(&stroke.points[already..]);
+                                raster::rasterize_points(
+                                    &mut self.in_progress_layer.borrow_mut(),
+                                    &stamp,
+                                    bw,
+                                    tool,
+                                    scale,
+                                );
+                                self.in_progress
+                                    .borrow_mut()
+                                    .extend_from_slice(&stroke.points[already..]);
+                            }
                         }
-                        self.strokes_dirty.set(true);
+
+                        // Promote live → committed with min (no re-raster). Merge
+                        // over the stroke bbox ∪ last-span damage so every stamped
+                        // pixel is copied; present damage stays last-span only.
+                        let merge_rect = stroke.approx_bbox().union(damage).inflate(bw + 1.0);
+                        {
+                            let ip = self.in_progress_layer.borrow();
+                            let mut arc = self.committed_layer.borrow_mut();
+                            raster::merge_min_rect(
+                                Arc::make_mut(&mut arc),
+                                &ip,
+                                &merge_rect,
+                                scale,
+                            );
+                        }
+
+                        if stroke.points.len() >= 2 {
+                            self.strokes.borrow_mut().push((**stroke).clone());
+                            {
+                                let mut book = self.pages.borrow_mut();
+                                let page = book.current_page_mut();
+                                page.strokes = self.strokes.borrow().clone();
+                                // Do NOT Arc::clone committed into PageBook here —
+                                // that shares ownership so the next stroke's
+                                // Arc::make_mut COWs the full canvas. Live
+                                // `committed_layer` stays unique; save_current_page
+                                // / navigate sync PageBook.
+                            }
+                            self.strokes_dirty.set(true);
+                        }
+                        self.in_progress.borrow_mut().clear();
+                        self.clear_in_progress_layer(tool);
+                        // Last-span damage only — the rest of the stroke is already on
+                        // screen from Extended presents and needs no re-present.
+                        self.push_ink_damage(*damage);
                     }
+                } else {
+                    self.in_progress.borrow_mut().clear();
+                    self.clear_in_progress_layer(tool);
+                    self.push_ink_damage(*damage);
                 }
-                self.in_progress.borrow_mut().clear();
-                self.clear_in_progress_layer(tool);
-                // Last-span damage only — the rest of the stroke is already on
-                // screen from Extended presents and needs no re-present.
-                self.push_ink_damage(*damage);
             }
             InkUpdate::Idle => {}
         }
@@ -3376,6 +3479,7 @@ impl EphemerisUi {
         let update = self.eraser.borrow_mut().update(event, &strokes_snapshot);
         match update {
             EraserUpdate::Started => {
+                self.eraser_removed.borrow_mut().clear();
                 self.in_progress.borrow_mut().clear();
                 self.clear_in_progress_layer(Tool::Eraser);
                 if let InputEvent::PenDown(s) = event {
@@ -3386,7 +3490,9 @@ impl EphemerisUi {
                 }
             }
             EraserUpdate::Hit { ids, damage } | EraserUpdate::Finished { ids, damage } => {
-                if self.remove_strokes_by_id(&ids) {
+                let removed = self.remove_strokes_by_id(&ids);
+                if !removed.is_empty() {
+                    self.eraser_removed.borrow_mut().extend(removed);
                     self.push_ink_damage(damage);
                 }
                 if matches!(event, InputEvent::PenUp(_)) {
@@ -3419,6 +3525,7 @@ impl EphemerisUi {
 
     /// Reset the live stroke raster to the blend identity for `tool`.
     fn clear_in_progress_layer(&self, tool: Tool) {
+        self.select_preview_live.set(false);
         let mut layer = self.in_progress_layer.borrow_mut();
         if tool == Tool::Eraser {
             layer.fill(0);
@@ -3466,6 +3573,7 @@ impl EphemerisUi {
     /// Clears the live in-progress buffer and resets the ink engine so a
     /// subsequent `PenDown` starts cleanly.  Does not touch the committed layer.
     pub fn discard_in_progress_stroke(&self) {
+        *self.pending_shape_snap.borrow_mut() = None;
         self.in_progress.borrow_mut().clear();
         let bw = *self.in_progress_base_width.borrow();
         let tool = self.engine.borrow().config().tool;
@@ -3480,6 +3588,392 @@ impl EphemerisUi {
             .borrow_mut()
             .push(Rect::new(0, STATUS_BAR_H, self.width, canvas_h));
         self.screen_change.set(true);
+    }
+
+    /// Committed stroke on the current page with `id`, if any.
+    pub fn page_stroke(&self, id: StrokeId) -> Option<Stroke> {
+        self.strokes
+            .borrow()
+            .iter()
+            .rev()
+            .find(|s| s.id == id)
+            .cloned()
+    }
+
+    /// Try to morph the in-progress freehand stroke into a smart shape while
+    /// the tip is still down. Returns `true` if the live ink was replaced.
+    ///
+    /// Pen tool only; highlighter / eraser are ignored. Low-confidence fits
+    /// leave the freehand stroke unchanged.
+    pub fn try_snap_in_progress_shape(&self) -> bool {
+        if self.engine.borrow().config().tool != Tool::Pen {
+            return false;
+        }
+        if self.pending_shape_snap.borrow().is_some() {
+            return true;
+        }
+        let pts = self.in_progress.borrow().clone();
+        let Some(fit) = ephemeris_core::ink::fit_smart_shape(&pts) else {
+            return false;
+        };
+        let bw = *self.in_progress_base_width.borrow();
+        let pad = bw + 1.0;
+        let mut old = ephemeris_core::geom::Rect::empty();
+        for p in &pts {
+            old.union_point(p.x, p.y);
+        }
+        old = old.inflate(pad);
+        let mut new_r = ephemeris_core::geom::Rect::empty();
+        for p in &fit.points {
+            new_r.union_point(p.x, p.y);
+        }
+        new_r = new_r.inflate(pad);
+        *self.in_progress.borrow_mut() = fit.points.clone();
+        *self.pending_shape_snap.borrow_mut() = Some(fit.points);
+        self.rebuild_in_progress_layer();
+        self.push_ink_damage(old.union(&new_r));
+        true
+    }
+
+    /// Current drawing-menu tool string (`"pen"`, `"eraser"`, `"move"`, …).
+    pub fn get_active_tool(&self) -> String {
+        self.component.get_active_tool().to_string()
+    }
+
+    /// Stroke IDs whose centre-line lies inside the freehand lasso.
+    pub fn strokes_inside_lasso(&self, lasso: &[(f32, f32)]) -> Vec<StrokeId> {
+        ephemeris_core::ink::strokes_inside_lasso(&self.strokes.borrow(), lasso)
+    }
+
+    /// Draw a temporary lasso outline on the in-progress layer (not persisted).
+    ///
+    /// `prev_damage` is the previous preview bbox so e-ink can clear the old path.
+    /// Returns the new damage rect (union of prev and current).
+    pub fn set_lasso_preview(
+        &self,
+        points: &[(f32, f32)],
+        prev_damage: ephemeris_core::geom::Rect,
+    ) -> ephemeris_core::geom::Rect {
+        let tool = Tool::Pen;
+        self.clear_in_progress_layer(tool);
+        let bw = 1.5_f32;
+        let mut cur = ephemeris_core::geom::Rect::empty();
+        if points.len() >= 2 {
+            for &(x, y) in points {
+                cur.union_point(x, y);
+            }
+            cur = cur.inflate(bw + 2.0);
+            let pts: Vec<Point> = points
+                .iter()
+                .enumerate()
+                .map(|(i, &(x, y))| Point::new(x, y, 0.4, 0.0, i as u32))
+                .collect();
+            raster::rasterize_points(
+                &mut self.in_progress_layer.borrow_mut(),
+                &pts,
+                bw,
+                tool,
+                self.ink_scale(),
+            );
+            self.select_preview_live.set(true);
+        }
+        let damage = prev_damage.union(&cur);
+        if !damage.is_empty() {
+            self.push_ink_damage(damage);
+        }
+        damage
+    }
+
+    /// Draw a dashed outline around a Move-tool selection on the live layer
+    /// (ephemeris-4n8). `bbox` is the selection's union stroke bbox.
+    ///
+    /// Returns the outline's damage rect; pass it as `prev_damage` to the next
+    /// preview call so e-ink clears the outline.
+    pub fn set_selection_outline(
+        &self,
+        bbox: ephemeris_core::geom::Rect,
+        prev_damage: ephemeris_core::geom::Rect,
+    ) -> ephemeris_core::geom::Rect {
+        const PAD: f32 = 6.0;
+        const DASH: f32 = 8.0;
+        const GAP: f32 = 6.0;
+        const BW: f32 = 1.5;
+        self.clear_in_progress_layer(Tool::Pen);
+        if bbox.is_empty() {
+            if !prev_damage.is_empty() {
+                self.push_ink_damage(prev_damage);
+            }
+            return prev_damage;
+        }
+        let r = bbox.inflate(PAD);
+        let corners = [
+            (r.min_x, r.min_y),
+            (r.max_x, r.min_y),
+            (r.max_x, r.max_y),
+            (r.min_x, r.max_y),
+            (r.min_x, r.min_y),
+        ];
+        let scale = self.ink_scale();
+        {
+            let mut layer = self.in_progress_layer.borrow_mut();
+            for side in corners.windows(2) {
+                let (a, b) = (side[0], side[1]);
+                let len = ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
+                let mut t = 0.0;
+                while t < len {
+                    let t1 = (t + DASH).min(len);
+                    let at = |d: f32| {
+                        let u = d / len;
+                        Point::new(a.0 + (b.0 - a.0) * u, a.1 + (b.1 - a.1) * u, 0.4, 0.0, 0)
+                    };
+                    raster::rasterize_points(&mut layer, &[at(t), at(t1)], BW, Tool::Pen, scale);
+                    t = t1 + GAP;
+                }
+            }
+        }
+        self.select_preview_live.set(true);
+        let damage = prev_damage.union(&r.inflate(BW + 2.0));
+        self.push_ink_damage(damage);
+        damage
+    }
+
+    /// Clear the in-progress / lasso / move preview layer.
+    pub fn clear_select_preview(&self) {
+        let tool = self.engine.borrow().config().tool;
+        self.in_progress.borrow_mut().clear();
+        self.clear_in_progress_layer(Tool::Pen);
+        if tool == Tool::Eraser {
+            self.clear_in_progress_layer(Tool::Eraser);
+        }
+        let canvas_h = self.canvas_height();
+        self.ink_damage
+            .borrow_mut()
+            .push(Rect::new(0, STATUS_BAR_H, self.width, canvas_h));
+    }
+
+    /// Hide selected strokes from the committed layer (white-fill + redraw
+    /// survivors) so a move preview can draw them on the live layer.
+    ///
+    /// Returns the union bbox that was cleared, or empty if nothing matched.
+    pub fn hide_strokes_for_move(&self, ids: &[StrokeId]) -> ephemeris_core::geom::Rect {
+        if ids.is_empty() {
+            return ephemeris_core::geom::Rect::empty();
+        }
+        let selected: Vec<Stroke> = self
+            .strokes
+            .borrow()
+            .iter()
+            .filter(|s| ids.contains(&s.id))
+            .cloned()
+            .collect();
+        if selected.is_empty() {
+            return ephemeris_core::geom::Rect::empty();
+        }
+        let mut damage = ephemeris_core::geom::Rect::empty();
+        for s in &selected {
+            damage = damage.union(&s.approx_bbox());
+        }
+        let remaining: Vec<Stroke> = self
+            .strokes
+            .borrow()
+            .iter()
+            .filter(|s| !ids.contains(&s.id))
+            .cloned()
+            .collect();
+        let scale = self.ink_scale();
+        {
+            let mut arc = self.committed_layer.borrow_mut();
+            let committed = Arc::make_mut(&mut arc);
+            Self::erase_region_redraw_survivors(committed, &damage, &remaining, scale);
+        }
+        self.push_ink_damage(damage);
+        damage
+    }
+
+    /// Draw `strokes` (already translated) onto the in-progress preview layer.
+    ///
+    /// `prev_damage` clears the previous preview position on e-ink.
+    pub fn set_move_preview(
+        &self,
+        strokes: &[Stroke],
+        prev_damage: ephemeris_core::geom::Rect,
+    ) -> ephemeris_core::geom::Rect {
+        self.clear_in_progress_layer(Tool::Pen);
+        let scale = self.ink_scale();
+        let mut cur = ephemeris_core::geom::Rect::empty();
+        {
+            let mut layer = self.in_progress_layer.borrow_mut();
+            for stroke in strokes {
+                if stroke.points.len() < 2 {
+                    continue;
+                }
+                cur = cur.union(&stroke.approx_bbox());
+                raster::rasterize_stroke(&mut layer, stroke, scale);
+            }
+        }
+        self.select_preview_live.set(!cur.is_empty());
+        let damage = prev_damage.union(&cur);
+        if !damage.is_empty() {
+            self.push_ink_damage(damage);
+        }
+        damage
+    }
+
+    /// After [`hide_strokes_for_move`], put the (still-untranslated) strokes
+    /// back onto the committed layer in `damage`.
+    pub fn restore_hidden_strokes(&self, damage: &ephemeris_core::geom::Rect) {
+        if damage.is_empty() {
+            return;
+        }
+        let all = self.strokes.borrow().clone();
+        let scale = self.ink_scale();
+        {
+            let mut arc = self.committed_layer.borrow_mut();
+            let committed = Arc::make_mut(&mut arc);
+            Self::erase_region_redraw_survivors(committed, damage, &all, scale);
+        }
+        self.clear_in_progress_layer(Tool::Pen);
+        self.push_ink_damage(*damage);
+    }
+
+    /// Insert strokes (undo of erase / redo of add). Skips ids already present.
+    pub fn insert_strokes(&self, new_strokes: &[Stroke]) -> bool {
+        if new_strokes.is_empty() {
+            return false;
+        }
+        let mut damage = ephemeris_core::geom::Rect::empty();
+        let mut inserted = Vec::new();
+        {
+            let mut strokes = self.strokes.borrow_mut();
+            for s in new_strokes {
+                if strokes.iter().any(|e| e.id == s.id) {
+                    continue;
+                }
+                damage = damage.union(&s.approx_bbox());
+                strokes.push(s.clone());
+                inserted.push(s);
+            }
+        }
+        if inserted.is_empty() {
+            return false;
+        }
+        let all = self.strokes.borrow().clone();
+        let scale = self.ink_scale();
+        {
+            let mut arc = self.committed_layer.borrow_mut();
+            let committed = Arc::make_mut(&mut arc);
+            for s in inserted {
+                if s.points.len() >= 2 {
+                    raster::rasterize_stroke(committed, s, scale);
+                }
+            }
+        }
+        {
+            let mut book = self.pages.borrow_mut();
+            let page = book.current_page_mut();
+            page.strokes = all;
+            page.committed = Arc::clone(&self.committed_layer.borrow());
+        }
+        self.strokes_dirty.set(true);
+        self.push_ink_damage(damage);
+        true
+    }
+
+    /// Replace the entire stroke list and rebuild the committed raster.
+    pub fn set_all_strokes(&self, strokes: Vec<Stroke>) {
+        let canvas_h = self.canvas_height();
+        *self.committed_layer.borrow_mut() = Arc::new(self.rasterize_strokes(&strokes));
+        *self.strokes.borrow_mut() = strokes.clone();
+        {
+            let mut book = self.pages.borrow_mut();
+            let page = book.current_page_mut();
+            page.strokes = strokes;
+            page.committed = Arc::clone(&self.committed_layer.borrow());
+            page.raster_stale = false;
+        }
+        self.in_progress.borrow_mut().clear();
+        self.clear_in_progress_layer(Tool::Pen);
+        self.strokes_dirty.set(true);
+        self.ink_damage
+            .borrow_mut()
+            .push(Rect::new(0, STATUS_BAR_H, self.width, canvas_h));
+        self.screen_change.set(true);
+    }
+
+    /// Apply an undo/redo [`ApplyOp`](ephemeris_core::ApplyOp). Returns true if
+    /// the page changed.
+    pub fn apply_ink_op(&self, op: &ephemeris_core::ApplyOp) -> bool {
+        match op {
+            ephemeris_core::ApplyOp::Add(strokes) => self.insert_strokes(strokes),
+            ephemeris_core::ApplyOp::Remove(ids) => {
+                let removed = self.remove_strokes_by_id(ids);
+                if !removed.is_empty() {
+                    let mut damage = ephemeris_core::geom::Rect::empty();
+                    for s in &removed {
+                        damage = damage.union(&s.approx_bbox());
+                    }
+                    self.push_ink_damage(damage);
+                    true
+                } else {
+                    false
+                }
+            }
+            ephemeris_core::ApplyOp::Translate { ids, dx, dy } => {
+                self.translate_strokes(ids, *dx, *dy)
+            }
+            ephemeris_core::ApplyOp::SetAll(strokes) => {
+                self.set_all_strokes(strokes.clone());
+                true
+            }
+        }
+    }
+
+    /// Translate selected strokes by `(dx, dy)`, preserving [`StrokeId`]s, and
+    /// rebuild the affected committed region. Sets `strokes_dirty`.
+    pub fn translate_strokes(&self, ids: &[StrokeId], dx: f32, dy: f32) -> bool {
+        if ids.is_empty() || (dx == 0.0 && dy == 0.0) {
+            return false;
+        }
+        let mut old_damage = ephemeris_core::geom::Rect::empty();
+        {
+            let strokes = self.strokes.borrow();
+            for s in strokes.iter().filter(|s| ids.contains(&s.id)) {
+                old_damage = old_damage.union(&s.approx_bbox());
+            }
+        }
+        if old_damage.is_empty() {
+            return false;
+        }
+        let moved = {
+            let mut strokes = self.strokes.borrow_mut();
+            ephemeris_core::ink::translate_strokes_by_id(&mut strokes, ids, dx, dy)
+        };
+        if moved == 0 {
+            return false;
+        }
+        let mut new_damage = ephemeris_core::geom::Rect::empty();
+        let all = self.strokes.borrow().clone();
+        for s in all.iter().filter(|s| ids.contains(&s.id)) {
+            new_damage = new_damage.union(&s.approx_bbox());
+        }
+        let damage = old_damage.union(&new_damage);
+        let scale = self.ink_scale();
+        {
+            let mut arc = self.committed_layer.borrow_mut();
+            let committed = Arc::make_mut(&mut arc);
+            Self::erase_region_redraw_survivors(committed, &damage, &all, scale);
+        }
+        {
+            let mut book = self.pages.borrow_mut();
+            let page = book.current_page_mut();
+            page.strokes = all;
+            page.committed = Arc::clone(&self.committed_layer.borrow());
+        }
+        self.in_progress.borrow_mut().clear();
+        self.clear_in_progress_layer(Tool::Pen);
+        self.strokes_dirty.set(true);
+        self.push_ink_damage(damage);
+        true
     }
 
     /// Clear both ink layers (committed and in-progress) for the current page.
@@ -3676,7 +4170,8 @@ impl EphemerisUi {
         drop(scheduler);
 
         let current_tool = self.engine.borrow().config().tool;
-        let has_in_progress = !self.in_progress.borrow().is_empty();
+        let has_in_progress =
+            !self.in_progress.borrow().is_empty() || self.select_preview_live.get();
         let geom = self.frame_geom();
         // Bilinear taps reach one logical pixel past a changed rect.
         const BG_MARGIN: u32 = 1;
@@ -4543,6 +5038,59 @@ mod tests {
             ui.get_page_strokes().is_empty(),
             "stroke list must be empty after clear"
         );
+    }
+
+    /// Selection outline marks the live layer for compositing even without
+    /// pen points, and clearing the preview resets it (ephemeris-4n8).
+    #[test]
+    fn selection_outline_is_composited_and_clearable() {
+        let ui = EphemerisUi::new(800, 600).expect("UI construction failed");
+        let bbox = ephemeris_core::geom::Rect {
+            min_x: 100.0,
+            min_y: 100.0,
+            max_x: 200.0,
+            max_y: 160.0,
+        };
+        let damage = ui.set_selection_outline(bbox, ephemeris_core::geom::Rect::empty());
+        assert!(damage.min_x < bbox.min_x && damage.max_x > bbox.max_x);
+        assert!(ui.select_preview_live.get());
+        assert!(ui.in_progress.borrow().is_empty());
+        assert!(ui.in_progress_layer.borrow().data.iter().any(|&v| v < 255));
+
+        ui.clear_select_preview();
+        assert!(!ui.select_preview_live.get());
+        assert!(ui.in_progress_layer.borrow().data.iter().all(|&v| v == 255));
+    }
+
+    /// Undo/redo ops round-trip through the live stroke list (ephemeris-e1b).
+    #[test]
+    fn apply_ink_op_round_trips() {
+        use ephemeris_core::ApplyOp;
+        let ui = EphemerisUi::new(800, 600).expect("UI construction failed");
+        ui.feed_input(&InputEvent::PenDown(pen_sample(10.0, 10.0)), 0);
+        ui.feed_input(&InputEvent::PenUp(pen_sample(90.0, 10.0)), 8);
+        let stroke = ui.get_page_strokes().pop().expect("stroke committed");
+        let x0 = stroke.points[0].x;
+
+        assert!(ui.apply_ink_op(&ApplyOp::Translate {
+            ids: vec![stroke.id],
+            dx: 20.0,
+            dy: 5.0,
+        }));
+        let moved = ui.page_stroke(stroke.id).expect("still present");
+        assert!((moved.points[0].x - (x0 + 20.0)).abs() < 1e-3);
+
+        assert!(ui.apply_ink_op(&ApplyOp::Remove(vec![stroke.id])));
+        assert!(ui.get_page_strokes().is_empty());
+        assert!(!ui.apply_ink_op(&ApplyOp::Remove(vec![stroke.id])));
+
+        assert!(ui.apply_ink_op(&ApplyOp::Add(vec![moved.clone()])));
+        // Re-adding an id that already exists is a no-op.
+        assert!(!ui.apply_ink_op(&ApplyOp::Add(vec![moved])));
+        assert_eq!(ui.get_page_strokes().len(), 1);
+
+        assert!(ui.apply_ink_op(&ApplyOp::SetAll(Vec::new())));
+        assert!(ui.get_page_strokes().is_empty());
     }
 
     /// Finished pen strokes are kept in the page stroke list; eraser removes them.

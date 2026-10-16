@@ -29,7 +29,10 @@ pub use config::{
     TaskLaneConfig,
 };
 pub use error::{AppError, Result};
-pub use ink::{EraserConfig, EraserEngine, EraserUpdate, InkConfig, InkEngine, InkUpdate};
+pub use ink::{
+    ApplyOp, EraserConfig, EraserEngine, EraserUpdate, InkConfig, InkEdit, InkEngine, InkHistory,
+    InkHistoryMap, InkUpdate, DEFAULT_INK_HISTORY_DEPTH,
+};
 pub use model::{
     Account, AccountId, AccountKind, CalendarEvent, Color, EnergyLevel, EventId, Note, NoteId,
     Page, PageId, PageTemplate, Point, Profile, ProfileId, Stroke, StrokeId, Task, TaskContext,
