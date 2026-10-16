@@ -4513,7 +4513,6 @@ impl App {
                 if let Some(note) = ns.iter_mut().find(|n| n.id.to_string() == active_id) {
                     note.paper_template = template;
                 }
-                ui2.set_drawing_menu_open(false);
             });
         }
 
@@ -5974,6 +5973,7 @@ impl App {
             last_ink_pressure: 0.5,
             shape_hold: None,
             select_gesture: None,
+            select_preview_dirty: false,
             undo_ui_page: None,
             data_dir,
             notes: notes.clone(),
@@ -6167,6 +6167,8 @@ struct WinitHandler {
     shape_hold: Option<ShapeHoldState>,
     /// Lasso / drag state while the Move tool is active.
     select_gesture: Option<SelectGesture>,
+    /// Lasso / drag moved since the preview was last drawn.
+    select_preview_dirty: bool,
     /// Note page the undo/redo affordances were last synced for.
     undo_ui_page: Option<(u32, usize)>,
     /// Directory where per-note pixel data is saved.
@@ -6736,94 +6738,62 @@ impl WinitHandler {
         });
     }
 
+    /// Record the latest lasso point / drag offset. Rendering is deferred to
+    /// [`Self::flush_select_preview`] so a burst of pen samples costs one
+    /// raster pass instead of one per sample (PineNote froze otherwise).
     fn handle_select_move(&mut self, lx: f32, ly: f32) {
         use ephemeris_ui::STATUS_BAR_H;
         let cy = ly - STATUS_BAR_H as f32;
-        // Clone what we need so we don't hold `select_gesture` across UI borrows.
-        enum MoveKind {
-            Lasso {
-                points: Vec<(f32, f32)>,
-                prev: ephemeris_core::geom::Rect,
-            },
-            Drag {
-                preview: Vec<ephemeris_core::Stroke>,
-                prev: ephemeris_core::geom::Rect,
-                dx: f32,
-                dy: f32,
-            },
+        match self.select_gesture.as_mut() {
+            Some(SelectGesture::Lassoing { points, .. }) => {
+                points.push((lx, cy));
+            }
+            Some(SelectGesture::Dragging {
+                origin_x,
+                origin_y,
+                dx,
+                dy,
+                ..
+            }) => {
+                *dx = lx - *origin_x;
+                *dy = cy - *origin_y;
+            }
+            _ => return,
         }
-        let kind = match &self.select_gesture {
+        self.select_preview_dirty = true;
+        self.request_redraw_coalesced();
+    }
+
+    /// Redraw the lasso / move preview once for all moves since the last call.
+    fn flush_select_preview(&mut self) {
+        if !std::mem::take(&mut self.select_preview_dirty) {
+            return;
+        }
+        match self.select_gesture.as_mut() {
             Some(SelectGesture::Lassoing {
                 points,
                 preview_damage,
             }) => {
-                let mut points = points.clone();
-                points.push((lx, cy));
-                Some(MoveKind::Lasso {
-                    points,
-                    prev: *preview_damage,
-                })
+                *preview_damage = self.ui.set_lasso_preview(points, *preview_damage);
             }
             Some(SelectGesture::Dragging {
                 originals,
-                origin_x,
-                origin_y,
                 preview_damage,
+                dx,
+                dy,
                 ..
             }) => {
-                let dx = lx - origin_x;
-                let dy = cy - origin_y;
                 let preview: Vec<_> = originals
                     .iter()
                     .map(|s| {
                         let mut c = s.clone();
-                        ephemeris_core::ink::translate_stroke(&mut c, dx, dy);
+                        ephemeris_core::ink::translate_stroke(&mut c, *dx, *dy);
                         c
                     })
                     .collect();
-                Some(MoveKind::Drag {
-                    preview,
-                    prev: *preview_damage,
-                    dx,
-                    dy,
-                })
+                *preview_damage = self.ui.set_move_preview(&preview, *preview_damage);
             }
-            _ => None,
-        };
-        match kind {
-            Some(MoveKind::Lasso { points, prev }) => {
-                let damage = self.ui.set_lasso_preview(&points, prev);
-                if let Some(SelectGesture::Lassoing {
-                    points: p,
-                    preview_damage,
-                }) = self.select_gesture.as_mut()
-                {
-                    *p = points;
-                    *preview_damage = damage;
-                }
-                self.request_redraw_coalesced();
-            }
-            Some(MoveKind::Drag {
-                preview,
-                prev,
-                dx,
-                dy,
-            }) => {
-                let damage = self.ui.set_move_preview(&preview, prev);
-                if let Some(SelectGesture::Dragging {
-                    preview_damage,
-                    dx: ddx,
-                    dy: ddy,
-                    ..
-                }) = self.select_gesture.as_mut()
-                {
-                    *preview_damage = damage;
-                    *ddx = dx;
-                    *ddy = dy;
-                }
-                self.request_redraw_coalesced();
-            }
-            None => {}
+            _ => {}
         }
     }
 
@@ -7293,6 +7263,7 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
         }
         #[cfg(target_os = "linux")]
         self.drain_pen_events();
+        self.flush_select_preview();
         // Hide Mutter tablet-tool cursor (zwp_tablet_tool_v2.set_cursor on
         // winit's wl_display). Must run on the same connection as the window.
         if let Some(d) = &mut self.display {
