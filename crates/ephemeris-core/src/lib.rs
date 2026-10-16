@@ -175,9 +175,10 @@ pub use user_lexicon::{
 };
 pub use vault_export::{
     canvas_export_dir, canvas_export_rel, export_canvas_json, export_note_markdown,
-    notebook_export_dir, notebook_export_rel, path_under_export_subdir, sync_canvases_to_vault,
-    sync_notes_to_vault, VaultCanvasExport, VaultNoteExport, CANVAS_EXPORT_FOLDER,
-    DEFAULT_EXPORT_SUBDIR, NOTES_EXPORT_FOLDER,
+    migrate_legacy_note_pdf, note_pdf_export_path, note_pdf_export_rel, notebook_export_dir,
+    notebook_export_rel, path_under_export_subdir, sync_canvases_to_vault, sync_notes_to_vault,
+    VaultCanvasExport, VaultNoteExport, CANVAS_EXPORT_FOLDER, DEFAULT_EXPORT_SUBDIR,
+    NOTES_EXPORT_FOLDER, NOTE_ASSETS_FOLDER,
 };
 pub use vault_git::{
     commit_and_push as vault_git_commit_and_push, is_git_repo, pull as vault_git_pull,

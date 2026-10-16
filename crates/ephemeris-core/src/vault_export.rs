@@ -3,10 +3,11 @@
 //! Layout: `{vault}/{export_subdir}/Notes/{Notebook}/{…}/{Note}.md`
 //! Unfiled notes: `{export_subdir}/Notes/{Note}.md` (empty notebook segments).
 //! Nested Ephemeris notebooks become nested directories *under* `Notes/`, never
-//! beside it. Optional PDF sibling `{Note}.pdf` is linked from the markdown
-//! when present.
+//! beside it. The PDF (+ hash sidecar) lives under `{note_dir}/_assets/` so the
+//! notebook folder stays markdown-first; markdown embeds `![[_assets/{Note}.pdf]]`.
 
 use crate::json_canvas::{new_canvas_id, CanvasNode, FileNode, JsonCanvas, TextNode};
+use crate::pdf_export::pdf_hash_sidecar;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -19,6 +20,8 @@ pub const NOTES_EXPORT_FOLDER: &str = "Notes";
 /// Folder under the export root that holds Obsidian JSON Canvas exports.
 pub const CANVAS_EXPORT_FOLDER: &str = "Canvas";
 
+/// Per-folder assets dir for note PDFs (and canvas PNGs).
+pub const NOTE_ASSETS_FOLDER: &str = "_assets";
 /// Payload for writing one note into the vault.
 #[derive(Debug, Clone)]
 pub struct VaultNoteExport {
@@ -63,6 +66,76 @@ pub fn notebook_export_rel(export_subdir: &Path, segments: &[String], file_name:
     parts.join("/")
 }
 
+/// Absolute path for a note's PDF under `{note_dir}/_assets/{stem}.pdf`.
+pub fn note_pdf_export_path(
+    vault_path: &Path,
+    export_subdir: &Path,
+    segments: &[String],
+    note_stem: &str,
+) -> PathBuf {
+    notebook_export_dir(vault_path, export_subdir, segments)
+        .join(NOTE_ASSETS_FOLDER)
+        .join(format!("{note_stem}.pdf"))
+}
+
+/// Vault-relative path for a note PDF under `_assets/`.
+pub fn note_pdf_export_rel(export_subdir: &Path, segments: &[String], note_stem: &str) -> String {
+    notebook_export_rel(
+        export_subdir,
+        segments,
+        &format!("{NOTE_ASSETS_FOLDER}/{note_stem}.pdf"),
+    )
+}
+
+/// Move legacy sibling `{stem}.pdf` (+ hash) into `_assets/`, or delete leftovers.
+///
+/// Older exports wrote PDF + `.ephemeris-hash` next to the markdown. Call this
+/// before writing the new layout so Obsidian folders stay tidy and the
+/// incremental hash sidecar keeps working across the move.
+pub fn migrate_legacy_note_pdf(note_dir: &Path, note_stem: &str) {
+    let legacy_pdf = note_dir.join(format!("{note_stem}.pdf"));
+    let legacy_hash = pdf_hash_sidecar(&legacy_pdf);
+    let assets_dir = note_dir.join(NOTE_ASSETS_FOLDER);
+    let new_pdf = assets_dir.join(format!("{note_stem}.pdf"));
+    let new_hash = pdf_hash_sidecar(&new_pdf);
+
+    if legacy_pdf.exists() {
+        if !new_pdf.exists() {
+            let _ = fs::create_dir_all(&assets_dir);
+            if fs::rename(&legacy_pdf, &new_pdf).is_ok() {
+                if legacy_hash.exists() && !new_hash.exists() {
+                    let _ = fs::rename(&legacy_hash, &new_hash);
+                }
+            } else {
+                let _ = fs::remove_file(&legacy_pdf);
+            }
+        } else {
+            let _ = fs::remove_file(&legacy_pdf);
+        }
+    }
+    if legacy_hash.exists() {
+        let _ = fs::remove_file(&legacy_hash);
+    }
+}
+
+/// Obsidian wiki embed for a vault-relative PDF path.
+fn pdf_wiki_embed(pdf_vault_rel: &str) -> String {
+    let path = Path::new(pdf_vault_rel);
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("note.pdf");
+    let under_assets = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        == Some(NOTE_ASSETS_FOLDER);
+    if under_assets {
+        format!("![[{NOTE_ASSETS_FOLDER}/{name}]]")
+    } else {
+        format!("![[{name}]]")
+    }
+}
 /// Write (or overwrite) the markdown sidecar for `note` under the export root.
 ///
 /// Returns the absolute path of the written `.md` file.
@@ -120,11 +193,8 @@ fn render_markdown(note: &VaultNoteExport) -> String {
     out.push_str(&format!("# {}\n\n", note.note_title));
 
     if let Some(ref pdf) = note.pdf_vault_rel {
-        let stem = Path::new(pdf)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("note");
-        out.push_str(&format!("![[{stem}.pdf]]\n\n"));
+        out.push_str(&pdf_wiki_embed(pdf));
+        out.push_str("\n\n");
     }
 
     match note
@@ -376,12 +446,85 @@ mod tests {
             note_id: 1,
             created_at: 0,
             text_content: None,
+            pdf_vault_rel: Some("Ephemeris/Notes/N/_assets/T.pdf".into()),
+        };
+        let path = export_note_markdown(tmp.path(), Path::new("Ephemeris"), &note).unwrap();
+        let body = fs::read_to_string(path).unwrap();
+        assert!(body.contains("![[_assets/T.pdf]]"));
+        assert!(body.contains("No transcribed text yet"));
+    }
+
+    #[test]
+    fn export_links_legacy_sibling_pdf_without_assets_prefix() {
+        let tmp = TempDir::new().unwrap();
+        let note = VaultNoteExport {
+            notebook_title: "N".into(),
+            notebook_segments: vec!["N".into()],
+            note_title: "T".into(),
+            note_id: 1,
+            created_at: 0,
+            text_content: None,
             pdf_vault_rel: Some("Ephemeris/Notes/N/T.pdf".into()),
         };
         let path = export_note_markdown(tmp.path(), Path::new("Ephemeris"), &note).unwrap();
         let body = fs::read_to_string(path).unwrap();
         assert!(body.contains("![[T.pdf]]"));
-        assert!(body.contains("No transcribed text yet"));
+        assert!(!body.contains("![[_assets/T.pdf]]"));
+    }
+
+    #[test]
+    fn note_pdf_export_path_under_assets() {
+        let abs = note_pdf_export_path(
+            Path::new("/vault"),
+            Path::new("Ephemeris"),
+            &["Work".into()],
+            "Meeting Notes",
+        );
+        assert_eq!(
+            abs,
+            Path::new("/vault/Ephemeris/Notes/Work/_assets/Meeting Notes.pdf")
+        );
+        let rel = note_pdf_export_rel(Path::new("Ephemeris"), &["Work".into()], "Meeting Notes");
+        assert_eq!(rel, "Ephemeris/Notes/Work/_assets/Meeting Notes.pdf");
+    }
+
+    #[test]
+    fn migrate_legacy_note_pdf_moves_into_assets() {
+        let tmp = TempDir::new().unwrap();
+        let note_dir = tmp.path().join("Ephemeris/Notes/N");
+        fs::create_dir_all(&note_dir).unwrap();
+        let legacy_pdf = note_dir.join("T.pdf");
+        let legacy_hash = pdf_hash_sidecar(&legacy_pdf);
+        fs::write(&legacy_pdf, b"%PDF-legacy").unwrap();
+        fs::write(&legacy_hash, "abc123").unwrap();
+
+        migrate_legacy_note_pdf(&note_dir, "T");
+
+        let new_pdf = note_dir.join("_assets/T.pdf");
+        let new_hash = pdf_hash_sidecar(&new_pdf);
+        assert!(new_pdf.exists());
+        assert_eq!(fs::read(&new_pdf).unwrap(), b"%PDF-legacy");
+        assert!(new_hash.exists());
+        assert_eq!(fs::read_to_string(&new_hash).unwrap(), "abc123");
+        assert!(!legacy_pdf.exists());
+        assert!(!legacy_hash.exists());
+    }
+
+    #[test]
+    fn migrate_legacy_note_pdf_removes_sibling_when_assets_exists() {
+        let tmp = TempDir::new().unwrap();
+        let note_dir = tmp.path().join("Ephemeris/Notes/N");
+        let assets = note_dir.join("_assets");
+        fs::create_dir_all(&assets).unwrap();
+        fs::write(assets.join("T.pdf"), b"%PDF-new").unwrap();
+        fs::write(note_dir.join("T.pdf"), b"%PDF-old").unwrap();
+        fs::write(pdf_hash_sidecar(&note_dir.join("T.pdf")), "old").unwrap();
+
+        migrate_legacy_note_pdf(&note_dir, "T");
+
+        assert_eq!(fs::read(assets.join("T.pdf")).unwrap(), b"%PDF-new");
+        assert!(!note_dir.join("T.pdf").exists());
+        assert!(!pdf_hash_sidecar(&note_dir.join("T.pdf")).exists());
     }
 
     #[test]
@@ -418,11 +561,17 @@ mod tests {
         let rel = notebook_export_rel(
             Path::new("Ephemeris"),
             &["Work".into(), "Ideas".into()],
-            "n.pdf",
+            "n.md",
         );
-        assert_eq!(rel, "Ephemeris/Notes/Work/Ideas/n.pdf");
+        assert_eq!(rel, "Ephemeris/Notes/Work/Ideas/n.md");
         let unfiled = notebook_export_rel(Path::new("Ephemeris"), &[], "loose.md");
         assert_eq!(unfiled, "Ephemeris/Notes/loose.md");
+        let pdf = notebook_export_rel(
+            Path::new("Ephemeris"),
+            &["Work".into(), "Ideas".into()],
+            "_assets/n.pdf",
+        );
+        assert_eq!(pdf, "Ephemeris/Notes/Work/Ideas/_assets/n.pdf");
     }
 
     #[test]
