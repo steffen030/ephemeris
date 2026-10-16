@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.26](https://github.com/steffen030/ephemeris/compare/v0.1.25...v0.1.26) (2026-10-16)
+
+
+### Bug Fixes
+
+* **notes:** smooth lasso drag, reliable smart shapes, menu and chip polish ([#66](https://github.com/steffen030/ephemeris/issues/66)) ([6994e3c](https://github.com/steffen030/ephemeris/commit/6994e3c0d837526bc1cea949c59aab2fe5ad024d))
+
 ## [0.1.25](https://github.com/steffen030/ephemeris/compare/v0.1.24...v0.1.25) (2026-10-16)
 
 
