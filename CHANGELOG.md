@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.24](https://github.com/steffen030/ephemeris/compare/v0.1.23...v0.1.24) (2026-10-16)
+
+
+### Features
+
+* **canvas:** direct gestures, handwriting-to-text cards, OSK in dialogs ([#58](https://github.com/steffen030/ephemeris/issues/58)) ([eec9374](https://github.com/steffen030/ephemeris/commit/eec9374086f478a8bcf564646b61045fbd6c9353))
+* **vault:** Improvements to vault sync ([#62](https://github.com/steffen030/ephemeris/issues/62)) ([20a61df](https://github.com/steffen030/ephemeris/commit/20a61df23837b61b7ce1c0db5903a60b0d77ec59))
+
+
+### Bug Fixes
+
+* **see-text:** render *italic* / _italic_ instead of literal markers (ephemeris-21l) ([#61](https://github.com/steffen030/ephemeris/issues/61)) ([b888821](https://github.com/steffen030/ephemeris/commit/b8888213485294a5fd9982af6fab7a583cf77c4d))
+* **ui:** correct remaining Material icon codepoints (ephemeris-88e) ([#60](https://github.com/steffen030/ephemeris/issues/60)) ([ec78115](https://github.com/steffen030/ephemeris/commit/ec7811512c8e2c849f4d305e86c34e695d71fc0f))
+
 ## [0.1.23](https://github.com/steffen030/ephemeris/compare/v0.1.22...v0.1.23) (2026-10-15)
 
 
