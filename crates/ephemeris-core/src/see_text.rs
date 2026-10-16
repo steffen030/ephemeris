@@ -143,14 +143,53 @@ pub fn rows_from_cache(cache: &PageRecognitionCache) -> Vec<SeeTextRow> {
     rows
 }
 
-/// Convert stored inline markdown (`**`, `==`, `<u>`, backslash escapes) to
-/// the StyledText-safe subset. Anything else markdown-significant is escaped.
+/// Convert stored inline markdown (`**`, `==`, `*em*` / `_em_`, `<u>`,
+/// backslash escapes) to the StyledText-safe subset. Anything else
+/// markdown-significant is escaped.
 pub fn markdown_inline_to_styled(s: &str) -> String {
     inline_to_styled(s, false)
 }
 
+/// Char indices of single `*` / `_` that form a `*em*` / `_em_` pair.
+/// Delimiters must hug the text (`* a *` is literal) and `_` must not sit
+/// inside a word (`snake_case_name` is literal), as in CommonMark.
+fn emphasis_delims(c: &[char]) -> Vec<usize> {
+    let word = |i: Option<usize>| {
+        i.and_then(|i| c.get(i))
+            .is_some_and(|ch| ch.is_alphanumeric())
+    };
+    let space = |i: Option<usize>| i.and_then(|i| c.get(i)).is_none_or(|ch| ch.is_whitespace());
+    let single = |i: usize, m: char| {
+        c[i] == m
+            && c.get(i + 1) != Some(&m)
+            && (i == 0 || c[i - 1] != m)
+            && (i == 0 || c[i - 1] != '\\')
+    };
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < c.len() {
+        let m = c[i];
+        let opens = (m == '*' || m == '_')
+            && single(i, m)
+            && !space(Some(i + 1))
+            && !(m == '_' && word(i.checked_sub(1)));
+        if opens {
+            let close = (i + 2..c.len())
+                .find(|&j| single(j, m) && !space(Some(j - 1)) && !(m == '_' && word(Some(j + 1))));
+            if let Some(j) = close {
+                out.extend([i, j]);
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 fn inline_to_styled(s: &str, drop_bold: bool) -> String {
     let c: Vec<char> = s.chars().collect();
+    let emphasis = emphasis_delims(&c);
     let mut out = String::with_capacity(s.len() + 4);
     let mut i = 0;
     let starts = |i: usize, pat: &str| {
@@ -159,7 +198,11 @@ fn inline_to_styled(s: &str, drop_bold: bool) -> String {
             .all(|(k, p)| c.get(i + k) == Some(&p))
     };
     while i < c.len() {
-        if starts(i, "**") || starts(i, "==") {
+        if emphasis.contains(&i) {
+            // StyledText only parses `*em*`.
+            out.push('*');
+            i += 1;
+        } else if starts(i, "**") || starts(i, "==") {
             if !drop_bold {
                 out.push_str("**");
             }
@@ -509,6 +552,32 @@ mod tests {
         assert_eq!((rows[2].kind, rows[2].number), (KIND_NUMBERED, 7));
         assert_eq!(rows[3].styled_md, "\\# hash");
         assert_eq!(rows[4].styled_md, "snake\\_case \\<b\\>");
+    }
+
+    #[test]
+    fn markdown_rows_italic_in_every_row_kind() {
+        let rows = rows_from_markdown(
+            "- [ ] call *Anna*\n- [x] _paid_ rent\n- a *b* c\n3. *x*\n# Big *one*\nplain *em* and **bold**",
+        );
+        assert_eq!(rows[0].styled_md, "call *Anna*");
+        assert_eq!(rows[0].plain, "call Anna");
+        assert_eq!(rows[1].styled_md, "*paid* rent");
+        assert_eq!(rows[2].styled_md, "a *b* c");
+        assert_eq!(rows[3].styled_md, "*x*");
+        assert_eq!(rows[4].styled_md, "**Big *one***");
+        assert_eq!(rows[5].styled_md, "plain *em* and **bold**");
+    }
+
+    #[test]
+    fn markdown_rows_lone_or_intraword_markers_stay_literal() {
+        let rows = rows_from_markdown(
+            "snake_case_name\n2 * 3 * 4\na* b*\n\\*not em\\*\nfile_v2.txt and *open",
+        );
+        assert_eq!(rows[0].styled_md, "snake\\_case\\_name");
+        assert_eq!(rows[1].styled_md, "2 \\* 3 \\* 4");
+        assert_eq!(rows[2].styled_md, "a\\* b\\*");
+        assert_eq!(rows[3].styled_md, "\\*not em\\*");
+        assert_eq!(rows[4].styled_md, "file\\_v2.txt and \\*open");
     }
 
     fn edit_of(c: &PageRecognitionCache, i: usize) -> LineEdit {
