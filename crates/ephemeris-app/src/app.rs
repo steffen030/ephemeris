@@ -63,6 +63,7 @@ const VAULT_EXPORT_BATCH_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const NAV_HOME: i32 = 0;
 const NAV_TASKS: i32 = 1;
 const NAV_NOTES: i32 = 2;
+const NAV_CANVAS: i32 = 3;
 const NAV_CAL: i32 = 4;
 const NAV_REC: i32 = 5;
 
@@ -1258,6 +1259,31 @@ impl App {
             })
         };
 
+        // Home › Continue: recent notes / canvases / recordings (profile-filtered).
+        let push_continue: Rc<dyn Fn()> = {
+            let notes_rc = notes.clone();
+            let recs_rc = recordings.clone();
+            let canvas_rc = canvas_session.clone();
+            let filter_rc = active_profile_filter.clone();
+            let nia_rc = notes_in_all_profiles.clone();
+            let ria_rc = recordings_in_all_profiles.clone();
+            let mgr_rc = profile_mgr.clone();
+            let ui2 = ui.clone_component();
+            Rc::new(move || {
+                push_continue_comp(
+                    &ui2,
+                    &notes_rc.borrow(),
+                    &canvas_rc,
+                    &recs_rc.borrow(),
+                    &filter_rc.borrow(),
+                    &nia_rc.borrow(),
+                    &ria_rc.borrow(),
+                    &mgr_rc.borrow(),
+                );
+            })
+        };
+        push_continue();
+
         // ── Profile add ───────────────────────────────────────────────────────
         {
             let mgr = profile_mgr.clone();
@@ -1386,6 +1412,7 @@ impl App {
             let cfg2 = config.clone();
             let push_recs_switch = push_recordings.clone();
             let push_nbs_switch = push_notebooks.clone();
+            let push_cont_switch = push_continue.clone();
             let canvas_switch = canvas_session.clone();
             let ui_canvas = ui.clone();
             ui.on_profile_changed(move |id| {
@@ -1407,6 +1434,7 @@ impl App {
                 push_nbs_switch();
                 *canvas_switch.profile_filter.borrow_mut() = filter_str;
                 crate::canvas_app::refresh_browser(&ui_canvas, &canvas_switch);
+                push_cont_switch();
             });
         }
 
@@ -1642,6 +1670,7 @@ impl App {
             let canvas_leave = canvas_session.clone();
             let cfg_leave = config.clone();
             let conns_leave = connections.clone();
+            let push_cont_home = push_continue.clone();
             ui.on_nav_overview_tapped(move || {
                 crate::canvas_app::leave_canvas_session(
                     &ui_rc,
@@ -1661,6 +1690,7 @@ impl App {
                 ui2.set_show_md_viewer(false);
                 ui2.set_ring_visible(false);
                 ui2.set_show_start_page(true);
+                push_cont_home();
             });
         }
 
@@ -2028,6 +2058,185 @@ impl App {
                     ui_rc.navigate_to_page(page_idx);
                     ui_rc.set_page_index((doc_page + 1) as i32, doc_page_count as i32);
                     push_note_text_for_active(&ui_rc, &notes2.borrow(), &note_id);
+                }
+            });
+        }
+
+        // ── Home › Continue: open note / canvas / recording ───────────────────
+        {
+            let ui_rc = ui.clone();
+            let ui2 = ui.clone_component();
+            let notes2 = notes.clone();
+            let notebooks2 = notebooks.clone();
+            let note_seq2 = note_id_seq.clone();
+            let nb_seq2 = notebook_id_seq.clone();
+            let data_dir2 = data_dir.clone();
+            let anchor_rc = current_note_anchor.clone();
+            let vault_leave = vault_export.clone();
+            let writes_leave = local_page_writes.clone();
+            let canvas_sess = canvas_session.clone();
+            let cfg_leave = config.clone();
+            let conns_leave = connections.clone();
+            let recs2 = recordings.clone();
+            let inflight = transcription_in_flight.clone();
+            let push_recs = push_recordings.clone();
+            ui.on_continue_item_tapped(move |kind, id| {
+                let kind = kind.to_string();
+                let id = id.to_string();
+                match kind.as_str() {
+                    "note" => {
+                        let prev = ui2.get_active_note_id().to_string();
+                        if !prev.is_empty() && prev != id {
+                            leave_note_canvas(
+                                &ui_rc,
+                                &mut notes2.borrow_mut(),
+                                &data_dir2,
+                                prev.as_str(),
+                                &vault_leave,
+                                &writes_leave,
+                            );
+                        }
+                        crate::canvas_app::leave_canvas_session(
+                            &ui_rc,
+                            &canvas_sess,
+                            &cfg_leave,
+                            &conns_leave.borrow(),
+                            false,
+                        );
+                        let mut notes = notes2.borrow_mut();
+                        let Some(note) = notes.iter_mut().find(|n| n.id.to_string() == id) else {
+                            return;
+                        };
+                        note.updated_at = now_secs();
+                        let page_idx = note.page_index;
+                        let note_id = note.id.to_string();
+                        let note_title = note.title.clone();
+                        let template = note.paper_template;
+                        let anchor = note.anchor.clone().unwrap_or_default();
+                        let doc_page = note.doc_page;
+                        let doc_page_count = note.doc_page_count.max(1);
+                        drop(notes);
+                        save_notes_index(
+                            &data_dir2,
+                            &notes2.borrow(),
+                            &notebooks2.borrow(),
+                            note_seq2.get(),
+                            nb_seq2.get(),
+                        );
+                        let paper_str = match template {
+                            ephemeris_core::PageTemplate::Lines => "lined",
+                            ephemeris_core::PageTemplate::Dot => "dotted",
+                            ephemeris_core::PageTemplate::Grid => "squared",
+                            ephemeris_core::PageTemplate::Blank => "blank",
+                        };
+                        let anchor_label = if let Some(ds) = anchor.strip_prefix("cal:") {
+                            NaiveDate::parse_from_str(ds, "%Y-%m-%d")
+                                .map(|d| format_day_anchor_label(d.year(), d.month(), d.day()))
+                                .unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
+                        *anchor_rc.borrow_mut() = anchor;
+                        ui_rc.set_note_anchor_label(&anchor_label);
+                        ui2.set_show_start_page(false);
+                        ui2.set_show_task_view(false);
+                        ui2.set_show_settings(false);
+                        ui2.set_show_filebrowser(false);
+                        ui2.set_show_calendar(false);
+                        ui2.set_show_recording_list(false);
+                        ui2.set_show_search(false);
+                        ui2.set_show_md_viewer(false);
+                        ui2.set_show_canvas_folder_list(false);
+                        ui2.set_show_canvas_list(false);
+                        ui2.set_show_canvas_board(false);
+                        ui2.set_ring_visible(false);
+                        ui2.set_show_note_list(false);
+                        ui2.set_show_notebook_list(false);
+                        ui2.set_nav_section(NAV_NOTES);
+                        ui2.set_active_note_id(note_id.as_str().into());
+                        ui2.set_active_paper(paper_str.into());
+                        ui2.set_drawing_menu_open(false);
+                        ui_rc.set_page_title(&note_title);
+                        ui_rc.set_current_page_template(template);
+                        ui_rc.navigate_to_page(page_idx);
+                        ui_rc.set_page_index((doc_page + 1) as i32, doc_page_count as i32);
+                        push_note_text_for_active(&ui_rc, &notes2.borrow(), &note_id);
+                    }
+                    "canvas" => {
+                        let Ok(cid) = id.parse::<u32>() else {
+                            return;
+                        };
+                        leave_note_canvas(
+                            &ui_rc,
+                            &mut notes2.borrow_mut(),
+                            &data_dir2,
+                            ui2.get_active_note_id().as_str(),
+                            &vault_leave,
+                            &writes_leave,
+                        );
+                        ui2.set_show_start_page(false);
+                        ui2.set_show_task_view(false);
+                        ui2.set_show_settings(false);
+                        ui2.set_show_filebrowser(false);
+                        ui2.set_show_calendar(false);
+                        ui2.set_show_recording_list(false);
+                        ui2.set_show_search(false);
+                        ui2.set_show_md_viewer(false);
+                        ui2.set_show_note_list(false);
+                        ui2.set_show_notebook_list(false);
+                        ui2.set_ring_visible(false);
+                        ui2.set_nav_section(NAV_CANVAS);
+                        crate::canvas_app::open_canvas_by_id(&ui_rc, &canvas_sess, cid);
+                    }
+                    "recording" => {
+                        leave_note_canvas(
+                            &ui_rc,
+                            &mut notes2.borrow_mut(),
+                            &data_dir2,
+                            ui2.get_active_note_id().as_str(),
+                            &vault_leave,
+                            &writes_leave,
+                        );
+                        crate::canvas_app::leave_canvas_session(
+                            &ui_rc,
+                            &canvas_sess,
+                            &cfg_leave,
+                            &conns_leave.borrow(),
+                            false,
+                        );
+                        ui2.set_show_start_page(false);
+                        ui2.set_show_task_view(false);
+                        ui2.set_show_settings(false);
+                        ui2.set_show_filebrowser(false);
+                        ui2.set_show_calendar(false);
+                        ui2.set_show_note_list(false);
+                        ui2.set_show_notebook_list(false);
+                        ui2.set_show_search(false);
+                        ui2.set_show_md_viewer(false);
+                        ui2.set_show_canvas_folder_list(false);
+                        ui2.set_show_canvas_list(false);
+                        ui2.set_show_canvas_board(false);
+                        ui2.set_ring_visible(false);
+                        push_recs();
+                        ui2.set_show_recording_list(true);
+                        ui2.set_nav_section(NAV_REC);
+                        let Ok(id_u32) = id.parse::<u32>() else {
+                            return;
+                        };
+                        let rec = recs2.borrow().iter().find(|r| r.id == id_u32).cloned();
+                        let Some(rec) = rec else { return };
+                        ui2.set_rec_active_id(rec.id.to_string().as_str().into());
+                        ui2.set_rec_active_title(rec.title.as_str().into());
+                        if inflight.borrow().contains(&id_u32) {
+                            ui2.set_rec_transcription_text("Transcribing…".into());
+                        } else if let Some(text) = &rec.transcription {
+                            ui2.set_rec_transcription_text(text.as_str().into());
+                        } else {
+                            ui2.set_rec_transcription_text("".into());
+                        }
+                        ui2.set_rec_transcription_visible(true);
+                    }
+                    _ => {}
                 }
             });
         }
@@ -11066,6 +11275,112 @@ fn push_agenda_comp(
 
 /// Max ranked open tasks shown on the home page (keeps agenda visible).
 const HOME_TASK_LIMIT: usize = 5;
+
+/// Max recent items in Home › Continue (half-width column beside Agenda).
+const HOME_CONTINUE_LIMIT: usize = 6;
+
+/// One candidate for the Continue list before sort/cap.
+struct ContinueCandidate {
+    kind: &'static str,
+    kind_label: &'static str,
+    id: String,
+    title: String,
+    stamp: u64,
+    profile_id: String,
+}
+
+/// Push profile-filtered recent notes / canvases / recordings to Home › Continue.
+#[allow(clippy::too_many_arguments)]
+fn push_continue_comp(
+    comp: &ephemeris_ui::EphemerisPage,
+    notes: &[AppNote],
+    canvas: &crate::canvas_app::CanvasSession,
+    recordings: &[AppRecording],
+    profile_filter: &str,
+    notes_in_all: &HashSet<String>,
+    recordings_in_all: &HashSet<String>,
+    mgr: &ephemeris_core::profile_manager::ProfileManager,
+) {
+    let now = now_secs();
+    let show_badges = profile_filter.is_empty();
+    let mut items: Vec<ContinueCandidate> = Vec::new();
+
+    for n in notes {
+        if !note_visible(n, profile_filter, notes_in_all) {
+            continue;
+        }
+        items.push(ContinueCandidate {
+            kind: "note",
+            kind_label: "Note",
+            id: n.id.to_string(),
+            title: n.title.clone(),
+            stamp: note_updated_at(n),
+            profile_id: n.profile_id.clone(),
+        });
+    }
+
+    {
+        let idx = canvas.index.borrow();
+        for c in &idx.canvases {
+            if !(profile_filter.is_empty()
+                || c.profile_id.is_empty()
+                || c.profile_id == profile_filter)
+            {
+                continue;
+            }
+            items.push(ContinueCandidate {
+                kind: "canvas",
+                kind_label: "Canvas",
+                id: c.id.to_string(),
+                title: c.title.clone(),
+                stamp: c.updated_at.max(c.created_at),
+                profile_id: c.profile_id.clone(),
+            });
+        }
+    }
+
+    for r in recordings {
+        let visible = if profile_filter.is_empty() {
+            r.profile_id.is_empty() || recordings_in_all.contains(&r.profile_id)
+        } else {
+            r.profile_id == profile_filter
+        };
+        if !visible {
+            continue;
+        }
+        items.push(ContinueCandidate {
+            kind: "recording",
+            kind_label: "Rec",
+            id: r.id.to_string(),
+            title: r.title.clone(),
+            stamp: r.created_at,
+            profile_id: r.profile_id.clone(),
+        });
+    }
+
+    items.sort_by(|a, b| b.stamp.cmp(&a.stamp).then_with(|| a.title.cmp(&b.title)));
+    items.truncate(HOME_CONTINUE_LIMIT);
+
+    let entries: Vec<ephemeris_ui::ContinueEntry> = items
+        .into_iter()
+        .map(|it| {
+            let (show_profile, profile_icon_char, has_custom_profile_icon, custom_profile_icon) =
+                profile_badge_for(&it.profile_id, show_badges, mgr);
+            ephemeris_ui::ContinueEntry {
+                kind: it.kind.into(),
+                id: it.id.as_str().into(),
+                title: it.title.as_str().into(),
+                date_label: format_note_date(it.stamp, now).as_str().into(),
+                kind_label: it.kind_label.into(),
+                show_profile,
+                profile_icon_char: profile_icon_char.as_str().into(),
+                has_custom_profile_icon,
+                custom_profile_icon,
+            }
+        })
+        .collect();
+    comp.set_continue_list(Rc::new(slint::VecModel::from(entries)).into());
+}
 
 /// Refresh both the start-page Engage list and the full-task-list in the UI.
 fn refresh_ui(

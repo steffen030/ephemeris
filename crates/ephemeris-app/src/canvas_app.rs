@@ -1,5 +1,6 @@
 //! Obsidian-compatible Canvas: browser, board overview, focus ink, vault export.
 
+use ephemeris_core::model::Tool;
 use ephemeris_core::profile_manager::ProfileManager;
 use ephemeris_core::{
     canvas_data_dir, crop_ink_preview, delete_canvas_files, export_canvas_json, gray8_to_png,
@@ -16,7 +17,7 @@ use ephemeris_ui::{
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1319,6 +1320,14 @@ pub(crate) fn wire_canvas(
 }
 
 fn open_canvas(ui: &EphemerisUi, session: &CanvasSession, id: u32, refresh: &Rc<dyn Fn()>) {
+    // Bump recency so Home › Continue ranks this canvas first.
+    {
+        let mut idx = session.index.borrow_mut();
+        if let Some(meta) = idx.canvases.iter_mut().find(|c| c.id == id) {
+            meta.updated_at = now_secs();
+        }
+    }
+    session.save_index();
     session.active_canvas_id.set(id);
     *session.doc.borrow_mut() = load_canvas_doc(&session.data_dir, id);
     session.ink_previews_canvas.set(None);
@@ -1346,6 +1355,16 @@ fn open_canvas(ui: &EphemerisUi, session: &CanvasSession, id: u32, refresh: &Rc<
     page.set_canvas_board_title(title.into());
     refresh();
     ui.request_screen_change();
+}
+
+/// Open a canvas board from Home › Continue (or other non-browser entry points).
+pub(crate) fn open_canvas_by_id(ui: &EphemerisUi, session: &CanvasSession, id: u32) {
+    let refresh = session
+        .board_refresh
+        .borrow()
+        .clone()
+        .unwrap_or_else(|| Rc::new(|| {}) as Rc<dyn Fn()>);
+    open_canvas(ui, session, id, &refresh);
 }
 
 /// Start dragging `hit`: the whole selection when it is part of it, else just
@@ -1592,6 +1611,22 @@ fn refresh_board_throttled(ui: &EphemerisUi, session: &CanvasSession) {
     refresh_board_image(ui, session);
 }
 
+/// Load cropped ink thumbnails for every text card on `canvas_id`.
+fn load_ink_previews(data_dir: &Path, canvas_id: u32, doc: &CanvasDoc) -> InkPreviews {
+    let mut previews = InkPreviews::new();
+    for n in &doc.nodes {
+        if let CanvasNode::Text(t) = n {
+            if let Some((w, h, px)) = load_card_page_pixels(data_dir, canvas_id, &t.id) {
+                // Cropped to the ink so it scales up to fill the card; None = blank page.
+                if let Some(preview) = crop_ink_preview(w, h, &px) {
+                    previews.insert(t.id.clone(), preview);
+                }
+            }
+        }
+    }
+    previews
+}
+
 /// Load card ink thumbnails once per canvas (disk I/O must stay off the
 /// per-frame path — the board re-renders on every drag / pinch frame).
 fn ensure_ink_previews(session: &CanvasSession) {
@@ -1600,18 +1635,8 @@ fn ensure_ink_previews(session: &CanvasSession) {
         return;
     }
     let doc = session.doc.borrow();
-    let mut previews = session.ink_previews.borrow_mut();
-    previews.clear();
-    for n in &doc.nodes {
-        if let CanvasNode::Text(t) = n {
-            if let Some((w, h, px)) = load_card_page_pixels(&session.data_dir, canvas_id, &t.id) {
-                // Cropped to the ink so it scales up to fill the card; None = blank page.
-                if let Some(preview) = crop_ink_preview(w, h, &px) {
-                    previews.insert(t.id.clone(), preview);
-                }
-            }
-        }
-    }
+    let loaded = load_ink_previews(&session.data_dir, canvas_id, &doc);
+    *session.ink_previews.borrow_mut() = loaded;
     session.ink_previews_canvas.set(Some(canvas_id));
 }
 
@@ -1758,11 +1783,12 @@ fn canvas_thumbnail(session: &CanvasSession, meta: &AppCanvasMeta) -> (bool, sli
     } else {
         let view = view_for_fit(&doc, THUMB_W, THUMB_H);
         let vp = Viewport::from_view(&view, THUMB_W, THUMB_H, &doc);
-        let no_ink = HashMap::new();
+        // Same ink load path as the live board so gallery tiles show handwriting.
+        let ink = load_ink_previews(&session.data_dir, meta.id, &doc);
         let opts = BoardDrawOpts {
             selected_ids: &[],
             show_ports: false,
-            ink_previews: &no_ink,
+            ink_previews: &ink,
             text_overlay: false,
             typed_cards: &doc.typed_cards,
         };
@@ -2002,6 +2028,9 @@ fn enter_focus(
     page.set_canvas_focus_active(true);
     page.set_canvas_menu_open(false);
     page.set_drawing_menu_open(false);
+    // Board may leave Move selected; handwriting focus always starts on Pen.
+    ui.set_tool(Tool::Pen);
+    page.set_active_tool("pen".into());
     page.set_active_note_id(format!("canvas:{canvas_id}:{node_id}").into());
     let board_title = page.get_canvas_board_title().to_string();
     page.set_page_title(format!("{board_title} · Text").into());
