@@ -807,6 +807,12 @@ impl EphemerisUi {
         self.component.set_agenda_list(model.into());
     }
 
+    /// Push Home › Continue rows (recent notes / canvases / recordings).
+    pub fn set_continue_list(&self, entries: Vec<ContinueEntry>) {
+        let model = std::rc::Rc::new(slint::VecModel::from(entries));
+        self.component.set_continue_list(model.into());
+    }
+
     /// Set the active agenda range tab: 0 = Day, 1 = Week, 2 = Month.
     pub fn set_agenda_range(&self, range: i32) {
         self.component.set_agenda_range(range);
@@ -818,6 +824,14 @@ impl EphemerisUi {
         F: FnMut(i32) + 'static,
     {
         self.component.on_agenda_range_changed(handler);
+    }
+
+    /// Register a closure for Home › Continue row taps (`kind`, `id`).
+    pub fn on_continue_item_tapped<F>(&self, handler: F)
+    where
+        F: FnMut(slint::SharedString, slint::SharedString) + 'static,
+    {
+        self.component.on_continue_item_tapped(handler);
     }
 
     // ── Callback registration ─────────────────────────────────────────────

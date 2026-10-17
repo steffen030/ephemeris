@@ -191,6 +191,22 @@ export struct AgendaEntry {
     location-label: string,
 }
 
+/// A recent item on the home Continue list (note / canvas / recording).
+export struct ContinueEntry {
+    /// "note" | "canvas" | "recording"
+    kind: string,
+    id: string,
+    title: string,
+    date-label: string,
+    /// Short kind chip: Note / Canvas / Rec
+    kind-label: string,
+    /// Show owning-profile badge (All aggregator view).
+    show-profile: bool,
+    profile-icon-char: string,
+    has-custom-profile-icon: bool,
+    custom-profile-icon: image,
+}
+
 /// A task row for the full task CRUD view.
 export struct TaskViewEntry {
     id: string,
@@ -691,6 +707,10 @@ export component EphemerisPage inherits Window {
     in-out property <int> agenda-range: 0;
     in property <[AgendaEntry]> agenda-list: [];
     callback agenda-range-changed(int);
+    /// Recent notes / canvases / recordings (Home › Continue).
+    in property <[ContinueEntry]> continue-list: [];
+    /// kind + id (same strings as ContinueEntry).
+    callback continue-item-tapped(string, string);
 
     // ── Task CRUD view ───────────────────────────────────────────────────
     in property <[TaskViewEntry]> full-task-list: [];
@@ -1499,130 +1519,240 @@ export component EphemerisPage inherits Window {
 
                 Rectangle { height: 12px; background: transparent; }
 
-                Rectangle {
-                    height: 36px;
-                    background: transparent;
-                    HorizontalLayout {
-                        spacing: 6px;
-                        alignment: start;
-
-                        Text {
-                            text: "Agenda";
-                            font-size: 16px;
-                            font-weight: 700;
-                            color: EinkTheme.btn-fg;
-                            vertical-alignment: center;
-                            width: 70px;
-                        }
-
-                        Rectangle {
-                            width: 44px; height: 28px;
-                            background: root.agenda-range == 0 ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
-                            border-radius: 4px;
-                            border-width: 2px;
-                            border-color: EinkTheme.btn-border;
-                            Text {
-                                text: "Day";
-                                font-size: 12px;
-                                color: root.agenda-range == 0 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                            TouchArea { clicked => { root.agenda-range = 0; root.agenda-range-changed(0); } }
-                        }
-
-                        Rectangle {
-                            width: 52px; height: 28px;
-                            background: root.agenda-range == 1 ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
-                            border-radius: 4px;
-                            border-width: 2px;
-                            border-color: EinkTheme.btn-border;
-                            Text {
-                                text: "Week";
-                                font-size: 12px;
-                                color: root.agenda-range == 1 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                            TouchArea { clicked => { root.agenda-range = 1; root.agenda-range-changed(1); } }
-                        }
-
-                        Rectangle {
-                            width: 58px; height: 28px;
-                            background: root.agenda-range == 2 ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
-                            border-radius: 4px;
-                            border-width: 2px;
-                            border-color: EinkTheme.btn-border;
-                            Text {
-                                text: "Month";
-                                font-size: 12px;
-                                color: root.agenda-range == 2 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                            TouchArea { clicked => { root.agenda-range = 2; root.agenda-range-changed(2); } }
-                        }
-                    }
-                }
-
-                Rectangle { height: 2px; background: EinkTheme.chrome-border; }
-
-                for item[i] in root.agenda-list: Rectangle {
-                    height: 48px;
+                // Agenda (left) + Continue (right), each half width.
+                HorizontalLayout {
+                    spacing: 12px;
                     width: start-page.width - 32px;
-                    background: transparent;
 
-                    HorizontalLayout {
-                        padding-left: 4px;
-                        padding-right: 4px;
-                        spacing: 8px;
-                        alignment: start;
+                    VerticalLayout {
+                        spacing: 0px;
+                        horizontal-stretch: 1;
 
-                        Text {
-                            text: item.time-label;
-                            font-size: 12px;
-                            color: EinkTheme.text-secondary;
-                            vertical-alignment: center;
-                            width: 64px;
+                        Rectangle {
+                            height: 36px;
+                            background: transparent;
+                            HorizontalLayout {
+                                spacing: 6px;
+                                alignment: start;
+
+                                Text {
+                                    text: "Agenda";
+                                    font-size: 16px;
+                                    font-weight: 700;
+                                    color: EinkTheme.btn-fg;
+                                    vertical-alignment: center;
+                                    width: 70px;
+                                }
+
+                                Rectangle {
+                                    width: 44px; height: 28px;
+                                    background: root.agenda-range == 0 ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+                                    border-radius: 4px;
+                                    border-width: 2px;
+                                    border-color: EinkTheme.btn-border;
+                                    Text {
+                                        text: "Day";
+                                        font-size: 12px;
+                                        color: root.agenda-range == 0 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                    TouchArea { clicked => { root.agenda-range = 0; root.agenda-range-changed(0); } }
+                                }
+
+                                Rectangle {
+                                    width: 52px; height: 28px;
+                                    background: root.agenda-range == 1 ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+                                    border-radius: 4px;
+                                    border-width: 2px;
+                                    border-color: EinkTheme.btn-border;
+                                    Text {
+                                        text: "Week";
+                                        font-size: 12px;
+                                        color: root.agenda-range == 1 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                    TouchArea { clicked => { root.agenda-range = 1; root.agenda-range-changed(1); } }
+                                }
+
+                                Rectangle {
+                                    width: 58px; height: 28px;
+                                    background: root.agenda-range == 2 ? EinkTheme.btn-active-bg : EinkTheme.btn-bg;
+                                    border-radius: 4px;
+                                    border-width: 2px;
+                                    border-color: EinkTheme.btn-border;
+                                    Text {
+                                        text: "Month";
+                                        font-size: 12px;
+                                        color: root.agenda-range == 2 ? EinkTheme.btn-active-fg : EinkTheme.btn-fg;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                    TouchArea { clicked => { root.agenda-range = 2; root.agenda-range-changed(2); } }
+                                }
+                            }
                         }
 
-                        Text {
-                            text: item.title;
-                            font-size: 14px;
-                            color: EinkTheme.btn-fg;
-                            vertical-alignment: center;
-                            overflow: elide;
-                            horizontal-stretch: 1;
+                        Rectangle { height: 2px; background: EinkTheme.chrome-border; }
+
+                        for item[i] in root.agenda-list: Rectangle {
+                            height: 48px;
+                            background: transparent;
+
+                            HorizontalLayout {
+                                padding-left: 4px;
+                                padding-right: 4px;
+                                spacing: 6px;
+                                alignment: start;
+
+                                Text {
+                                    text: item.time-label;
+                                    font-size: 11px;
+                                    color: EinkTheme.text-secondary;
+                                    vertical-alignment: center;
+                                    width: 52px;
+                                }
+
+                                Text {
+                                    text: item.title;
+                                    font-size: 13px;
+                                    color: EinkTheme.btn-fg;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                    horizontal-stretch: 1;
+                                }
+                            }
+
+                            Rectangle {
+                                x: 0; y: parent.height - 1px;
+                                width: parent.width; height: 1px;
+                                background: EinkTheme.chrome-border;
+                                opacity: 0.3;
+                            }
                         }
 
-                        Text {
-                            text: item.location-label;
-                            font-size: 11px;
-                            color: EinkTheme.text-secondary;
-                            vertical-alignment: center;
-                            width: 100px;
-                            overflow: elide;
-                            horizontal-alignment: right;
+                        if root.agenda-list.length == 0: Rectangle {
+                            height: 48px;
+                            background: transparent;
+                            Text {
+                                text: "No events in this period";
+                                font-size: 13px;
+                                color: EinkTheme.text-secondary;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
                         }
                     }
 
-                    Rectangle {
-                        x: 0; y: parent.height - 1px;
-                        width: parent.width; height: 1px;
-                        background: EinkTheme.chrome-border;
-                        opacity: 0.3;
-                    }
-                }
+                    VerticalLayout {
+                        spacing: 0px;
+                        horizontal-stretch: 1;
 
-                if root.agenda-list.length == 0: Rectangle {
-                    height: 48px;
-                    background: transparent;
-                    Text {
-                        text: "No events in this period";
-                        font-size: 13px;
-                        color: EinkTheme.text-secondary;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
+                        Rectangle {
+                            height: 36px;
+                            background: transparent;
+                            Text {
+                                text: "Continue";
+                                font-size: 16px;
+                                font-weight: 700;
+                                color: EinkTheme.btn-fg;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        Rectangle { height: 2px; background: EinkTheme.chrome-border; }
+
+                        for item[i] in root.continue-list: Rectangle {
+                            height: 48px;
+                            background: transparent;
+
+                            HorizontalLayout {
+                                padding-left: 4px;
+                                padding-right: 4px;
+                                spacing: 6px;
+                                alignment: start;
+
+                                Text {
+                                    text: item.kind == "canvas" ? Icons.grid-view
+                                        : item.kind == "recording" ? Icons.mic
+                                        : Icons.notes;
+                                    font-family: "Material Icons";
+                                    font-size: 16px;
+                                    color: EinkTheme.text-secondary;
+                                    vertical-alignment: center;
+                                    width: 22px;
+                                }
+
+                                VerticalLayout {
+                                    spacing: 0px;
+                                    horizontal-stretch: 1;
+                                    alignment: center;
+                                    Text {
+                                        text: item.title;
+                                        font-size: 13px;
+                                        color: EinkTheme.btn-fg;
+                                        overflow: elide;
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 6px;
+                                        Text {
+                                            text: item.kind-label;
+                                            font-size: 10px;
+                                            color: EinkTheme.text-secondary;
+                                        }
+                                        Text {
+                                            text: item.date-label;
+                                            font-size: 10px;
+                                            color: EinkTheme.text-secondary;
+                                            overflow: elide;
+                                            horizontal-stretch: 1;
+                                        }
+                                    }
+                                }
+
+                                if item.show-profile: Rectangle {
+                                    width: 22px; height: 22px;
+                                    background: transparent;
+                                    if item.has-custom-profile-icon: Image {
+                                        source: item.custom-profile-icon;
+                                        width: 18px; height: 18px;
+                                        image-fit: contain;
+                                    }
+                                    if !item.has-custom-profile-icon: Text {
+                                        text: item.profile-icon-char;
+                                        font-family: "Material Icons";
+                                        font-size: 14px;
+                                        color: EinkTheme.text-secondary;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+
+                            Rectangle {
+                                x: 0; y: parent.height - 1px;
+                                width: parent.width; height: 1px;
+                                background: EinkTheme.chrome-border;
+                                opacity: 0.3;
+                            }
+
+                            TouchArea {
+                                clicked => { root.continue-item-tapped(item.kind, item.id); }
+                            }
+                        }
+
+                        if root.continue-list.length == 0: Rectangle {
+                            height: 48px;
+                            background: transparent;
+                            Text {
+                                text: "Nothing recent yet";
+                                font-size: 13px;
+                                color: EinkTheme.text-secondary;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
                     }
                 }
             }
