@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.27](https://github.com/steffen030/ephemeris/compare/v0.1.26...v0.1.27) (2026-10-17)
+
+
+### Features
+
+* **home:** Continue recent items; fix canvas gallery ink thumbs ([#68](https://github.com/steffen030/ephemeris/issues/68)) ([93585f5](https://github.com/steffen030/ephemeris/commit/93585f50a2a50cdb2b2fa2a980a1532106c5ff31))
+
+
+### Performance Improvements
+
+* **ink:** live tail to pen tip and defer pen-up HWR cache sync ([#69](https://github.com/steffen030/ephemeris/issues/69)) ([7406227](https://github.com/steffen030/ephemeris/commit/74062277b8ba83ce56a28b059e98ccb6681861e2))
+
 ## [0.1.26](https://github.com/steffen030/ephemeris/compare/v0.1.25...v0.1.26) (2026-10-16)
 
 
