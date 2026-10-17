@@ -71,6 +71,11 @@ const NAV_REC: i32 = 5;
 /// stall the UI thread on flash I/O. Leave-note still flushes synchronously.
 const LOCAL_PAGE_WRITE_DEBOUNCE: Duration = Duration::from_millis(400);
 
+/// Quiet time after the last PenUp before the recognition cache is reconciled
+/// with the page strokes. Handwriting lifts the pen every few hundred ms, so
+/// the line split + cache save + task sync run at pauses, not between strokes.
+const RECOG_SYNC_DELAY: Duration = Duration::from_millis(400);
+
 /// Hold-still duration at end of a stroke before smart-shape snap (ephemeris-9co).
 const SHAPE_HOLD: Duration = Duration::from_millis(500);
 /// Max tip drift (logical px) while holding for a smart-shape snap.
@@ -122,6 +127,16 @@ impl Drop for StallWatch {
             );
         }
     }
+}
+
+/// Recognition-cache reconcile queued by a page persist (see [`RECOG_SYNC_DELAY`]).
+/// Carries its own stroke snapshot so a page switch before the flush is safe.
+struct PendingRecogSync {
+    note_id: u32,
+    doc_page: usize,
+    strokes: Vec<ephemeris_core::Stroke>,
+    ruling: Option<f32>,
+    due: Instant,
 }
 
 struct BgRecogJobResult {
@@ -6182,6 +6197,7 @@ impl App {
             last_ink_pressure: 0.5,
             shape_hold: None,
             select_gesture: None,
+            recog_sync: None,
             select_preview_dirty: false,
             undo_ui_page: None,
             data_dir,
@@ -6376,6 +6392,8 @@ struct WinitHandler {
     shape_hold: Option<ShapeHoldState>,
     /// Lasso / drag state while the Move tool is active.
     select_gesture: Option<SelectGesture>,
+    /// Deferred pen-up recognition-cache reconcile (never on the ink path).
+    recog_sync: Option<PendingRecogSync>,
     /// Lasso / drag moved since the preview was last drawn.
     select_preview_dirty: bool,
     /// Note page the undo/redo affordances were last synced for.
@@ -7261,11 +7279,56 @@ impl WinitHandler {
             strokes: strokes.clone(),
         });
         self.ui.ensure_committed_unique();
+        if let Some(note) = self.notes.borrow_mut().iter_mut().find(|n| n.id == note_id) {
+            note.updated_at = now_secs();
+        }
 
         // Incremental recognition cache: invalidate only lines whose stroke ids
-        // changed — do not wipe the whole page's text_content.
+        // changed. Deferred to a pen pause — HWR text may lag, ink may not.
+        if self
+            .recog_sync
+            .as_ref()
+            .is_some_and(|p| (p.note_id, p.doc_page) != (note_id, doc_page))
+        {
+            self.flush_recog_sync(true);
+        }
+        self.recog_sync = Some(PendingRecogSync {
+            note_id,
+            doc_page,
+            strokes,
+            ruling: note_ruling_pitch(&self.ui),
+            due: Instant::now() + RECOG_SYNC_DELAY,
+        });
+        self.vault_export.mark(note_id);
+    }
+
+    /// Reconcile the queued page's recognition cache with its strokes, save
+    /// it, and refresh note text / tasks / See-text. Runs once the pen has
+    /// been up for [`RECOG_SYNC_DELAY`], or immediately when `force`.
+    fn flush_recog_sync(&mut self, force: bool) {
+        let ready = self
+            .recog_sync
+            .as_ref()
+            .is_some_and(|p| force || (!self.is_drawing && Instant::now() >= p.due));
+        if !ready {
+            return;
+        }
+        let Some(job) = self.recog_sync.take() else {
+            return;
+        };
+        let PendingRecogSync {
+            note_id,
+            doc_page,
+            strokes,
+            ruling,
+            ..
+        } = job;
+        // Deleted before the flush: do not resurrect its cache or tasks.
+        if !self.notes.borrow().iter().any(|n| n.id == note_id) {
+            return;
+        }
+        let _stall = StallWatch::new("recog_sync");
         let version = recognition_model_version_for(&self.config.borrow());
-        let ruling = note_ruling_pitch(&self.ui);
         let mut cache = self
             .bg_recog
             .get_or_load(&self.data_dir, note_id, doc_page, &version);
@@ -7275,24 +7338,22 @@ impl WinitHandler {
         }
         let completed = cache.completed_markdown();
         let rows = see_text_rows(&cache, Some(&completed));
-        let see_text_open = self.ui.clone_component().get_note_see_text();
         (self.sync_note_tasks)(note_id, doc_page, &cache);
         self.bg_recog.store(note_id, doc_page, cache);
         if let Some(note) = self.notes.borrow_mut().iter_mut().find(|n| n.id == note_id) {
-            note.updated_at = now_secs();
             note.text_content = if completed.is_empty() {
                 None
             } else {
                 Some(completed)
             };
         }
-        // Update See-text overlay in place when open (pending markers); otherwise
-        // leave Slint alone mid-ink to avoid UI damage.
-        if see_text_open {
+        // Update See-text overlay in place when open on this page (pending
+        // markers); otherwise leave Slint alone to avoid UI damage.
+        let see_text_open = self.ui.clone_component().get_note_see_text();
+        if see_text_open && self.current_note_page() == Some((note_id, doc_page)) {
             self.ui.set_see_text_rows(&rows);
+            self.request_redraw_coalesced();
         }
-        // Vault export waits for leave-note or the 10‑minute batch — never per stroke.
-        self.vault_export.mark(note_id);
     }
 
     fn handle_pointer_release(&mut self, lx: f32, ly: f32, t_us: u64) {
@@ -7584,6 +7645,10 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
         }
 
         // --- Deferred vault OCR/PDF (leave-note or 10‑minute batch) ---
+        if self.vault_export.flush_soon.get() {
+            // Leave-note export should carry the latest note text.
+            self.flush_recog_sync(true);
+        }
         self.vault_export.try_flush(
             &self.config.borrow(),
             &self.notes.borrow(),
@@ -7593,8 +7658,13 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
             &self.local_page_writes,
         );
 
+        // --- Deferred pen-up recognition-cache reconcile ---
+        self.flush_recog_sync(false);
+
         // --- Idle background per-line recognition (ktg.12) ---
         if self.bg_recog.may_spawn(false) {
+            // The worker must start from the reconciled cache.
+            self.flush_recog_sync(true);
             let page_idx = self.ui.current_page_idx();
             let note_info = self
                 .notes
@@ -7802,11 +7872,17 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
             }
         });
         let canvas_wake = crate::canvas_app::next_wake(&self.canvas_session);
-        let earliest = match (shape_wake, canvas_wake) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (Some(a), None) | (None, Some(a)) => Some(a),
-            (None, None) => None,
-        };
+        // Not while drawing: a due time already past would spin the loop, and
+        // the stroke's PenUp re-arms the deadline anyway.
+        let recog_wake = self
+            .recog_sync
+            .as_ref()
+            .filter(|_| !self.is_drawing)
+            .map(|p| p.due);
+        let earliest = [shape_wake, canvas_wake, recog_wake]
+            .into_iter()
+            .flatten()
+            .min();
         match (earliest, current) {
             (Some(wake), Some(t)) if wake < t => {
                 event_loop.set_control_flow(ControlFlow::WaitUntil(wake));
@@ -7871,7 +7947,10 @@ impl ApplicationHandler<AppUserEvent> for WinitHandler {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let _stall = StallWatch::new("window_event");
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                self.flush_recog_sync(true);
+                event_loop.exit();
+            }
 
             WindowEvent::Resized(_) => {
                 if let Some(d) = &mut self.display {

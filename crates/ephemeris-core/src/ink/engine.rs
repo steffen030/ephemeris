@@ -288,6 +288,21 @@ impl InkEngine {
         })
     }
 
+    /// Newest control point not yet covered by an emitted Catmull-Rom span.
+    ///
+    /// Spans wait one sample of look-ahead, so the emitted polyline ends one
+    /// control behind the pen. Live previews bridge that gap (plus the
+    /// One-Euro lag) to the raw tip; the committed stroke is unaffected.
+    pub fn pending_tip(&self) -> Option<Point> {
+        self.active.as_ref().and_then(|b| {
+            if b.points.len() >= 2 {
+                b.points.last().copied()
+            } else {
+                None
+            }
+        })
+    }
+
     /// Read-only access to the engine's current configuration.
     pub fn config(&self) -> &InkConfig {
         &self.cfg

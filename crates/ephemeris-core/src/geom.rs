@@ -98,6 +98,16 @@ impl Rect {
     pub fn contains(&self, x: f32, y: f32) -> bool {
         x >= self.min_x && x <= self.max_x && y >= self.min_y && y <= self.max_y
     }
+
+    /// `true` if both rects are non-empty and overlap (edges touching counts).
+    pub fn intersects(&self, other: &Rect) -> bool {
+        !self.is_empty()
+            && !other.is_empty()
+            && self.min_x <= other.max_x
+            && other.min_x <= self.max_x
+            && self.min_y <= other.max_y
+            && other.min_y <= self.max_y
+    }
 }
 
 impl Default for Rect {
@@ -135,6 +145,15 @@ mod tests {
         assert_eq!((r.min_x, r.min_y, r.max_x, r.max_y), (-2.0, 3.0, 4.0, 10.0));
         assert_eq!(r.width(), 6.0);
         assert_eq!(r.height(), 7.0);
+    }
+
+    #[test]
+    fn intersects_overlap_touch_and_empty() {
+        let a = Rect::new(0.0, 0.0, 10.0, 10.0);
+        assert!(a.intersects(&Rect::new(5.0, 5.0, 20.0, 20.0)));
+        assert!(a.intersects(&Rect::new(10.0, 0.0, 12.0, 2.0)));
+        assert!(!a.intersects(&Rect::new(11.0, 0.0, 12.0, 2.0)));
+        assert!(!a.intersects(&Rect::empty()));
     }
 
     #[test]
