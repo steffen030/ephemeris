@@ -573,6 +573,9 @@ pub struct EphemerisUi {
     /// rather than pen points, so it must be composited even though
     /// `in_progress` is empty. Reset whenever the live layer is cleared.
     select_preview_live: Cell<bool>,
+    /// Logical canvas rect of the provisional tail stamped on the live layer
+    /// (last emitted spline point → raw pen tip). Erased before every feed.
+    live_tail: Cell<Option<ephemeris_core::geom::Rect>>,
     /// Strokes removed during the current eraser gesture (for undo, ephemeris-e1b).
     eraser_removed: RefCell<Vec<Stroke>>,
 }
@@ -651,6 +654,7 @@ impl EphemerisUi {
             strokes_dirty: Cell::new(false),
             pending_shape_snap: RefCell::new(None),
             select_preview_live: Cell::new(false),
+            live_tail: Cell::new(None),
             eraser_removed: RefCell::new(Vec::new()),
         })
     }
@@ -3306,6 +3310,9 @@ impl EphemerisUi {
             return self.feed_eraser(event);
         }
 
+        // The provisional tail must never reach the committed layer or chain
+        // into new spans — restore the live layer before the engine advances.
+        self.erase_live_tail();
         let update = self.engine.borrow_mut().update(event, t_ms);
         let tool = self.engine.borrow().config().tool;
         let scale = self.ink_scale();
@@ -3473,7 +3480,95 @@ impl EphemerisUi {
             InkUpdate::Idle => {}
         }
 
+        if let InputEvent::PenMove(sample) = event {
+            if self.engine.borrow().is_drawing() {
+                self.draw_live_tail(sample);
+            }
+        }
+
         update
+    }
+
+    /// Stamp a provisional segment from the last emitted spline point through
+    /// the engine's pending control to the raw pen position, so ink reaches
+    /// the tip immediately instead of trailing by the One-Euro lag plus one
+    /// Catmull-Rom look-ahead sample. Display only: the stroke the engine
+    /// commits (and HWR reads) is unchanged.
+    fn draw_live_tail(&self, sample: &ephemeris_pal::input::PenSample) {
+        let Some(&head) = self.in_progress.borrow().last() else {
+            return;
+        };
+        let mut tail = Vec::with_capacity(3);
+        tail.push(head);
+        if let Some(pending) = self.engine.borrow().pending_tip() {
+            tail.push(pending);
+        }
+        tail.push(Point {
+            x: sample.x,
+            y: sample.y,
+            pressure: sample.pressure.clamp(0.0, 1.0),
+            tilt: sample.tilt,
+            t_ms: head.t_ms,
+        });
+        let bw = *self.in_progress_base_width.borrow();
+        let tool = self.engine.borrow().config().tool;
+        let mut rect = ephemeris_core::geom::Rect::empty();
+        let mut hw = 0.0_f32;
+        for p in &tail {
+            rect.union_point(p.x, p.y);
+            hw = hw.max(ephemeris_core::ink::width_for(bw, p.pressure) * 0.5);
+        }
+        let rect = rect.inflate(hw + 1.0);
+        raster::rasterize_points(
+            &mut self.in_progress_layer.borrow_mut(),
+            &tail,
+            bw,
+            tool,
+            self.ink_scale(),
+        );
+        self.live_tail.set(Some(rect));
+        self.push_ink_damage(rect);
+    }
+
+    /// Remove the provisional tail: white-fill its rect, then re-stamp the
+    /// in-progress segments that touch it (min-blend makes re-stamping exact).
+    fn erase_live_tail(&self) {
+        let Some(rect) = self.live_tail.take() else {
+            return;
+        };
+        let scale = self.ink_scale();
+        {
+            let mut layer = self.in_progress_layer.borrow_mut();
+            let Some((x0, y0, x1, y1)) =
+                raster::ink_pixel_bounds(&rect, scale, layer.width, layer.height)
+            else {
+                return;
+            };
+            let stride = layer.stride as usize;
+            for y in y0..y1 {
+                let row = y as usize * stride;
+                layer.data[row + x0 as usize..row + x1 as usize].fill(255);
+            }
+        }
+        let bw = *self.in_progress_base_width.borrow();
+        let tool = self.engine.borrow().config().tool;
+        // Max half-width plus slack for ink-pixel rounding at the rect edge.
+        let reach = ephemeris_core::ink::width_for(bw, 1.0) * 0.5 + 2.0;
+        let pts = self.in_progress.borrow();
+        let mut layer = self.in_progress_layer.borrow_mut();
+        if pts.len() == 1 {
+            raster::rasterize_points(&mut layer, &pts, bw, tool, scale);
+        }
+        for seg in pts.windows(2) {
+            let mut r = ephemeris_core::geom::Rect::empty();
+            r.union_point(seg[0].x, seg[0].y);
+            r.union_point(seg[1].x, seg[1].y);
+            if r.inflate(reach).intersects(&rect) {
+                raster::rasterize_points(&mut layer, seg, bw, tool, scale);
+            }
+        }
+        drop(layer);
+        self.push_ink_damage(rect);
     }
 
     fn feed_eraser(&self, event: &InputEvent) -> InkUpdate {
@@ -3551,6 +3646,9 @@ impl EphemerisUi {
     /// Reset the live stroke raster to the blend identity for `tool`.
     fn clear_in_progress_layer(&self, tool: Tool) {
         self.select_preview_live.set(false);
+        if let Some(rect) = self.live_tail.take() {
+            self.push_ink_damage(rect);
+        }
         let mut layer = self.in_progress_layer.borrow_mut();
         if tool == Tool::Eraser {
             layer.fill(0);
@@ -4768,6 +4866,48 @@ mod tests {
     /// canvas-sized; the compositor only applies it to canvas rows) rather than
     /// by pixel-comparing two rendered frames (which would be sensitive to
     /// font-rendering non-determinism introduced by changing the page title).
+    /// The live tail reaches the raw pen tip immediately, and erasing it
+    /// leaves exactly the engine's emitted in-progress ink (no residue that
+    /// could leak into the committed stroke).
+    #[test]
+    fn live_tail_reaches_tip_and_erases_cleanly() {
+        let ui = EphemerisUi::new(800, 600).expect("UI construction failed");
+        ui.feed_input(&InputEvent::PenDown(pen_sample(100.0, 50.0)), 0);
+        let mut t = 8;
+        for x in (110..=300u32).step_by(10) {
+            ui.feed_input(&InputEvent::PenMove(pen_sample(x as f32, 50.0)), t);
+            t += 8;
+        }
+        let scale = ui.ink_scale();
+        let tip_px = |layer: &PixelBuf| {
+            let (x, y) = scale.apply(299.0, 50.0);
+            layer.data[y as usize * layer.stride as usize + x as usize]
+        };
+        // Emitted spline lags the pen; the tail must cover the raw tip.
+        let emitted_end = ui.in_progress.borrow().last().unwrap().x;
+        assert!(emitted_end < 299.0, "spline should lag the tip");
+        assert!(
+            tip_px(&ui.in_progress_layer.borrow()) < 128,
+            "tail missing at tip"
+        );
+
+        ui.erase_live_tail();
+        let mut expected = ui.in_progress_layer.borrow().clone();
+        expected.fill(255);
+        let bw = *ui.in_progress_base_width.borrow();
+        raster::rasterize_points(
+            &mut expected,
+            &ui.in_progress.borrow(),
+            bw,
+            Tool::Pen,
+            scale,
+        );
+        assert!(
+            ui.in_progress_layer.borrow().data == expected.data,
+            "erasing the tail must restore the emitted in-progress ink exactly"
+        );
+    }
+
     #[test]
     fn pen_down_move_up_produces_ink_only_in_canvas() {
         let ui = EphemerisUi::new(800, 600).expect("UI construction failed");
